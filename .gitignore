@@ -1,0 +1,26 @@
+﻿# Binaries & Libraries
+*.exe
+*.dll
+*.bin
+*.tq10
+*.o
+*.a
+
+# Ordner mit Gewichten (sehr wichtig!)
+falcon3_7b_tq10/
+falcon3_tq10/
+granite_3b_tq10/
+weights/
+models/
+
+# Temporäres & Backups
+*.bak.*
+*_original.cpp
+debug_cpp.txt
+__pycache__/
+.vscode/
+.idea/
+
+# Lokale Test-Dateien
+test_in.bin
+test_out.bin
