@@ -1,32 +1,34 @@
-﻿# Atlas-TQ1-BitNet
-Bit-exact C++ implementation of the Atlas BitNet inference engine.
+﻿# Atlas-TQ1-BitNet: SIMD Turbo Edition
 
-## Overview
-Atlas is a high-performance inference engine optimized for 1.58-bit (ternary) quantized models. It focuses on extreme memory efficiency and CPU-level optimization using AVX2 and OpenMP.
+Hochoptimierte C++ Inferenz-Engine für 1.58-Bit (Ternary) Quantized Models.
 
-## Performance Benchmarks (2026-05-15)
-Results measured on Intel Core i7-13700T (13th Gen) with DDR4-3200 (Single-Channel):
+## Performance (i7-13700T @ 13th Gen)
 
-| Model | Size | Speed (Old PC) | Speed (New PC) | Improvement |
-| :--- | :--- | :--- | :--- | :--- |
-| **Falcon3-7B** | 7B | 5.8s / token | **2.3s / token** | ~2.5x |
-| **Falcon3-10B** | 10B | 7.5s / token | **3.3s / token** | ~2.3x |
+| Modell | Latenz | Speed |
+| :--- | :--- | :--- |
+| **Falcon3-7B** | ~282 ms/tok | 3.5 tok/s |
+| **Falcon3-10B** | ~444 ms/tok | 2.2 tok/s |
 
-*Note: Load times for 10B reduced from ~20s to **6.4s** due to NVMe/DDR4 optimizations.*
+Gesamt-Inferenz inkl. Python-Overhead (ask.py): **~319ms/tok**.
 
-## Features
-- **Bit-Exact Kernel:** Validated deterministic output across MSVC and Clang builds.
-- **Ternary Quantization:** Native support for TQ1_0 (BitNet 1.58b) packing.
-- **Advanced Sampling:** Temperature-based sampling to prevent repetition loops and handle EOS tokens.
-- **SIMD Optimized:** Hand-crafted AVX2 kernels for weight unpacking and dot products.
+## Build
 
-## How to Run
-1. **Compile:** `clang++ -O3 -march=native -fopenmp atlas_falcon3.cpp -o atlas.exe`
-2. **Inference:**
-   `python ask.py "Your prompt here" --10b --temp 0.4`
+```bash
+clang++ -O3 -march=native -fopenmp atlas_falcon3.cpp -o atlas_falcon3_avx2.exe
+clang++ -O3 -march=native -fopenmp atlas_falcon3_7b.cpp -o atlas_falcon3_7b_avx2.exe
+```
 
-## Roadmap
-- [x] AVX2 & OpenMP Support
-- [x] Temperature Sampling
-- [ ] Dual-Channel RAM Optimization (Target: < 2.0s for 10B)
-- [ ] RAG Integration for CORE-X CMS
+## Usage
+
+```bash
+python ask.py "Your prompt" --7b --temp 0.7
+python ask.py "Your prompt" --10b --temp 0.3
+```
+
+## Files
+
+- `atlas_falcon3.cpp` – 10B inference engine
+- `atlas_falcon3_7b.cpp` – 7B inference engine
+- `ask.py` – CLI interface
+- `falcon3_tq10/` – 10B weights
+- `falcon3_7b_tq10/` – 7B weights
