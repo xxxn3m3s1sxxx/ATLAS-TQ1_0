@@ -32,15 +32,6 @@ dll.atlas_tensor_data.restype = ctypes.POINTER(ctypes.c_uint8)
 dll.atlas_tensor_data.argtypes = [ctypes.c_void_p, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int)]
 
-dll.atlas_tensor_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
-    ctypes.c_int]
-
-dll.atlas_matmul_f32.restype = None
-dll.atlas_matmul_f32.argtypes = [ctypes.c_int, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_float),
-    ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float]
-
 dll.atlas_matmul_i8_f32.restype = None
 dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
     ctypes.POINTER(ctypes.c_int8), ctypes.POINTER(ctypes.c_uint8),
@@ -64,6 +55,15 @@ dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_use_f32_matmul.restype = None
 dll.atlas_set_use_f32_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_use_ternary_matmul.restype = None
+dll.atlas_set_use_ternary_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_use_packed_matmul.restype = None
+dll.atlas_set_use_packed_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_num_threads.restype = None
+dll.atlas_set_num_threads.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_lmhead_gemv.restype = None
 dll.atlas_lmhead_gemv.argtypes = [
@@ -150,7 +150,7 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
 
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
-    def __init__(self, atlas_path, safetensors_path=None, model_dir=None):
+    def __init__(self, atlas_path, safetensors_path=None, model_dir=None, use_packed_matmul=False):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
@@ -194,16 +194,21 @@ class AtlasModel:
         # Cache tensor indices for fast lookup
         self._cache_indices()
 
-        # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
-        cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
-        if cache_loaded:
-            print("[Atlas] Loaded int8 weights from cache (mmap)")
+        if use_packed_matmul:
+            # v1.3.1: Direct TQ1-packed matmul — keep raw TQ1 data, skip cache/decomp
+            dll.atlas_set_use_packed_matmul(self.model_ptr, 1)
+            print("[Atlas] Using direct TQ1-packed matmul (no int8 decompression)")
         else:
-            dll.atlas_decompress_all(self.model_ptr)
-            print("[Atlas] TQ1 tensors decoded to int8")
-            dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
-        # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
-        dll.atlas_prefetch_int8(self.model_ptr)
+            # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
+            cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
+            if cache_loaded:
+                print("[Atlas] Loaded int8 weights from cache (mmap)")
+            else:
+                dll.atlas_decompress_all(self.model_ptr)
+                print("[Atlas] TQ1 tensors decoded to int8")
+                dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
+            # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
+            dll.atlas_prefetch_int8(self.model_ptr)
 
         # Enable full-precision matmul for small models (1B) where u8 quantization
         # degrades output coherence. Larger models (3B+) are robust to the noise.
@@ -253,6 +258,18 @@ class AtlasModel:
     def set_seed(self, seed):
         """Set C++ PRNG seed for deterministic sampling."""
         dll.atlas_set_seed(ctypes.c_uint64(seed))
+
+    def set_use_ternary_matmul(self, enable=True):
+        """v1.3.0: Enable/disable ternary-add kernel (vpsignb, no multiplication)."""
+        dll.atlas_set_use_ternary_matmul(self.model_ptr, 1 if enable else 0)
+
+    def set_use_packed_matmul(self, enable=True):
+        """v1.3.1: Enable/disable direct TQ1-packed matmul (no decompression, 5× less weight reads)."""
+        dll.atlas_set_use_packed_matmul(self.model_ptr, 1 if enable else 0)
+
+    def set_num_threads(self, n):
+        """v1.3.1: Set OpenMP thread count (0 = default). Lowers CPU load on shared systems."""
+        dll.atlas_set_num_threads(self.model_ptr, n)
 
     def _cache_indices(self):
         self.idx = {}
@@ -325,7 +342,7 @@ class AtlasModel:
         return result
 
     def _matmul_tq1(self, data_flat, packed_cols, rows, act, scale):
-        """Run TQ1 matmul via C++ DLL with BitNet activation quantization."""
+        """TQ1 matmul with BitNet activation quantization (pure numpy)."""
         orig_shape = act.shape
         act = act.reshape(-1, orig_shape[-1])
         max_abs = np.max(np.abs(act), axis=-1, keepdims=True)
@@ -339,13 +356,16 @@ class AtlasModel:
             pad[:, :act_q.shape[1]] = act_q
             act_q = pad
 
+        # Decode TQ1 bytes and compute dot product in Python
+        # tq1_decode[byte] = [t0, t1, t2, t3, t4] ∈ {-1,0,1}
+        dec = np.array([((b // 3**i) % 3) - 1 for b in range(256) for i in range(5)],
+                       dtype=np.int8).reshape(256, 5)
         out = np.zeros((act_q.shape[0], rows), dtype=np.float32)
-        dll.atlas_matmul_f32(
-            rows, packed_cols,
-            data_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            act_q.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            act_q.shape[0], ctypes.c_float(1.0))
+        for r in range(rows):
+            row_bytes = data_flat[r * packed_cols:(r + 1) * packed_cols]
+            w = dec[row_bytes].reshape(-1)  # int8 weight row
+            dot = act_q @ w  # [B] float32 dot product
+            out[:, r] = dot
 
         # Reorder: atlas order (ur*4+q) → HF unpack order (q*rows_packed+ur)
         rows_packed = rows // 4

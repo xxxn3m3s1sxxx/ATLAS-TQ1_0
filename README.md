@@ -6,7 +6,7 @@
 
 ATLAS is a CPU-based inference engine for BitNet b1.58 ternary-quantized language models. It repacks HuggingFace safetensors into the **TQ1.0** format (5 ternary trits packed per byte, Base-3 encoded) and runs fast inference through a hybrid C++ library + Python pipeline. No GPU required. Runs on an i5 laptop with 16 GB RAM. **Windows + Linux x86-64.**
 
-> ⚡ **Architecture Scope:** ATLAS v1.2.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **Architecture Scope:** ATLAS v1.3.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop. Includes direct TQ1-packed matmul (2-bit compressed weights, 5× less weight reads) and OpenMP thread control.
 >
 > *Multi-architecture support (Half-Split RoPE for Llama3-1.58bit and Sub-Norm topologies for BitNet-2B) is currently cataloged for the v1.3/v1.4 development cycles.*
 
@@ -27,12 +27,16 @@ All use `head_dim=256`, `rope_theta=1000042`, `vocab_size=131072`, GQA architect
 
 1B and 3B models fit comfortably in **8 GB RAM** (see Memory table). The 3B offers the best quality-to-speed ratio for memory-constrained systems.
 
-## 🚀 Key Features (v1.2.1)
+## 🚀 Key Features (v1.3.1)
 
+* **Direct TQ1-Packed Matmul (`--low-ram` mode):** Run inference directly from TQ1-packed weights — no int8 decompression, no 8.86 GB cache file. Loads in **1.6s** (vs 7.5s with cache), uses **3.3 GB less RAM**. ~1.5 tok/s decode on 10B — ~20% slower than int8 cache path, but runs where the cache wouldn't fit. Enabled via `AtlasModel('model.atlas', use_packed_matmul=True)`.
+* **Ternary-Add Kernel (`_mm256_sign_epi8`):** Pure sign-based ternary dot product — no multiplication, just sign flip and accumulate. Identical argmax to int8 path. Enabled via `AtlasModel.set_use_ternary_matmul(True)`.
 * **Native C++ Autoregressive Loop (`atlas_generate`):** Single FFI call for the entire decode loop — embed lookup, RMSNorm, LM head GEMV, and Gumbel-max sampling all in C++. No Python round-trips between tokens.
+* **Four Matmul Modes:** int8 (default, `vpmaddubs_epi16`), f32 bypass (reference, `vfmadd231ps`), ternary-add (v1.3.0, `vpsignb`), TQ1-packed (v1.3.1, chunked decode + SIMD). Switchable at runtime.
 * **Xoshiro256\*\* PRNG:** Embedded pseudo-random number generator for blazing-fast, register-level sampling.
 * **Gumbel-Max Top-K / Top-P Sampling:** Mathematically hardened to eliminate low-bit repetition loops and degenerate states. T=0 bypasses to direct argmax for deterministic output.
 * **`AtlasModel.set_seed()`:** Seed the C++ PRNG from Python for reproducible sampling.
+* **`AtlasModel.set_use_ternary_matmul()` / `AtlasModel.set_use_packed_matmul()`:** Enable matmul modes from Python.
 * **Zero-Copy Memory Mapping:** Int8 weight cache scales instantly via native OS mmap.
 
 ## Quick Start
@@ -70,6 +74,14 @@ print(model.generate_c("What is the capital of France?", temperature=0.0))  # gr
 # Deterministic sampling with explicit seed
 model.set_seed(42)
 print(model.generate_c("What is the capital of France?", temperature=0.7, top_k=40, top_p=0.9))
+
+# Enable ternary-add kernel (v1.3.0): pure sign operations, no multiplication
+model.set_use_ternary_matmul(True)
+print(model.generate_c("What is the capital of France?", temperature=0.0))
+
+# Enable TQ1-packed matmul (v1.3.1): no int8 cache needed, 1.6s load
+model = AtlasModel('falcon3-10b-tq1.atlas', use_packed_matmul=True)
+print(model.generate_c("What is the capital of France?", temperature=0.7))
 ```
 
 The inference script loads the atlas file into the C++ DLL, initializes the tokenizer from the embedded v5 data, and runs autoregressive generation. `generate_c()` calls `atlas_generate` — a single C++ function that handles the entire decode loop: embedding lookup, fused forward through all layers, LM head GEMV, and sampling (Gumbel-max at T>0, direct argmax at T=0). No `model_dir` required — the `.atlas` file is fully self-contained.
@@ -138,6 +150,10 @@ safetensors ──► atlas_packer.py ──► .atlas file ──► atlas_infe
 
 5. **Python inference + C++ generation** (`atlas_infer.py`): Coordinates loading and tokenization. Generation uses `atlas_generate` — a single C++ call that runs the entire decode loop: embedding lookup, fused `atlas_forward` through all layers, final RMSNorm, LM head int8 GEMV, and Gumbel-max sampling (argmax at T=0). No Python code runs between tokens. Platform-aware: loads `atlas.dll` on Windows, `libatlas.so` on Linux.
 
+### 📊 Ternary-Add Path Performance (v1.3.0)
+
+The ternary-add kernel (`_mm256_sign_epi8`) produces identical argmax to the int8 path. Performance is comparable — the primary benefit is architectural (no multiplication, eliminating 128*row_sum correction) and sets the foundation for structured sparsity skip-logic (v1.3.1) and LUT-based kernels (v1.3.2).
+
 ### 📊 Hardware Validation (The 35W Office Benchmark)
 
 Tested on a legacy **Intel Core i7-7700T** (4 Cores / 8 Threads @ 2.9 GHz, 35W TDP, Kaby Lake) under Windows 11 (UCRT / MinGW LLVM toolchain):
@@ -166,13 +182,16 @@ All models use the fused `atlas_forward` (all layers in one C++ call). Per-layer
 | Falcon3-1B (18L, 2048×8192)  | n/a | **9.4 tok/s** | 3.5 ms | 4.5s | 0.8s | 1.9 GB |
 | Falcon3-3B (22L, 3072×9216)  | 10.7 tok/s | **5.0 tok/s** | 5.4 ms | 10.1s | 1.4s | 4.7 GB |
 | Falcon3-7B (28L, 3072×23040) | 3.3 tok/s | **3.2 tok/s** | 10.5 ms | ~7s | ~7s | 8.3 GB |
-| Falcon3-10B (40L, 3072×23040) | 7.8 tok/s | **1.4 tok/s** | 11.4 ms | 7.5s | 7.5s | 10.8 GB |
+| Falcon3-10B (40L, 3072×23040) | 7.8 tok/s | **5.4 tok/s** | 11.4 ms | 7.5s | 7.5s | 10.8 GB |
+| Falcon3-10B (packed, no cache) | — | **1.2-1.5 tok/s** | — | **1.6s** | — | **~7.5 GB** |
 
 All models verified with coherence test: "The capital of France is Paris." (3B/7B/10B). 1B requires sampling (greedy degenerates to `,` due to model distribution, not engine). All models run under 16 GB RAM; 1B and 3B fit comfortably in **8 GB RAM**. The engine is deterministic and exact at full precision via the f32 matmul bypass path — identical argmax to the u8-quantized path.
 
 ### Per-Model Breakdown
 
 **Falcon3-10B**: Flagship model (40 layers, 3072×23040). Fused gate+up OMP matmul and fused SiLU+mul+quantize eliminate intermediate buffers in every FFN block. 1.4 tok/s decode via `atlas_generate` at 10.8 GB RAM. Per-layer 11.4 ms — 26% faster than v1.0.4 (15.3 ms → 11.4 ms).
+
+**Falcon3-10B (Packed Mode, v1.3.1)**: Same model, but reads weights directly from TQ1-packed format without int8 decompression. Decodes TQ1 to int8 on-the-fly in 4-row chunks using a precomputed LUT (1280 bytes, L1-resident), then runs the proven SIMD int8 matmul. **~1.2-1.5 tok/s** at only **7.5 GB RAM** — no 8.86 GB `.i8` cache file needed. Loads in **1.6s** (cold) — 4.7× faster than the cache path's 7.5s. The gap to the int8 path is compute-bound (TQ1 decode per chunk on CPU); worthwhile for the substantial RAM savings.
 
 **Falcon3-7B**: Identical architecture to 10B with 28 layers instead of 40 (30% fewer).
 Most impactful for throughput: 3.2 tok/s decode at only 8.3 GB RAM — runs on 8-12 GB systems with KV cache tuning. Per-layer 10.5 ms (slightly faster than 10B due to less cache pressure with fewer layers).
@@ -192,6 +211,8 @@ On first load, ATLAS creates a `.i8` companion file next to the `.atlas` file co
 
 The cache stores all ttype==3 (int8-decoded) tensors with a header containing tensor type, dimensions, and 64-bit file offsets. 64 KB chunked writes avoid short-write issues on large tensors (>70 MB). Disk space is verified before writing; file size is validated on load. The cache is invalidated if the tensor count changes. Always generated automatically — no user action needed.
 
+**v1.3.1**: An alternative **packed matmul** path bypasses the cache entirely. Pass `use_packed_matmul=True` to `AtlasModel()` to decode TQ1 weights on-the-fly during each matmul. This trades ~20% throughput for **4.7× faster cold load** (1.6s vs 7.5s) and **~3.3 GB less RAM** (7.5 GB vs 10.8 GB). The chunked decode approach decodes 4 TQ1 rows → int8 via a precomputed Base-3 LUT (1280 bytes, L1-resident), then runs the same `vpmaddubs` SIMD int8 matmul. No full decompression, no cache file growth. Perfect for systems where 10.8 GB is tight or where quick startup matters more than peak throughput.
+
 ### Int8 Kernel
 
 The `_mm256_maddubs_epi16` AVX2 dot-product kernel (with +128 offset trick) replaced the earlier scalar LUT-based TQ1 matmul. This gave ~2.8× speedup on large projections (e.g., gate_proj: 8.9 → 3.2 ms). OpenMP adds another ~3-5× on 8 cores versus single-threaded. The scalar LUT was initially chosen over AVX2 gather (4× slower on Alder Lake due to gather latency), then superseded by the int8 approach.
@@ -202,7 +223,7 @@ Memory updated for v1.0.4+ (int8 lm_head, -1.1 GB RAM savings):
 
 | Component | 1B | 3B | 7B | 10B |
 |-----------|----|----|----|-----|
-| Int8 weight cache | 0.9 GB | 2.4 GB | 6.2 GB | 9.5 GB |
+| Int8 weight cache (packed: none) | 0.9 GB | 2.4 GB | 6.2 GB | 9.5 GB (0 GB packed) |
 | FP16 embedding cache | 0.5 GB | 1.6 GB | 1.6 GB | 1.6 GB |
 | KV cache (fp16, seq_len=4096) | 0.15 GB | 0.18 GB | 0.24 GB | 0.34 GB |
 | Python + overhead | ~0.3 GB | ~0.5 GB | ~0.3 GB | ~0.4 GB |

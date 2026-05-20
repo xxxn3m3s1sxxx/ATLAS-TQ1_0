@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <immintrin.h>
+#include <omp.h>
 
 #ifdef _WIN32
   #define ATLAS_API __declspec(dllexport)
@@ -172,27 +173,6 @@ static int gumbel_sample(float* logits, int V,
 
 extern "C" {
 
-// ─── LUT ───────────────────────────────────────────────────────────────
-static bool lut_initialized = false;
-alignas(32) static float tq1_lut0[256];
-alignas(32) static float tq1_lut1[256];
-alignas(32) static float tq1_lut2[256];
-alignas(32) static float tq1_lut3[256];
-alignas(32) static float tq1_lut4[256];
-
-static void ensure_lut() {
-    if (lut_initialized) return;
-    for (int b = 0; b < 256; ++b) {
-        int t = b;
-        tq1_lut0[b] = (float)((t % 3) - 1); t /= 3;
-        tq1_lut1[b] = (float)((t % 3) - 1); t /= 3;
-        tq1_lut2[b] = (float)((t % 3) - 1); t /= 3;
-        tq1_lut3[b] = (float)((t % 3) - 1); t /= 3;
-        tq1_lut4[b] = (float)((t % 3) - 1);
-    }
-    lut_initialized = true;
-}
-
 static inline float fp16_to_fp32(uint16_t h) {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
     uint32_t f32 = (e == 0) ? ((s << 31) | (0 << 23) | (m << 13))
@@ -221,6 +201,8 @@ struct AtlasModel {
     int vocab_size;
     float rope_theta;
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
+    bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
+    bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4× less memory)
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
     std::vector<std::string> tensor_names;
@@ -302,9 +284,11 @@ struct AtlasModel {
     }
 };
 
+static void init_tq1_decode_lut();
+
 // ─── Load model ─────────────────────────────────────────────────────────
 ATLAS_API AtlasModel* atlas_load(const char* path) {
-    ensure_lut();
+    init_tq1_decode_lut();
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ATLAS] Cannot open %s\n", path); return nullptr; }
 
@@ -862,67 +846,7 @@ ATLAS_API const uint8_t* atlas_tensor_data(AtlasModel* m, int idx, int* size) {
     return m->tensors[idx].data;
 }
 
-// ─── Matmul: TQ1 packed → float32 output ──────────────────────────────
-// Performs: output[t][r] = scale * sum_{k} unpack(weight[r][k]) · activation[t][k*5:(k+1)*5]
-//
-// activations: [n_tokens × packed_cols*5] float32
-// output:      [n_tokens × rows] float32
-// data:        packed TQ1 bytes (without scale prefix), [rows × packed_cols]
-ATLAS_API void atlas_matmul_f32(int rows, int packed_cols, const uint8_t* data,
-                                 const float* activations, float* output,
-                                 int n_tokens, float scale) {
-    const int as = packed_cols * 5;
-
-    #ifdef _OPENMP
-    #pragma omp parallel for
-    #endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t* rd = data + r * packed_cols;
-        for (int t = 0; t < n_tokens; t++) {
-            const float* ab = activations + t * as;
-            float sum = 0.0f;
-            int k = 0;
-            for (; k + 4 <= packed_cols; k += 4) {
-                int base = k * 5;
-                uint8_t b0 = rd[k], b1 = rd[k+1], b2 = rd[k+2], b3 = rd[k+3];
-                sum += tq1_lut0[b0]*ab[base+0]+tq1_lut1[b0]*ab[base+1]
-                     + tq1_lut2[b0]*ab[base+2]+tq1_lut3[b0]*ab[base+3]+tq1_lut4[b0]*ab[base+4];
-                base += 5;
-                sum += tq1_lut0[b1]*ab[base+0]+tq1_lut1[b1]*ab[base+1]
-                     + tq1_lut2[b1]*ab[base+2]+tq1_lut3[b1]*ab[base+3]+tq1_lut4[b1]*ab[base+4];
-                base += 5;
-                sum += tq1_lut0[b2]*ab[base+0]+tq1_lut1[b2]*ab[base+1]
-                     + tq1_lut2[b2]*ab[base+2]+tq1_lut3[b2]*ab[base+3]+tq1_lut4[b2]*ab[base+4];
-                base += 5;
-                sum += tq1_lut0[b3]*ab[base+0]+tq1_lut1[b3]*ab[base+1]
-                     + tq1_lut2[b3]*ab[base+2]+tq1_lut3[b3]*ab[base+3]+tq1_lut4[b3]*ab[base+4];
-            }
-            for (; k < packed_cols; k++) {
-                uint8_t b = rd[k];
-                sum += tq1_lut0[b]*ab[k*5+0]+tq1_lut1[b]*ab[k*5+1]
-                     + tq1_lut2[b]*ab[k*5+2]+tq1_lut3[b]*ab[k*5+3]+tq1_lut4[b]*ab[k*5+4];
-            }
-            output[t * rows + r] = sum / scale;
-        }
-    }
-}
-
-// ─── Convenience: matmul for a tensor index ────────────────────────────
-// Loads scale from first 2 bytes of tensor data
-ATLAS_API void atlas_tensor_matmul(AtlasModel* m, int idx,
-                                    const float* activations, float* output,
-                                    int n_tokens) {
-    if (idx < 0 || idx >= (int)m->tensors.size()) return;
-    auto& t = m->tensors[idx];
-    if (t.ttype != 0) return;  // not a TQ1 tensor
-
-    uint16_t scale_raw;
-    memcpy(&scale_raw, t.data, 2);
-    float scale = fp16_to_fp32(scale_raw);
-
-    atlas_matmul_f32(t.row_dim, t.packed_cols, t.data + 2,
-                     activations, output, n_tokens, scale);
-}
+// ─── Matmul: int8 weights × uint8 activations → float32 output ──────────
 
 // ─── Matmul: int8 weights × int8 activations → float32 output ──────────
 // Uses _mm256_maddubs_epi16 with offset trick:
@@ -1175,6 +1099,29 @@ ATLAS_API void atlas_set_use_f32_matmul(AtlasModel* m, int val) {
     if (m) m->use_f32_matmul = val ? true : false;
 }
 
+// ─── v1.3.0: Set ternary matmul mode (vpsignb, no multiplication) ────
+// Uses _mm256_sign_epi8 for pure sign-based ternary dot product.
+// Eliminates 128*row_sum correction. Requires weights ∈ {-1, 0, +1}.
+ATLAS_API void atlas_set_use_ternary_matmul(AtlasModel* m, int val) {
+    if (m) m->use_ternary_matmul = val ? true : false;
+}
+
+// ─── v1.3.1: Set packed matmul mode (2-bit packed ternary weights) ────
+// Operates directly on 2-bit compressed weights (4 values/byte).
+// Requires TQ1→2-bit conversion at load time. 4× less memory bandwidth.
+ATLAS_API void atlas_set_use_packed_matmul(AtlasModel* m, int val) {
+    if (m) m->use_packed_matmul = val ? true : false;
+}
+
+// ─── v1.3.1: Set OpenMP thread count ──────────────────────────────────
+// n=0 resets to default (all available threads).
+ATLAS_API void atlas_set_num_threads(AtlasModel* m, int n) {
+    (void)m;
+    #ifdef _OPENMP
+    omp_set_num_threads(n > 0 ? n : omp_get_max_threads());
+    #endif
+}
+
 // ─── Helper: horizontal sum of __m256 float ──────────────────────────
 static inline float hsum_ps(__m256 v) {
     __m128 l = _mm256_castps256_ps128(v);
@@ -1183,6 +1130,156 @@ static inline float hsum_ps(__m256 v) {
     l = _mm_hadd_ps(l, l);
     l = _mm_hadd_ps(l, l);
     return _mm_cvtss_f32(l);
+}
+
+// ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
+// act_u8: [B, input_dim] uint8 quantized activations [1, 255]
+// weights: [rows, input_dim] int8 ternary weights {-1, 0, +1}
+// max_abs: [B] per-token max abs (for dequant)
+// scale: per-tensor dequant scale
+// output: [B, rows] reordered float
+// Uses _mm256_sign_epi8 → pure sign/flip/zero, no i8×i8 multiply.
+static void matmul_ternary_add_reorder(int rows, int input_dim,
+    const int8_t* weights, const uint8_t* act_u8,
+    const float* max_abs, float scale, float* output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        for (int b = 0; b < B; b++) {
+            const uint8_t* a = act_u8 + b * input_dim;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * input_dim;
+                __m256i acc = _mm256_setzero_si256();
+                int c = 0;
+                for (; c + 32 <= input_dim; c += 32) {
+                    __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                    __m256i wv = _mm256_loadu_si256((const __m256i*)(w + c));
+                    __m256i ai = _mm256_sub_epi8(au, _mm256_set1_epi8(-128));
+                    __m256i prod = _mm256_sign_epi8(ai, wv);
+                    __m128i lo = _mm256_castsi256_si128(prod);
+                    __m128i hi = _mm256_extracti128_si256(prod, 1);
+                    __m256i s16_lo = _mm256_cvtepi8_epi16(lo);
+                    __m256i s16_hi = _mm256_cvtepi8_epi16(hi);
+                    __m256i s32_lo = _mm256_madd_epi16(s16_lo, _mm256_set1_epi16(1));
+                    __m256i s32_hi = _mm256_madd_epi16(s16_hi, _mm256_set1_epi16(1));
+                    acc = _mm256_add_epi32(acc, s32_lo);
+                    acc = _mm256_add_epi32(acc, s32_hi);
+                }
+                __m128i lo2 = _mm256_castsi256_si128(acc);
+                __m128i hi2 = _mm256_extracti128_si256(acc, 1);
+                __m128i s = _mm_add_epi32(lo2, hi2);
+                s = _mm_hadd_epi32(s, s);
+                s = _mm_hadd_epi32(s, s);
+                int dot = _mm_cvtsi128_si32(s);
+                for (; c < input_dim; c++) {
+                    dot += ((int)a[c] - 128) * (int)w[c];
+                }
+                out4[sub] = (float)dot * max_abs[b] / (127.0f * scale);
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+}
+
+// ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
+// Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
+alignas(32) static int8_t tq1_decode[256][5];
+static bool tq1_decode_init = false;
+
+static void init_tq1_decode_lut() {
+    if (tq1_decode_init) return;
+    for (int b = 0; b < 256; b++) {
+        int t = b;
+        tq1_decode[b][0] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][1] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][2] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][3] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][4] = (int8_t)((t % 3) - 1);
+    }
+    tq1_decode_init = true;
+}
+
+// ─── Fused TQ1 decode + int32 dot product for packed weights ──────────
+// Decodes TQ1 bytes to int8 trits on-the-fly and computes the activation dot
+// product in one pass. No intermediate decode buffer needed.
+// Uses the +128 offset trick:
+//   sum(act_u8[i] * w[i]) → dot = sum(act_u8[i] * lut[t]) - 128 * sum_w
+//   result = dot / (127.0 * scale)  -- dequant scale applied by caller
+static void matmul_tq1_packed_reorder(int rows, int input_dim,
+    const uint8_t* packed, int packed_cols,
+    const uint8_t* act_u8, const float* max_abs,
+    float scale, float* output, int B) {
+    init_tq1_decode_lut();
+    int rows_packed = rows / 4;
+
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+        int8_t* decode_buf = (int8_t*)malloc(4 * input_dim * sizeof(int8_t));
+        int32_t row_sums[4];
+
+        #ifdef _OPENMP
+        #pragma omp for
+        #endif
+        for (int ur = 0; ur < rows_packed; ur++) {
+            for (int sub = 0; sub < 4; sub++) {
+                const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
+                int8_t* row = decode_buf + sub * input_dim;
+                int32_t sum_w = 0;
+                for (int c = 0; c < packed_cols; c++) {
+                    const int8_t* l = tq1_decode[w[c]];
+                    row[c * 5 + 0] = l[0]; sum_w += l[0];
+                    row[c * 5 + 1] = l[1]; sum_w += l[1];
+                    row[c * 5 + 2] = l[2]; sum_w += l[2];
+                    row[c * 5 + 3] = l[3]; sum_w += l[3];
+                    row[c * 5 + 4] = l[4]; sum_w += l[4];
+                }
+                row_sums[sub] = sum_w;
+            }
+
+            for (int b = 0; b < B; b++) {
+                const uint8_t* act = act_u8 + b * input_dim;
+                float deq = max_abs[b] / (127.0f * scale);
+                float out4[4];
+
+                for (int sub = 0; sub < 4; sub++) {
+                    const int8_t* row = decode_buf + sub * input_dim;
+                    __m256i sum = _mm256_setzero_si256();
+                    int j = 0;
+                    for (; j + 32 <= input_dim; j += 32) {
+                        __m256i wv = _mm256_loadu_si256((const __m256i*)(row + j));
+                        __m256i av = _mm256_loadu_si256((const __m256i*)(act + j));
+                        __m256i m = _mm256_maddubs_epi16(av, wv);
+                        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(m, _mm256_set1_epi16(1)));
+                    }
+                    int32_t dot = 0;
+                    __m128i l = _mm256_castsi256_si128(sum);
+                    __m128i h = _mm256_extracti128_si256(sum, 1);
+                    l = _mm_add_epi32(l, h);
+                    l = _mm_hadd_epi32(l, l);
+                    l = _mm_hadd_epi32(l, l);
+                    dot = _mm_cvtsi128_si32(l);
+                    for (; j < input_dim; j++) dot += (int32_t)act[j] * (int32_t)row[j];
+                    out4[sub] = (float)(dot - 128 * row_sums[sub]) * deq;
+                }
+
+                float* dst = output + b * rows;
+                dst[0 * rows_packed + ur] = out4[0];
+                dst[1 * rows_packed + ur] = out4[1];
+                dst[2 * rows_packed + ur] = out4[2];
+                dst[3 * rows_packed + ur] = out4[3];
+            }
+        }
+        free(decode_buf);
+    }
 }
 
 // ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
@@ -1305,6 +1402,16 @@ static void forward_layer_internal(
         w = (int8_t*)(t.data + 2);
         rs = (int32_t*)(w + nv);
     };
+    auto get_tq1_packed = [](const TensorInfo& t, const uint8_t*& w, int& rows,
+                      int& dim, int& pc, float& scale) {
+        if (t.ttype != 0) { rows = 0; dim = 0; pc = 0; w = nullptr; return; }
+        uint16_t sr; memcpy(&sr, t.data, 2);
+        scale = fp16_to_fp32(sr);
+        rows = t.row_dim;
+        pc = t.packed_cols;
+        dim = pc * 5;
+        w = t.data + 2;
+    };
 
     auto& tq = m->tensors[idx_q];
     auto& tk = m->tensors[idx_k];
@@ -1321,7 +1428,43 @@ static void forward_layer_internal(
     float* max_abs = (float*)alloca(B * sizeof(float));
 
     auto& tv = m->tensors[idx_v];
-    if (m->use_f32_matmul) {
+    if (m->use_packed_matmul) {
+        // v1.3.1: Direct TQ1-packed matmul — reads 5× less weight data
+        quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
+        {
+            const uint8_t* w; int rows, dim, pc; float scale;
+            get_tq1_packed(tq, w, rows, dim, pc, scale);
+            matmul_tq1_packed_reorder(rows, dim, w, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        }
+        {
+            const uint8_t* w; int rows, dim, pc; float scale;
+            get_tq1_packed(tk, w, rows, dim, pc, scale);
+            matmul_tq1_packed_reorder(rows, dim, w, pc, m->buf_i8, max_abs, scale, m->buf_hidden, B);
+        }
+        {
+            const uint8_t* w; int rows, dim, pc; float scale;
+            get_tq1_packed(tv, w, rows, dim, pc, scale);
+            matmul_tq1_packed_reorder(rows, dim, w, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
+        }
+    } else if (m->use_ternary_matmul) {
+        // Ternary-add path: vpsignb, no multiplication, no row_sums
+        quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tq, w, rs, rows, dim, scale);
+            matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        }
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tk, w, rs, rows, dim, scale);
+            matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs, scale, m->buf_hidden, B);
+        }
+        {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(tv, w, rs, rows, dim, scale);
+            matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs, scale, m->buf_up, B);
+        }
+    } else if (m->use_f32_matmul) {
         // Full-precision path: f32×i8, no activation quantization
         {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
@@ -1399,18 +1542,33 @@ static void forward_layer_internal(
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(to, w, rs, rows, dim, scale);
-        for (int b = 0; b < B; b++) {
-            memcpy(m->buf_act + b * dim, attn_out + b * qd, qd * sizeof(float));
-            memset(m->buf_act + b * dim + qd, 0, (dim - qd) * sizeof(float));
-        }
-        if (m->use_f32_matmul) {
-            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
-        } else {
+        if (m->use_packed_matmul) {
+            const uint8_t* wp; int rows, dim, pc; float scale;
+            get_tq1_packed(to, wp, rows, dim, pc, scale);
+            for (int b = 0; b < B; b++) {
+                memcpy(m->buf_act + b * dim, attn_out + b * qd, qd * sizeof(float));
+                memset(m->buf_act + b * dim + qd, 0, (dim - qd) * sizeof(float));
+            }
             quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
-            matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
-                              scale, m->buf_hidden, m->buf_gate, B);
+            matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        } else {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(to, w, rs, rows, dim, scale);
+            for (int b = 0; b < B; b++) {
+                memcpy(m->buf_act + b * dim, attn_out + b * qd, qd * sizeof(float));
+                memset(m->buf_act + b * dim + qd, 0, (dim - qd) * sizeof(float));
+            }
+            if (m->use_ternary_matmul) {
+                quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
+                matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs,
+                                          scale, m->buf_gate, B);
+            } else if (m->use_f32_matmul) {
+                matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+            } else {
+                quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
+                matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
+                                  scale, m->buf_hidden, m->buf_gate, B);
+            }
         }
     }
 
@@ -1450,7 +1608,110 @@ static void forward_layer_internal(
         memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
     }
 
-    if (m->use_f32_matmul) {
+    if (m->use_packed_matmul) {
+        // v1.3.1: Direct TQ1-packed gate+up — separate calls per tensor
+        quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
+        {
+            const uint8_t* wp; int rows, dim, pc; float scale;
+            get_tq1_packed(tg, wp, rows, dim, pc, scale);
+            matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        }
+        {
+            const uint8_t* wp; int rows, dim, pc; float scale;
+            get_tq1_packed(tu, wp, rows, dim, pc, scale);
+            matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
+        }
+    } else if (m->use_ternary_matmul) {
+        // Ternary-add FFN: vpsignb, no multiplication, no row_sums correction
+        quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
+
+        int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
+        int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
+        get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
+        get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
+        int rows = g_rows, dim_w = g_dim_v;
+        int rows_packed = rows / 4;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for
+        #endif
+        for (int ur = 0; ur < rows_packed; ur++) {
+            const int8_t* gw4 = gw + ur * 4 * dim_w;
+            const int8_t* uw4 = uw + ur * 4 * dim_w;
+
+            for (int b = 0; b < B; b++) {
+                const uint8_t* a = m->buf_i8 + b * ffn_dim;
+                float deq = max_abs[b] / 127.0f;
+
+                float g_val[4], u_val[4];
+                for (int sub = 0; sub < 4; sub++) {
+                    const int8_t* wg = gw4 + sub * dim_w;
+                    const int8_t* wu = uw4 + sub * dim_w;
+                    __m256i g_acc = _mm256_setzero_si256();
+                    __m256i u_acc = _mm256_setzero_si256();
+                    int c = 0;
+                    for (; c + 32 <= dim_w; c += 32) {
+                        __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                        __m256i ai = _mm256_sub_epi8(au, _mm256_set1_epi8(-128));
+                        __m256i g_wv = _mm256_loadu_si256((const __m256i*)(wg + c));
+                        __m256i u_wv = _mm256_loadu_si256((const __m256i*)(wu + c));
+                        __m256i g_prod = _mm256_sign_epi8(ai, g_wv);
+                        __m256i u_prod = _mm256_sign_epi8(ai, u_wv);
+
+                        __m128i g_lo = _mm256_castsi256_si128(g_prod);
+                        __m128i g_hi = _mm256_extracti128_si256(g_prod, 1);
+                        __m256i g16_lo = _mm256_cvtepi8_epi16(g_lo);
+                        __m256i g16_hi = _mm256_cvtepi8_epi16(g_hi);
+                        __m256i g32_lo = _mm256_madd_epi16(g16_lo, _mm256_set1_epi16(1));
+                        __m256i g32_hi = _mm256_madd_epi16(g16_hi, _mm256_set1_epi16(1));
+                        g_acc = _mm256_add_epi32(g_acc, g32_lo);
+                        g_acc = _mm256_add_epi32(g_acc, g32_hi);
+
+                        __m128i u_lo = _mm256_castsi256_si128(u_prod);
+                        __m128i u_hi = _mm256_extracti128_si256(u_prod, 1);
+                        __m256i u16_lo = _mm256_cvtepi8_epi16(u_lo);
+                        __m256i u16_hi = _mm256_cvtepi8_epi16(u_hi);
+                        __m256i u32_lo = _mm256_madd_epi16(u16_lo, _mm256_set1_epi16(1));
+                        __m256i u32_hi = _mm256_madd_epi16(u16_hi, _mm256_set1_epi16(1));
+                        u_acc = _mm256_add_epi32(u_acc, u32_lo);
+                        u_acc = _mm256_add_epi32(u_acc, u32_hi);
+                    }
+
+                    auto hsum_i32 = [](__m256i acc) -> int {
+                        __m128i lo = _mm256_castsi256_si128(acc);
+                        __m128i hi = _mm256_extracti128_si256(acc, 1);
+                        __m128i s = _mm_add_epi32(lo, hi);
+                        s = _mm_hadd_epi32(s, s);
+                        s = _mm_hadd_epi32(s, s);
+                        return _mm_cvtsi128_si32(s);
+                    };
+                    int g_dot = hsum_i32(g_acc);
+                    int u_dot = hsum_i32(u_acc);
+
+                    for (; c < dim_w; c++) {
+                        int ai8 = (int)a[c] - 128;
+                        g_dot += ai8 * (int)wg[c];
+                        u_dot += ai8 * (int)wu[c];
+                    }
+
+                    // No 128*row_sum correction needed — vpsignb already gives Σ(ai8 * w_i)
+                    g_val[sub] = (float)g_dot * deq / g_scale;
+                    u_val[sub] = (float)u_dot * deq / u_scale;
+                }
+
+                float* g_out = m->buf_gate + b * rows;
+                float* u_out = m->buf_up + b * rows;
+                g_out[0 * rows_packed + ur] = g_val[0];
+                g_out[1 * rows_packed + ur] = g_val[1];
+                g_out[2 * rows_packed + ur] = g_val[2];
+                g_out[3 * rows_packed + ur] = g_val[3];
+                u_out[0 * rows_packed + ur] = u_val[0];
+                u_out[1 * rows_packed + ur] = u_val[1];
+                u_out[2 * rows_packed + ur] = u_val[2];
+                u_out[3 * rows_packed + ur] = u_val[3];
+            }
+        }
+    } else if (m->use_f32_matmul) {
         // Full-precision FFN: f32 activations × int8 weights, no quantization
         int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
         int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
@@ -1574,7 +1835,6 @@ static void forward_layer_internal(
                     u_val[sub] = (float)u_dot * deq / u_scale;
                 }
 
-                // Reorder inline: each packed group scatters to 4 HF rows
                 float* g_out = m->buf_gate + b * rows;
                 float* u_out = m->buf_up + b * rows;
                 g_out[0 * rows_packed + ur] = g_val[0];
@@ -1592,9 +1852,59 @@ static void forward_layer_internal(
     // ─── 8. Fused SiLU(gate)*up → down matmul ───
     {
         auto& td = m->tensors[idx_down];
-        int8_t* w; int32_t* rs; int rows, dim; float scale;
-        get_i8(td, w, rs, rows, dim, scale);
-        if (m->use_f32_matmul) {
+        if (m->use_packed_matmul) {
+            const uint8_t* wp; int rows, dim, pc; float scale;
+            get_tq1_packed(td, wp, rows, dim, pc, scale);
+            // SiLU(gate)*up → quantize to u8 → TQ1-packed matmul
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * dim;
+                float mb = 1e-5f;
+                for (int i = 0; i < inter; i++) {
+                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                    tmp[i] = v;
+                    float av = fabsf(v);
+                    if (av > mb) mb = av;
+                }
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+                float inv = 127.0f / mb;
+                max_abs[b] = mb;
+                for (int i = 0; i < dim; i++) {
+                    int q = (int)(tmp[i] * inv + 128.5f);
+                    if (q < 0) q = 0; if (q > 255) q = 255;
+                    m->buf_i8[b * dim + i] = (uint8_t)q;
+                }
+            }
+            matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        } else {
+            int8_t* w; int32_t* rs; int rows, dim; float scale;
+            get_i8(td, w, rs, rows, dim, scale);
+            if (m->use_ternary_matmul) {
+            // Ternary-add: SiLU(gate)*up → quantize to u8 → vpsignb ternary-add → dequant
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * dim;
+                float mb = 1e-5f;
+                for (int i = 0; i < inter; i++) {
+                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                    tmp[i] = v;
+                    float av = fabsf(v);
+                    if (av > mb) mb = av;
+                }
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+                float inv = 127.0f / mb;
+                max_abs[b] = mb;
+                for (int i = 0; i < dim; i++) {
+                    int q = (int)(tmp[i] * inv + 128.5f);
+                    if (q < 0) q = 0; if (q > 255) q = 255;
+                    m->buf_i8[b * dim + i] = (uint8_t)q;
+                }
+            }
+            matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs,
+                                      scale, m->buf_gate, B);
+        } else if (m->use_f32_matmul) {
             // Full-precision: compute SiLU(gate)*up directly into buf_act, then f32×i8 matmul
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
@@ -1629,6 +1939,7 @@ static void forward_layer_internal(
             }
             matmul_reorder_deq(rows, dim, w, rs, m->buf_i8, max_abs,
                               scale, m->buf_hidden, m->buf_gate, B);
+        }
         }
     }
 

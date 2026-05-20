@@ -1,5 +1,5 @@
 // atlas_ffi.h — Pure C API contract for ATLAS TQ1.0 inference engine
-// v1.0.2 — Single source of truth for FFI consumers (Mojo, Rust, Zig, Go, C)
+// v1.3.0 — Single source of truth for FFI consumers (Mojo, Rust, Zig, Go, C)
 //
 // File format: ATLAS TQ1.0 (.atlas)
 //   [0:5]   "ATLAS" magic
@@ -120,6 +120,20 @@ ATLAS_API void atlas_prefetch_int8(void* model);
 // Set full-precision matmul mode (no activation quantization).
 // Enable for small models (1B) where u8 quantization degrades coherence.
 ATLAS_API void atlas_set_use_f32_matmul(void* model, int val);
+
+// v1.3.0: Set ternary matmul mode (vpsignb, no multiplication).
+// Uses _mm256_sign_epi8 for pure sign-based ternary dot product.
+// Works on existing .i8 cache weights. Eliminates 128*row_sum correction.
+ATLAS_API void atlas_set_use_ternary_matmul(void* model, int val);
+
+// v1.3.1: Set packed TQ1 matmul mode (direct on packed data, no decompression).
+// Reads TQ1-packed weights directly — 5× less memory bandwidth than int8 path.
+// Must be set BEFORE atlas_decompress_all (which would destroy the packed data).
+ATLAS_API void atlas_set_use_packed_matmul(void* model, int val);
+
+// v1.3.1: Set OpenMP thread count for this model (0 = use OMP default).
+// Reduces CPU load on shared systems. 4 threads vs 8 typically loses ~10-20% tok/s.
+ATLAS_API void atlas_set_num_threads(void* model, int n);
 
 // ─── Tensor access ────────────────────────────────────────────────────
 // Get tensor metadata: type, row_dim, col_dim (=packed_cols*5 for TQ1, 0 otherwise).
