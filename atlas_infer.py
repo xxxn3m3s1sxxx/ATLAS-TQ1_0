@@ -41,6 +41,9 @@ dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
 dll.atlas_decompress_all.restype = None
 dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
 
+dll.atlas_decompress_ffn.restype = None
+dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
+
 dll.atlas_save_cache.restype = None
 dll.atlas_save_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
@@ -61,6 +64,9 @@ dll.atlas_set_use_ternary_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_use_packed_matmul.restype = None
 dll.atlas_set_use_packed_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_use_hybrid_matmul.restype = None
+dll.atlas_set_use_hybrid_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_num_threads.restype = None
 dll.atlas_set_num_threads.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -150,7 +156,8 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
 
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
-    def __init__(self, atlas_path, safetensors_path=None, model_dir=None, use_packed_matmul=False):
+    def __init__(self, atlas_path, safetensors_path=None, model_dir=None,
+                 use_packed_matmul=False, use_hybrid_matmul=False):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
@@ -198,6 +205,19 @@ class AtlasModel:
             # v1.3.1: Direct TQ1-packed matmul — keep raw TQ1 data, skip cache/decomp
             dll.atlas_set_use_packed_matmul(self.model_ptr, 1)
             print("[Atlas] Using direct TQ1-packed matmul (no int8 decompression)")
+        elif use_hybrid_matmul:
+            # v1.3.2: FFN int8 cache, QKV packed — best speed/RAM balance
+            # For small models (1B, hidden<=2048), decompress all tensors for f32 bypass
+            # (packed matmul + f32 bypass dispatch is non-deterministic)
+            dll.atlas_set_use_hybrid_matmul(self.model_ptr, 1)
+            if self.hidden <= 2048:
+                dll.atlas_decompress_all(self.model_ptr)
+                print("[Atlas] 1B full int8 (QKV/O also decompressed for f32 bypass)")
+                dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
+            else:
+                dll.atlas_decompress_ffn(self.model_ptr)
+                print("[Atlas] Hybrid: FFN int8, QKV packed")
+            dll.atlas_prefetch_int8(self.model_ptr)
         else:
             # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
             cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
@@ -209,11 +229,9 @@ class AtlasModel:
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)
-
-        # Enable full-precision matmul for small models (1B) where u8 quantization
-        # degrades output coherence. Larger models (3B+) are robust to the noise.
-        if self.hidden <= 2048:
-            dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
+            # Enable full-precision matmul for small models (1B)
+            if self.hidden <= 2048:
+                dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
         # Precompute KV cache
         self.max_seq_len = 4096  # conservative for 16GB
@@ -259,6 +277,10 @@ class AtlasModel:
         """Set C++ PRNG seed for deterministic sampling."""
         dll.atlas_set_seed(ctypes.c_uint64(seed))
 
+    def set_use_f32_matmul(self, enable=True):
+        """v1.3.2: Enable/disable f32 bypass (no activation quantization)."""
+        dll.atlas_set_use_f32_matmul(self.model_ptr, 1 if enable else 0)
+
     def set_use_ternary_matmul(self, enable=True):
         """v1.3.0: Enable/disable ternary-add kernel (vpsignb, no multiplication)."""
         dll.atlas_set_use_ternary_matmul(self.model_ptr, 1 if enable else 0)
@@ -266,6 +288,10 @@ class AtlasModel:
     def set_use_packed_matmul(self, enable=True):
         """v1.3.1: Enable/disable direct TQ1-packed matmul (no decompression, 5× less weight reads)."""
         dll.atlas_set_use_packed_matmul(self.model_ptr, 1 if enable else 0)
+
+    def set_use_hybrid_matmul(self, enable=True):
+        """v1.3.2: Enable/disable hybrid mode (FFN int8, QKV packed)."""
+        dll.atlas_set_use_hybrid_matmul(self.model_ptr, 1 if enable else 0)
 
     def set_num_threads(self, n):
         """v1.3.1: Set OpenMP thread count (0 = default). Lowers CPU load on shared systems."""

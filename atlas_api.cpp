@@ -203,6 +203,7 @@ struct AtlasModel {
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
     bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4× less memory)
+    bool use_hybrid_matmul = false; // v1.3.2: FFN int8 cache, QKV packed
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
     std::vector<std::string> tensor_names;
@@ -788,6 +789,54 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
     printf("[ATLAS] Decompressed %d TQ1 tensors to int8\n", total);
 }
 
+// ─── v1.3.2: Decompress only FFN tensors to int8 (gate/up/down) ────
+ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
+    int total = 0;
+    for (size_t i = 0; i < m->tensors.size(); i++) {
+        auto& t = m->tensors[i];
+        if (t.ttype != 0) continue;
+        // Check name: only decompress MLP tensors
+        if (m->tensor_names.size() > i) {
+            const std::string& name = m->tensor_names[i];
+            if (name.find("mlp") == std::string::npos &&
+                name.find("gate") == std::string::npos &&
+                name.find("down") == std::string::npos) continue;
+        }
+        total++;
+
+        int input_dim = t.packed_cols * 5;
+        int n_vals = t.row_dim * input_dim;
+
+        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        new_data[0] = t.data[0];
+        new_data[1] = t.data[1];
+
+        int8_t* i8 = (int8_t*)(new_data + 2);
+        int32_t* rs = (int32_t*)(i8 + n_vals);
+        const uint8_t* packed = t.data + 2;
+
+        for (int r = 0; r < t.row_dim; r++) {
+            int sum = 0;
+            int pos = 0;
+            for (int c = 0; c < t.packed_cols; c++) {
+                uint8_t b = packed[r * t.packed_cols + c];
+                int v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                v = (b % 3) - 1;        i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+            }
+            rs[r] = sum;
+        }
+
+        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+        t.data = new_data;
+        t.data_size = 2 + n_vals + t.row_dim * 4;
+        t.ttype = 3;
+    }
+    printf("[ATLAS] Decompressed %d FFN tensors to int8\n", total);
+}
+
 // ─── Prefetch int8 data into physical RAM ─────────────────────────────
 // Touch one byte per 4KB page to force page-in / prevent working-set trim lag.
 ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
@@ -1113,6 +1162,11 @@ ATLAS_API void atlas_set_use_packed_matmul(AtlasModel* m, int val) {
     if (m) m->use_packed_matmul = val ? true : false;
 }
 
+// ─── v1.3.2: Set hybrid matmul mode (FFN int8, QKV packed) ──────────
+ATLAS_API void atlas_set_use_hybrid_matmul(AtlasModel* m, int val) {
+    if (m) m->use_hybrid_matmul = val ? true : false;
+}
+
 // ─── v1.3.1: Set OpenMP thread count ──────────────────────────────────
 // n=0 resets to default (all available threads).
 ATLAS_API void atlas_set_num_threads(AtlasModel* m, int n) {
@@ -1428,8 +1482,8 @@ static void forward_layer_internal(
     float* max_abs = (float*)alloca(B * sizeof(float));
 
     auto& tv = m->tensors[idx_v];
-    if (m->use_packed_matmul) {
-        // v1.3.1: Direct TQ1-packed matmul — reads 5× less weight data
+    if (tq.ttype == 0) {
+        // v1.3.1+1.3.2: Direct TQ1-packed matmul (QKV stay packed in hybrid mode)
         quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
         {
             const uint8_t* w; int rows, dim, pc; float scale;
@@ -1542,7 +1596,7 @@ static void forward_layer_internal(
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
-        if (m->use_packed_matmul) {
+        if (to.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(to, wp, rows, dim, pc, scale);
             for (int b = 0; b < B; b++) {
@@ -1608,8 +1662,8 @@ static void forward_layer_internal(
         memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
     }
 
-    if (m->use_packed_matmul) {
-        // v1.3.1: Direct TQ1-packed gate+up — separate calls per tensor
+    if (tg.ttype == 0) {
+        // v1.3.1+1.3.2: Direct TQ1-packed gate+up (FFN stay packed in full-packed mode)
         quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
         {
             const uint8_t* wp; int rows, dim, pc; float scale;
@@ -1852,7 +1906,7 @@ static void forward_layer_internal(
     // ─── 8. Fused SiLU(gate)*up → down matmul ───
     {
         auto& td = m->tensors[idx_down];
-        if (m->use_packed_matmul) {
+        if (td.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(td, wp, rows, dim, pc, scale);
             // SiLU(gate)*up → quantize to u8 → TQ1-packed matmul
@@ -2247,7 +2301,8 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
     output_ids[n_gen++] = next_token;
 
-    if (next_token == 0) {  // EOS
+    const int eos_id = 11;  // Falcon3: <|endoftext|>
+    if (next_token == eos_id) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
         return n_gen;
@@ -2275,7 +2330,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
         output_ids[n_gen++] = next_token;
 
-        if (next_token == 0) break;  // EOS
+        if (next_token == eos_id) break;  // EOS
     }
 
     atlas_vfree((uint8_t*)embed_buf);

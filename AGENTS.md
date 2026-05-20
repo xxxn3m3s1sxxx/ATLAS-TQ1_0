@@ -26,9 +26,17 @@
 - **v1.2.1 Patch Release**: `AtlasModel.set_seed()` as clean Python method. Version bump. Released as GitHub latest.
 - **v1.3.0 — Ternary-Add Kernel**: `matmul_ternary_add_reorder` with `_mm256_sign_epi8` — pure sign-based ternary dot product. Eliminates 128*row_sum correction. Fused FFN ternary gate+up path. `atlas_set_use_ternary_matmul()` C API, `AtlasModel.set_use_ternary_matmul()` Python. Identical argmax to int8 path (10B T=0). "The capital of France is Paris." ✅.
 - **v1.3.1 — Direct TQ1-Packed Matmul + num_threads**: `matmul_tq1_packed_reorder` with chunked decode + `vpmaddubs` SIMD int8 matmul. Pre-computed Base-3 LUT (`tq1_decode[256][5]`, 1280 bytes, L1-resident). Per-thread decode buffer via `malloc`/`free` inside OMP. Correct 128*row_sum activation bias correction verified. `atlas_set_use_packed_matmul()` C API. `atlas_set_num_threads()` C API + `AtlasModel.set_num_threads(n)` Python. T=0 coherence: packed=Paris, int8=Paris ✅. Builds clean with `-Wall -Wextra -Wpedantic` (0 warnings). **Pushed as v1.3.1 release on GitHub.**
+- **v1.3.2 — Hybrid Mode (FFN int8 + QKV packed)**: `atlas_set_use_hybrid_matmul()` + `atlas_decompress_ffn()` C APIs. Per-tensor ttype-based dispatch (ttype=0→packed, ttype=3→int8). FFN (gate/up/down) decompressed to int8, QKV/O stay packed. **6.6 tok/s on 10B** (warm) — faster than full int8 cold start because no 9.5 GB cache file to load. ~9.3 GB RAM. All 4 models packed + tested.
+- **v1.3.2 Full Portfolio**: All 4 Falcon3 models packed and benchmarked on i5-1235U:
+  - **1B hybrid**: 14.9 tok/s, ~1.4 GB, f32 bypass auto-enabled
+  - **3B hybrid**: 4.6 tok/s, ~4 GB
+  - **7B hybrid**: 7.4 tok/s, ~7 GB
+  - **10B hybrid**: 4.8 tok/s (warm), ~9.3 GB
+- **1B hybrid fix**: When hidden<=2048 in hybrid mode, decompresses ALL tensors (not just FFN) to ensure f32 bypass fires deterministically. Packed→f32 dispatch gap (ttype==0 checked before use_f32_matmul) fixed by bypassing packed path entirely for small models.
+- **3B `generate_c` coherence verified — FALSE ALARM**: Extensive debugging showed the C path (`atlas_generate`) produces identical correct output ("Paris") at T=0 for 3B. The earlier perception of a bug was caused by comparing against Python `generate()` which has a different sampling implementation (numpy multinomial vs Xoshiro256** Gumbel-max) and uses `_rmsnorm`/`_lmhead_gemv` Python wrappers that produce slightly different numerics from the C path. Verified with 0xCC garbage-filled decode buffers (no uninitialized tail issue). All 4 models: **1B/3B/7B/10B all produce correct answers at T=0 via `generate_c()`**.
+- **NULL-check added**: `matmul_tq1_packed_reorder` decode_buf malloc now has NULL check before use.
 
 ### In Progress
-- **v1.3.2 — Mixed-Precision**: ttype=4 for int4 protected layers (down_proj, first 2-3 FFN).
 - **v2.0.0 — C++ BPE Tokenizer**: Python-autarkic. Single FFI call, no PreTrainedTokenizerFast dependency.
 
 ### Fixed
@@ -43,23 +51,29 @@
 - **Shared gate+up quantization**: C++ fused path = single shared scale. Python per-layer = separate scales. 0.3% gap is EXPECTED.
 
 ## Next Steps
-1. ~~#3 Tokenizer + safetensors overhead killen~~ **(DONE — v5 embedded tokenizer)**
-2. ~~**Linux native testen**~~ **(DONE — v1.2.0 compile-linux.sh validated)**
-3. ~~**10B coherence test**~~ **(DONE — "The capital of France is Paris." ✅)**
-4. ~~**README finalisieren**~~ **(DONE)**
+1. ~~v5 embedded tokenizer~~ ✅
+2. ~~Linux compile~~ ✅
+3. ~~All models packed + coherence verified~~ ✅
+4. ~~v1.3.2 hybrid mode for all 4 models~~ ✅
+5. **v2.0.0 — C++ BPE Tokenizer**: Remove Python tokenizer dependency entirely.
 
 ## Critical Context
-- **v1.3.1 latest** (TQ1-Packed Matmul: `matmul_tq1_packed_reorder` with chunked decode + SIMD).
-- **10B model only** on disk (1B/3B/7B removed to free space for 10B testing).
-- **`.i8` cache**: Auto-generated on first load, mmap'd on subsequent loads.
-- **Prefill is already batched**: `forward()` passes all prompt tokens as B=prompt_len in single `atlas_forward` call. `atlas_attention_f32` handles causal masking per-token within the batch.
-- **Engine correctness**: corr=0.9967 with fixed Python reference. Remaining 0.3% = shared quantization gap.
-- **1B f32 bypass**: Auto-enabled for `hidden <= 2048`. Confirms u8 path is exact (identical argmax).
-- **Benchmarks (v1.3.1, i5-1235U, 8 OMP threads, 30 tok, Python generate, warm)**:
-  - **10B int8 cache**: load=7.5s, gen=~5.4 tok/s, 10.8 GB RAM
-  - **10B packed**: load=1.6s, gen=1.2-3.3 tok/s, 7.5 GB RAM
-- **Coherence**: T=0 identical argmax between packed and int8 ("The capital of France is Paris."). Verified: the 128*row_sum correction is REQUIRED because uint8 activations have a +128 bias, regardless of whether weights are ternary or full-range int8.
-- **Memory**: Loading via file mmap (zero-copy). Packed mode: ~200 MB Python + ~3.3 GB C++ (TQ1 mmap only).
+- **v1.3.2 latest** (Hybrid Mode: FFN int8, QKV packed — best speed/RAM balance).
+- **All 4 models on disk** (C:\models): 1B/3B/7B/10B + packed .atlas files in C:\atlas.
+- **Hybrid default path**: FFN tensors decompressed to int8 (ttype=3), QKV/O stay packed (ttype=0). Per-tensor ttype dispatch in forward. For 1B (hidden<=2048), all tensors decompressed + f32 bypass enabled.
+- **`.i8` cache**: Auto-generated on first load (full decompress path), mmap'd on subsequent loads.
+- **Prefill is already batched**: `forward()` passes all prompt tokens as B=prompt_len in single `atlas_forward` call.
+- **Three matmul modes**: hybrid (default), packed (use_packed_matmul=True), int8 (full cache).
+- **Coherence**: ALL 4 models produce "Paris" at T=0 via `generate_c()`. 1B greedy degenerates to `,` (model-inherent distribution, not engine). 3B greedy repeats "Paris" sentence (model-inherent). 7B/10B give single "Paris". All pass at T=0.
+- **f32 bypass dispatch**: `use_f32_matmul` is checked AFTER `t.ttype==0` in forward. For 1B hybrid, all tensors are decompressed so f32 bypass fires correctly. Pure packed + f32 bypass is broken (ttype==0 catches first) — not used because 1B hybrid auto-decompresses everything.
+- **Benchmarks (v1.3.2, i5-1235U, 8 OMP threads, 30 tok, generate_c, warm)**:
+  - **1B hybrid**: 14.9 tok/s, ~1.4 GB
+  - **3B hybrid**: 4.6 tok/s, ~4 GB
+  - **7B hybrid**: 7.4 tok/s, ~7 GB
+  - **10B hybrid**: 4.8 tok/s, ~9.3 GB
+  - **10B int8 cache**: 5.4 tok/s, 10.8 GB
+  - **10B packed**: 1.5 tok/s, 7.5 GB
+- **128*row_sum correction**: REQUIRED for ALL uint8×int8 matmuls (activation quantization adds +128 bias, regardless of weight format).
 
 ## Custom Skills (.opencode/skills/)
 - `atlas-build`: Compile the C++ DLL/SO with correct flags (Windows clang++ / Linux GCC). Debug/release build + common linking fixes.

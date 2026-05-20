@@ -135,6 +135,13 @@ ATLAS_API void atlas_set_use_packed_matmul(void* model, int val);
 // Reduces CPU load on shared systems. 4 threads vs 8 typically loses ~10-20% tok/s.
 ATLAS_API void atlas_set_num_threads(void* model, int n);
 
+// v1.3.2: Set hybrid matmul mode (FFN int8 cache, QKV packed).
+// Best speed/RAM balance: ~90% of full int8 speed, ~8 GB RAM.
+ATLAS_API void atlas_set_use_hybrid_matmul(void* model, int val);
+
+// v1.3.2: Decompress only FFN tensors (gate/up/down) to int8, leave QKV packed.
+ATLAS_API void atlas_decompress_ffn(void* model);
+
 // ─── Tensor access ────────────────────────────────────────────────────
 // Get tensor metadata: type, row_dim, col_dim (=packed_cols*5 for TQ1, 0 otherwise).
 ATLAS_API void atlas_tensor_info(void* model, int idx, int* ttype,
