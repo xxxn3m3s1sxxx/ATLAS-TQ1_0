@@ -45,3 +45,4 @@ profile_layer.py
 *.zip
 instrument_prefill.py
 test_layer0.py
+.opencode/

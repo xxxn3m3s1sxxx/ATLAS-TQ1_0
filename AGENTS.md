@@ -62,6 +62,30 @@
   - **10B**: load=7.5s, gen=21.1s/30tok (1.4 tok/s) — "The capital of France is Paris." ✅
 - **Memory**: Loading via file mmap (zero-copy). `AtlasModel(model)` = ~200 MB Python + ~1-10 GB C++ (OS-paged from mmap).
 
+## Custom Plugin: Hashline OpenCode Plugin
+- `C:\Users\skap\.config\opencode\plugins\hashline.ts`: Hashline OpenCode Plugin — registers two tools:
+  - `hashline_edit` — drop-in replacement for `edit()` when str_replace fails. Takes `path`, `old`, `new`, shells out to `hashline.py replace` with temp files.
+  - `hashline_patch` — apply raw hashline diff format directly (`@@ file\n+ ANCHOR\n~payload`, etc.)
+- Auto-loads from global `plugins/` directory. Checks `hashline.py` availability on startup.
+- **trace.ts active**: CLI 28/28 tests, plugin uses `child_process.spawnSync`.
+- Uses `--file-old` / `--file-new` flags to pass multi-line content (temp files in OS tmpdir, cleaned up in `finally`).
+- `hashline.py` `replace` command supports `--file-old`, `--file-new`, `--stdin-old`/`--stdin-new` with `\n===OLD/NEW===\n` delimiter.
+- `hashline.py` `replace` command supports `--file-old`, `--file-new`, `--stdin-old`/`--stdin-new` with `\n===OLD/NEW===\n` delimiter.
+
+## Custom Skills (.opencode/skills/)
+- `atlas-build`: Compile the C++ DLL/SO with correct flags (Windows clang++ / Linux GCC). Debug/release build + common linking fixes.
+- `atlas-kernel`: AVX2 int8 matmul, f32 bypass, attention, RMSNorm, sampling kernels. Correctness expectations (corr>0.996) and memory model.
+- `atlas-benchmark`: tok/s measurement, load times, f32-bypass comparison. Known benchmarks table. Coherence verification protocol.
+- `atlas-hashline`: Hash-anchored editing with `hashline.py` — LINE+HASH anchors statt str_replace. SHA-256 content hashes, 4 edit ops, anchor validation, multi-file support.
+
+## Hashline Editing
+- `C:\atlas\hashline.py`: Hash-anchored editing tool — SHA-256 content hashes, 4 edit ops (`+`, `<`, `=`, `-`), anchor validation, multi-file support.
+- `.opencode/skills/atlas-hashline/SKILL.md`: Skill für Hashline-Workflow.
+- Usage: `python hashline.py read <file>` → Anker sehen, dann `python hashline.py edit <file> <diff>`.
+- Also: `python hashline.py replace <file> --file-old <old> --file-new <new>`.
+- Set `$env:PYTHONIOENCODING="utf-8"` auf Windows.
+- OpenCode Plugin: `hashline_edit` (drop-in für edit) + `hashline_patch` (raw diffs) via global plugins dir.
+
 ## Relevant Files
 - `C:\atlas\atlas_api.cpp`: `atlas_get_tokenizer()` C API (line 441), v5 header parsing (bytes 29-36), AllocHdr valloc/vfree, is_mapped guards, int8 matmul kernel, f32 bypass, Xoshiro256** PRNG, Gumbel-max sample, `atlas_generate()`.
 - `C:\atlas\atlas_infer.py`: `AtlasModel` — embedded tokenizer loading via `atlas_get_tokenizer()`, `generate_c()` wraps `atlas_generate` (v1.2.1). `set_seed()` Python method.
@@ -69,3 +93,4 @@
 - `C:\atlas\atlas_packer.py`: v5 format writer — appends tokenizer block after tensor data, stores offset in header.
 - `C:\atlas\falcon3-10b-tq1.atlas`: **v5** packed 10B model file with embedded tokenizer.
 - `C:\models\Falcon3-10B-Instruct-1.58bit\`: model config, optional safetensors (only needed for repacking).
+- `C:\atlas\.opencode\opencode-tools\`: Monorepo — hashline (42 tests) + impact (63) + verify (48) + trace (28) = 181 total.
