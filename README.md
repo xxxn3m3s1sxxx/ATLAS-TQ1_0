@@ -6,7 +6,7 @@
 
 CPU inference engine for Falcon3 BitNet b1.58 ternary-quantized models. Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **Architecture Scope:** ATLAS v1.4.0 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **Architecture Scope:** ATLAS v2.0.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
 
 ## Supported Models
 
@@ -17,11 +17,14 @@ CPU inference engine for Falcon3 BitNet b1.58 ternary-quantized models. Repacks 
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 |
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 |
 
-All use `head_dim=256`, `rope_theta=1000042`, GQA. v5 `.atlas` format embeds tokenizer — no external files needed.
+All use `head_dim=256`, `rope_theta=1000042`, GQA. v5/v6 `.atlas` format embeds tokenizer (v6: binary pool-lookup decode, no external deps) — no external files needed.
 
 ## Quick Start
 
 ```bash
+# Runtime only (inference):
+pip install numpy
+# For repacking models from safetensors:
 pip install numpy safetensors transformers
 ```
 
@@ -75,7 +78,7 @@ These numbers reflect the interplay of SIMD throughput, cache pressure, and memo
 
 - **10B (hybrid dominance):** Hybrid leads at **11.0 tok/s** vs int8 (8.8). On the i7-7700T's 8 MB L3 cache, the full int8 path causes constant cache evictions across 40 layers. Hybrid's packed QKV slashes memory traffic by 5×, keeping the FFN-heavy pipeline fed and avoiding L3 thrashing.
 
-### Hybrid Mode (default, v1.3.2/v1.4.0)
+### Hybrid Mode (default, v1.3.2+)
 
 Best speed/RAM balance. FFN projections (gate/up/down) run as decompressed int8 — they dominate compute. QKV/O projections stay in TQ1-packed format — they're memory-bound and benefit from 5× fewer bytes read.
 
@@ -132,10 +135,11 @@ safetensors → atlas_packer.py → .atlas file → atlas_infer.py → atlas.dll
 ### Pipeline
 
 1. **Packer** (`atlas_packer.py`): De-interleaves BitNet's 4-row-packed uint8 → Base-3 TQ1. 5 trits per byte, padded with ternary-0.
-2. **v5 file format**: 64-byte header (magic `"ATLAS"`, version=5, model hyperparameters, tokenizer offset/size), 12-byte tensor directory, name block, data, embedded tokenizer (tokenizer.json + config — loadable by `tokenizers::Tokenizer::from_buffer()`). C API `atlas_get_tokenizer()` exposes the raw bytes. No external model directory needed: `AtlasModel('model.atlas')` suffices.
+2. **v5/v6 file format**: v5: 64-byte header (magic `"ATLAS"`, version=5, model hyperparameters, tokenizer offset/size), 12-byte tensor directory, name block, data, embedded tokenizer.json. v6: same structure + binary tokenizer block (128-byte header, pool offsets/lengths, BPE merges, byte_encoder, special tokens) — enables C++ pool-lookup decode without `transformers` or `tokenizers` libraries. C API `atlas_get_tokenizer()` exposes v5 JSON or v6 binary block. `AtlasModel('model.atlas')` suffices, no external model directory.
 3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. TQ1 tensors are decompressed to int8 with per-tensor `valloc`/`vfree` (`VirtualAlloc` on Windows, `mmap` on Linux). `atlas_forward` runs all N layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) — with no Python round-trips between layers. Ping-pong buffers avoid per-layer copies.
-4. **Matmul modes**: int8 (`vpmaddubs_epi16`), f32 bypass (`vfmadd231ps`), ternary-add (`vpsignb`), TQ1-packed (chunked decode + SIMD). Switched at runtime.
-5. **Sampling**: Xoshiro256** PRNG + Gumbel-max top-k/top-p. T=0 → argmax. Optimized survivor-list collection (top-k prunes to ~40 candidates, top-p operates on survivors only — eliminates O(V log V) sort).
+4. **Tokenizer (v6)**: Python `tokenizers` for encode (Falcon3's byte_encoder is fundamentally incompatible with C++ byte-level pre-encode — 191/256 byte tokens overwritten by special tokens). C++ pool-lookup for decode (`O(1)` per token). `_apply_chat_template` renders Falcon3 Jinja2 format without `transformers`.
+5. **Matmul modes**: int8 (`vpmaddubs_epi16`), f32 bypass (`vfmadd231ps`), ternary-add (`vpsignb`), TQ1-packed (chunked decode + SIMD). Switched at runtime.
+6. **Sampling**: Xoshiro256** PRNG + Gumbel-max top-k/top-p. T=0 → argmax. Optimized survivor-list collection (top-k prunes to ~40 candidates, top-p operates on survivors only — eliminates O(V log V) sort).
 
 ## Bugfix Chronology
 
@@ -224,12 +228,27 @@ All four Falcon3 models (1B, 3B, 7B, 10B) pass coherence: "The capital of France
 
 | File | Purpose |
 |------|---------|
-| `atlas_packer.py` | safetensors → TQ1 v5 (embedded tokenizer) |
+| `atlas_packer.py` | safetensors → TQ1 v5/v6 (embedded tokenizer + optional binary tokenizer block) |
+| `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
 | `atlas_infer.py` | Python inference engine |
-| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms) |
+| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer) |
 | `atlas_ffi.h` | C API contract |
 | `atlas.dll` / `libatlas.so` | Prebuilt binaries |
 | `falcon3-{1,3,7,10}b-tq1.atlas` | Packed models |
+
+## Version History
+
+| Version | Key Changes |
+|---------|-------------|
+| **v2.0.1** | `scores` alloca → heap (stack fully sterile) |
+| **v2.0.0** | C++ binary tokenizer (v6 format) — no `transformers` dependency at runtime |
+| **v1.4.0** | Stack overflow fix, survivor-list sampling optimization |
+| **v1.3.2** | Hybrid mode (FFN int8 + QKV packed), per-tensor dispatch |
+| **v1.3.1** | Direct TQ1-packed matmul, `atlas_set_num_threads` |
+| **v1.3.0** | Ternary-add kernel (`vpsignb`), eliminates row_sum correction |
+| **v1.2.0** | C++ sampling (Xoshiro256**, Gumbel-max), `atlas_generate` |
+| **v1.1.0** | AllocHdr-based valloc/vfree, production hardening |
+| **v1.0.0** | Initial TQ1.0 inference engine |
 
 ## License
 
