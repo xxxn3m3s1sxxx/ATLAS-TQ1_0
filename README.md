@@ -6,7 +6,7 @@
 
 CPU inference engine for Falcon3 BitNet b1.58 ternary-quantized models. Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **Architecture Scope:** ATLAS v2.0.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **Architecture Scope:** ATLAS v2.0.3 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
 
 ## Supported Models
 
@@ -240,6 +240,8 @@ All four Falcon3 models (1B, 3B, 7B, 10B) pass coherence: "The capital of France
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.0.3** | n_input ≥ max_seq_len guard (CRITICAL), scores_buf OOM guard (Bug 9) |
+| **v2.0.2** | Memory leak fix (__del__), KV-cache overflow clamp, stale .i8 cache validation, thread-local statics, seed=0 pass-through |
 | **v2.0.1** | `scores` alloca → heap (stack fully sterile) |
 | **v2.0.0** | C++ binary tokenizer (v6 format) — no `transformers` dependency at runtime |
 | **v1.4.0** | Stack overflow fix, survivor-list sampling optimization |

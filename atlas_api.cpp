@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <vector>
 #include <string>
+#include <mutex>
 #include <immintrin.h>
 #include <omp.h>
 
@@ -121,10 +122,10 @@ static int gumbel_sample(float* logits, int V,
         for (int i = 0; i < V; i++) logits[i] *= invT;
     }
 
-    static std::vector<int> sidx;
+    thread_local std::vector<int> sidx;
 
     if (top_k > 0 && top_k < V) {
-        static std::vector<float> scopy;
+        thread_local std::vector<float> scopy;
         if ((int)scopy.size() < V) scopy.resize(V);
         memcpy(scopy.data(), logits, V * sizeof(float));
         std::nth_element(scopy.begin(), scopy.begin() + top_k - 1, scopy.end(),
@@ -801,6 +802,21 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
     char path[1024]; cache_path(atlas_path, path, sizeof(path));
 
     int n = (int)m->tensors.size();
+
+    // Get atlas file size to prevent stale cache loading
+    int64_t atlas_file_size = 0;
+#ifdef _WIN32
+    HANDLE hA = CreateFileA(atlas_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hA != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fs; if (GetFileSizeEx(hA, &fs)) atlas_file_size = fs.QuadPart;
+        CloseHandle(hA);
+    }
+#else
+    struct stat st;
+    if (stat(atlas_path, &st) == 0) atlas_file_size = (int64_t)st.st_size;
+#endif
+
     // Compute total data size needed
     int64_t total_data = 0;
     for (int i = 0; i < n; i++) {
@@ -809,7 +825,7 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
             total_data += t.data_size;
     }
 
-    int64_t header_size = 4 + (int64_t)n * 21;
+    int64_t header_size = 12 + (int64_t)n * 21;
     int64_t cache_size = header_size + total_data;
 
     // Check available disk space on Windows
@@ -837,6 +853,7 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
 #endif
 
     fwrite(&n, 4, 1, f);
+    fwrite(&atlas_file_size, 8, 1, f);
 
     // Only cache int8-decoded tensors (ttype==3). Non-int8 tensors (norms, embed, GQA scales)
     // have correct data from atlas_load and don't need caching.
@@ -926,7 +943,15 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 #endif
 
     int n = *(int*)base;
-    int64_t min_size = 4 + (int64_t)n * 21;
+    if (file_size < 12) {
+#ifdef _WIN32
+        UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+        munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
+        return 0;
+    }
+    int64_t min_size = 12 + (int64_t)n * 21;
     if (n != (int)m->tensors.size() || file_size < (size_t)min_size) {
 #ifdef _WIN32
         UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
@@ -936,7 +961,33 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         return 0;
     }
 
-    uint8_t* hdr = base + 4;
+    // Validate atlas file size to prevent loading stale cache
+    int64_t cached_atlas_size;
+    memcpy(&cached_atlas_size, base + 4, 8);
+    int64_t current_atlas_size = 0;
+#ifdef _WIN32
+    HANDLE hA = CreateFileA(atlas_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hA != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fs; if (GetFileSizeEx(hA, &fs)) current_atlas_size = fs.QuadPart;
+        CloseHandle(hA);
+    }
+#else
+    struct stat st;
+    if (stat(atlas_path, &st) == 0) current_atlas_size = (int64_t)st.st_size;
+#endif
+    if (cached_atlas_size != current_atlas_size || current_atlas_size == 0) {
+        printf("[CACHE] Atlas file size mismatch (%lld vs %lld), ignoring\n",
+               (long long)cached_atlas_size, (long long)current_atlas_size);
+#ifdef _WIN32
+        UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+        munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
+        return 0;
+    }
+
+    uint8_t* hdr = base + 12;
     int64_t data_start = min_size;
 
     int replaced = 0;
@@ -964,10 +1015,19 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 
         auto& t = m->tensors[i];
         if (t.ttype == 0 && cttype == 3 && ds > 0 && off >= 0) {
+            // Validate tensor shapes match model
+            if (t.row_dim != row_dim || t.packed_cols != cpc) {
+                printf("[CACHE] Tensor %d shape mismatch (model: %dx%d, cache: %dx%d), ignoring\n",
+                       i, t.row_dim, t.packed_cols, row_dim, cpc);
+#ifdef _WIN32
+                UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+                munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
+                return 0;
+            }
             if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
             t.ttype = 3;
-            t.row_dim = row_dim;
-            t.packed_cols = cpc;
             t.data_size = ds;
             t.data = (uint8_t*)(base + data_start + off);
             replaced++;
@@ -1259,15 +1319,15 @@ ATLAS_API void atlas_attention_f32(
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
 
     // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
-    int max_seq = seq_now;
-    static float* scores_buf = nullptr;
-    static size_t scores_cap = 0;
+    int max_seq = seq_now > max_seq_len ? max_seq_len : seq_now;
+    thread_local float* scores_buf = nullptr;
+    thread_local size_t scores_cap = 0;
     size_t needed = (size_t)n_heads * max_seq;
     if (needed > scores_cap) {
         free(scores_buf);
         scores_cap = needed;
         scores_buf = (float*)malloc(scores_cap * sizeof(float));
-        if (!scores_buf) { scores_cap = 0; }
+        if (!scores_buf) { scores_cap = 0; return; }
     }
     float* scores = scores_buf;
 
@@ -1491,11 +1551,11 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
 
 // ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
 // Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
+static std::once_flag tq1_decode_init_flag;
 alignas(32) static int8_t tq1_decode[256][5];
-static bool tq1_decode_init = false;
 
 static void init_tq1_decode_lut() {
-    if (tq1_decode_init) return;
+    std::call_once(tq1_decode_init_flag, [&]() {
     for (int b = 0; b < 256; b++) {
         int t = b;
         tq1_decode[b][0] = (int8_t)((t % 3) - 1); t /= 3;
@@ -1504,7 +1564,7 @@ static void init_tq1_decode_lut() {
         tq1_decode[b][3] = (int8_t)((t % 3) - 1); t /= 3;
         tq1_decode[b][4] = (int8_t)((t % 3) - 1);
     }
-    tq1_decode_init = true;
+    }); // std::call_once
 }
 
 // ─── Fused TQ1 decode + int32 dot product for packed weights ──────────
@@ -2428,7 +2488,7 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
 
 // ─── v1.2.0: Seed PRNG ─────────────────────────────────────────────────
 ATLAS_API void atlas_set_seed(uint64_t seed) {
-    xoshiro_seed(seed ? seed : 0xDEADBEEFCAFEBABEull);
+    xoshiro_seed(seed);
 }
 
 // ─── v1.2.0: Sample one token via Gumbel-max ──────────────────────────
@@ -2480,6 +2540,11 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 {
     if (!m || !input_ids || !output_ids || n_input < 1 || max_new_tokens < 1)
         return -1;
+    if (n_input >= max_seq_len) {
+        fprintf(stderr, "[ATLAS] atlas_generate: prompt (%d) >= max_seq_len (%d), use shorter prompt\n",
+                n_input, max_seq_len);
+        return -1;
+    }
 
     // Find required tensors by name
     int idx_norm = -1, idx_embed = -1;
@@ -2558,6 +2623,13 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     // ─── Decode loop ───
     atlas_vfree((uint8_t*)positions);
+    // Veto: clamp max_new_tokens to prevent KV cache overflow
+    int max_possible = max_seq_len - n_input;
+    if (max_possible <= 0) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); return 0;
+    }
+    if (max_new_tokens > max_possible) max_new_tokens = max_possible;
     for (int step = 1; step < max_new_tokens; step++) {
         // Embed last generated token
         int tid = next_token;

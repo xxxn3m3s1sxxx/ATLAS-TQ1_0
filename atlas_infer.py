@@ -310,6 +310,11 @@ class AtlasModel:
                 print("[Atlas] No embedded tokenizer found")
 
 
+    def __del__(self):
+        if self.model_ptr:
+            dll.atlas_free(self.model_ptr)
+            self.model_ptr = None
+
     def set_seed(self, seed):
         """Set C++ PRNG seed for deterministic sampling."""
         dll.atlas_set_seed(ctypes.c_uint64(seed))
