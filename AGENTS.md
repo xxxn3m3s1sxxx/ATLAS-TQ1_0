@@ -56,15 +56,14 @@
 - **`atlas_forward` seq_now**: Must be actual sequence length, NOT layer count.
 - **Shared gate+up quantization**: C++ fused path = single shared scale. Python per-layer = separate scales. 0.3% gap is EXPECTED.
 
-## Next Steps
-1. ~~v5 embedded tokenizer~~ ✅
-2. ~~Linux compile~~ ✅
-3. ~~All models packed + coherence verified~~ ✅
-4. ~~v1.3.2 hybrid mode for all 4 models~~ ✅
-5. **v2.0.0 — C++ Binary Tokenizer**: Remove Python tokenizer dependency entirely.
+## Next Steps (v2.5.0-alpha)
+1. **TQ1-LUT (Decompress-Hotpath)**: Replace `%3//3` modulo ops in inner decode loop with precomputed LUT (`int8_t[243][5]`). Directly reduces per-token decode latency.
+2. **BPE-PQ (Encoder-Tuning)**: Priority-queue (max-heap) for C++ BPE merge loop — O(N log N) instead of O(N²) for long prompts.
+3. **F16C (Hardware-Kopplung)**: Native F16C instructions in matmul kernel for mixed-precision attention acceleration.
+4. **T=0.7 Benchmark-Standard**: `generate_c` test protocol switches from T=0.0 to T=0.7, top_k=40. Eliminates model-inherent deterministic degeneracy (1B newline collapse, 7B early EOS).
 
 ## Critical Context
-- **v1.4.0 latest** (Stack overflow fix — heap-allocated attention workspace).
+- **v2.0.0 latest** (C++ Binary Tokenizer, v6 format, no transformers dependency).
 - **All 4 models on disk** (C:\models): 1B/3B/7B/10B + packed .atlas files in C:\atlas.
 - **Hybrid default path**: FFN tensors decompressed to int8 (ttype=3), QKV/O stay packed (ttype=0). Per-tensor ttype dispatch in forward. For 1B (hidden<=2048), all tensors decompressed + f32 bypass enabled.
 - **`.i8` cache**: Auto-generated on first load (full decompress path), mmap'd on subsequent loads.
