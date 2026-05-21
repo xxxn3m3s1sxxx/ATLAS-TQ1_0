@@ -108,13 +108,11 @@ static float xoshiro_float() {
 // When temperature <= 0: deterministic argmax (greedy).
 static int gumbel_sample(float* logits, int V,
                           float temperature, int top_k, float top_p) {
-    // Temperature ≤ 0: deterministic greedy argmax
     if (temperature <= 0.0f) {
         int best = 0;
         float best_val = logits[0];
-        for (int i = 1; i < V; i++) {
+        for (int i = 1; i < V; i++)
             if (logits[i] > best_val) { best_val = logits[i]; best = i; }
-        }
         return best;
     }
 
@@ -123,49 +121,66 @@ static int gumbel_sample(float* logits, int V,
         for (int i = 0; i < V; i++) logits[i] *= invT;
     }
 
-    // Top-k: find kth largest, zero out below it
+    static std::vector<int> sidx;
+
     if (top_k > 0 && top_k < V) {
-        std::vector<float> copy(logits, logits + V);
-        std::nth_element(copy.begin(), copy.begin() + top_k - 1, copy.end(),
+        static std::vector<float> scopy;
+        if ((int)scopy.size() < V) scopy.resize(V);
+        memcpy(scopy.data(), logits, V * sizeof(float));
+        std::nth_element(scopy.begin(), scopy.begin() + top_k - 1, scopy.end(),
                          [](float a, float b) { return a > b; });
-        float threshold = copy[top_k - 1];
+        float threshold = scopy[top_k - 1];
+        sidx.clear();
+        for (int i = 0; i < V; i++) {
+            if (logits[i] < threshold) {
+                logits[i] = -FLT_MAX / 4;
+            } else {
+                sidx.push_back(i);
+            }
+        }
+    } else {
+        // Collect survivors the normal way
+        sidx.clear();
         for (int i = 0; i < V; i++)
-            if (logits[i] < threshold) logits[i] = -FLT_MAX / 4;
+            if (logits[i] > -FLT_MAX / 8) sidx.push_back(i);
     }
 
-    // Softmax (max-subtraction for numerical stability) into probs
-    float max_val = -FLT_MAX / 4;
-    for (int i = 0; i < V; i++) if (logits[i] > max_val) max_val = logits[i];
-    float sum_exp = 0.0f;
-    for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_val);
-    float inv_sum = 1.0f / (sum_exp + 1e-38f);
-    for (int i = 0; i < V; i++) logits[i] = expf(logits[i] - max_val) * inv_sum;
-
-    // Top-p: find nucleus via descending sort, mask tail
     if (top_p > 0.0f && top_p < 1.0f) {
-        std::vector<int> idx(V);
-        for (int i = 0; i < V; i++) idx[i] = i;
-        std::sort(idx.begin(), idx.end(),
-                  [&](int a, int b) { return logits[a] > logits[b]; });
-        float cum = 0.0f;
-        for (int i = 0; i < V; i++) {
-            cum += logits[idx[i]];
-            if (cum > top_p) {
-                for (int j = i + 1; j < V; j++) logits[idx[j]] = 0.0f;
-                break;
+        int S = (int)sidx.size();
+        if (S > 1) {
+            // Softmax on survivors only
+            float max_val = logits[sidx[0]];
+            for (int i = 1; i < S; i++)
+                if (logits[sidx[i]] > max_val) max_val = logits[sidx[i]];
+            float sum_exp = 0.0f;
+            for (int i = 0; i < S; i++) sum_exp += expf(logits[sidx[i]] - max_val);
+            float inv_sum = 1.0f / (sum_exp + 1e-38f);
+            for (int i = 0; i < S; i++)
+                logits[sidx[i]] = expf(logits[sidx[i]] - max_val) * inv_sum;
+
+            // Max-heap on survivors only: pop largest until cum > top_p.
+            std::make_heap(sidx.begin(), sidx.end(),
+                           [&](int a, int b) { return logits[a] < logits[b]; });
+            float cum = 0.0f;
+            int n = S;
+            for (int i = 0; i < S && cum < top_p; i++) {
+                std::pop_heap(sidx.begin(), sidx.begin() + n,
+                              [&](int a, int b) { return logits[a] < logits[b]; });
+                n--;
+                cum += logits[sidx[n]];
             }
+            for (int j = 0; j < n; j++) logits[sidx[j]] = -FLT_MAX / 4;
         }
     }
 
-    // Gumbel-max: add noise, take argmax
+    // Gumbel-max on survivors only
     int best = 0;
     float best_val = -FLT_MAX / 4;
-    for (int i = 0; i < V; i++) {
-        if (logits[i] <= 0.0f) continue;
+    for (int i : sidx) {
+        if (logits[i] <= -FLT_MAX / 8) continue;
         float u = xoshiro_float();
         if (u <= 0.0f) u = 1e-38f;
-        float noise = -logf(-logf(u));
-        float val = logf(logits[i]) + noise;
+        float val = logits[i] + -logf(-logf(u));
         if (val > best_val) { best_val = val; best = i; }
     }
     return best;
@@ -219,6 +234,8 @@ struct AtlasModel {
     float* buf_act = nullptr;       // [max_batch * max_dim] quantized f32→i8 scratch
     uint8_t* buf_i8 = nullptr;      // [max_batch * max_dim] uint8 quantized activations
     float* buf_out = nullptr;       // [max_batch * hidden_dim] layer output ping-pong for atlas_forward
+    // Attention workspace (heap-allocated, avoids stack overflow with large B)
+    float* attn_ws = nullptr;       // [max_batch * n_heads * head_dim * 4]
     int max_batch = 0;
     // mmap cache handles (for int8 data loaded from .i8 file)
     void* mmap_base = nullptr;      // MapViewOfFile base (.i8 cache)
@@ -245,6 +262,7 @@ struct AtlasModel {
         if (buf_act) atlas_vfree((uint8_t*)buf_act);
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
+        if (attn_ws) atlas_vfree((uint8_t*)attn_ws);
         if (lm_head_i8) atlas_vfree((uint8_t*)lm_head_i8);
         if (lm_head_offsets) atlas_vfree((uint8_t*)lm_head_offsets);
         if (lm_head_scales) atlas_vfree((uint8_t*)lm_head_scales);
@@ -270,6 +288,7 @@ struct AtlasModel {
         if (buf_act) atlas_vfree((uint8_t*)buf_act);
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
+        if (attn_ws) atlas_vfree((uint8_t*)attn_ws);
 
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
@@ -281,6 +300,8 @@ struct AtlasModel {
         buf_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
         buf_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
         buf_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
+        int ws = (int)((size_t)B * n_heads * head_dim * 4);
+        attn_ws = (float*)atlas_valloc((size_t)ws * sizeof(float));
         max_batch = B;
     }
 };
@@ -581,9 +602,14 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
 
     // Check available disk space on Windows
 #ifdef _WIN32
-    char root[4] = { path[0], ':', '\\', 0 };
+    char abs_path[MAX_PATH];
+    char root[4] = { 0 };
+    DWORD abs_len = GetFullPathNameA(path, MAX_PATH, abs_path, NULL);
+    if (abs_len >= 3 && abs_len < MAX_PATH) {
+        root[0] = abs_path[0]; root[1] = ':'; root[2] = '\\'; root[3] = 0;
+    }
     ULARGE_INTEGER free_bytes;
-    if (GetDiskFreeSpaceExA(root, &free_bytes, NULL, NULL)) {
+    if (root[0] && GetDiskFreeSpaceExA(root, &free_bytes, NULL, NULL)) {
         if (cache_size > (int64_t)free_bytes.QuadPart) {
             printf("[CACHE] Skip: need %.1f GB, only %.1f GB free on %s\n",
                    cache_size / 1e9, (double)free_bytes.QuadPart / 1e9, root);
@@ -649,7 +675,7 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
         fprintf(stderr, "[CACHE] Write failed, deleting partial cache\n");
         remove(path);
     } else {
-        printf("[CACHE] Saved %d tensors (%.1f MB)\n", n, cache_size / 1e6);
+        printf("[CACHE] Saved %d int8 tensors (%.1f MB)\n", n, cache_size / 1e6);
     }
 }
 
@@ -1020,6 +1046,10 @@ ATLAS_API void atlas_attention_f32(
     int n_rep = n_heads / n_kv_heads;
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
 
+    // Attention scores reused across batch — single stack allocation (max 12*4096=192KB)
+    int max_seq = seq_now;
+    float* scores = (float*)alloca(n_heads * max_seq * sizeof(float));
+
     for (int b = 0; b < B; b++) {
         int pos = positions[b];
         float* qb = q + b * n_heads * head_dim;
@@ -1067,10 +1097,6 @@ ATLAS_API void atlas_attention_f32(
                 *vc = f32_to_f16(vb[h * head_dim + d]);
             }
         }
-
-        // Attention scores [n_heads, seq_now] — stack-allocate (max 12*4096=196KB, fine on 1MB stack)
-        int max_seq = seq_now;
-        float* scores = (float*)alloca(n_heads * max_seq * sizeof(float));
 
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
@@ -1580,10 +1606,11 @@ static void forward_layer_internal(
     }
 
     // ─── 3. Fused attention (reuse atlas_attention_f32) ───
-    float* attn_out = (float*)alloca(B * qd * sizeof(float));
-    float* q_f32 = (float*)alloca(B * qd * sizeof(float));
-    float* k_f32 = (float*)alloca(B * kvd * sizeof(float));
-    float* v_f32 = (float*)alloca(B * kvd * sizeof(float));
+    int ws = B * nH * hd;
+    float* attn_out = m->attn_ws;
+    float* q_f32 = m->attn_ws + ws;
+    float* k_f32 = m->attn_ws + ws * 2;
+    float* v_f32 = m->attn_ws + ws * 3;
     for (int b = 0; b < B; b++) {
         memcpy(q_f32 + b * qd, m->buf_gate + b * tq.row_dim, qd * sizeof(float));
         memcpy(k_f32 + b * kvd, m->buf_hidden + b * tk.row_dim, kvd * sizeof(float));

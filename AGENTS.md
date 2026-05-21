@@ -40,6 +40,7 @@
 - **v2.0.0 — C++ BPE Tokenizer**: Python-autarkic. Single FFI call, no PreTrainedTokenizerFast dependency.
 
 ### Fixed
+- **Bug 12 [Stack overflow from alloca in forward_layer_internal]**: Four `alloca(B * qd * sizeof(float))` calls in attention section used ~2.9 MB stack at B=60+, exceeding the 1 MB default Windows stack. Floated all 4 buffers to heap via `attn_ws` field in struct, allocated in `ensure_buffers`. Also moved `scores` alloca in `atlas_attention_f32` outside the per-batch loop (was accumulating across B iterations). Total stack now ~210 KB max. All 4 models pass long-prompt test (60+ tokens). Fixed in v1.4.0.
 - **Bug 11 [10B tokenizer_offset int32 overflow]**: `int` (signed 32-bit) fur `tokenizer_offset` overflowt bei >2 GB Dateigroese. 10B Offset bei ~3.3 GB -> negativ als int32. Fix: `uint32_t` + `ptrdiff_t` cast. Einziger Bug in v1.2.0-pre (behoben in v1.2.0).
 
 ## Key Decisions
@@ -58,7 +59,7 @@
 5. **v2.0.0 — C++ BPE Tokenizer**: Remove Python tokenizer dependency entirely.
 
 ## Critical Context
-- **v1.3.2 latest** (Hybrid Mode: FFN int8, QKV packed — best speed/RAM balance).
+- **v1.4.0 latest** (Stack overflow fix — heap-allocated attention workspace).
 - **All 4 models on disk** (C:\models): 1B/3B/7B/10B + packed .atlas files in C:\atlas.
 - **Hybrid default path**: FFN tensors decompressed to int8 (ttype=3), QKV/O stay packed (ttype=0). Per-tensor ttype dispatch in forward. For 1B (hidden<=2048), all tensors decompressed + f32 bypass enabled.
 - **`.i8` cache**: Auto-generated on first load (full decompress path), mmap'd on subsequent loads.
@@ -66,13 +67,13 @@
 - **Three matmul modes**: hybrid (default), packed (use_packed_matmul=True), int8 (full cache).
 - **Coherence**: ALL 4 models produce "Paris" at T=0 via `generate_c()`. 1B greedy degenerates to `,` (model-inherent distribution, not engine). 3B greedy repeats "Paris" sentence (model-inherent). 7B/10B give single "Paris". All pass at T=0.
 - **f32 bypass dispatch**: `use_f32_matmul` is checked AFTER `t.ttype==0` in forward. For 1B hybrid, all tensors are decompressed so f32 bypass fires correctly. Pure packed + f32 bypass is broken (ttype==0 catches first) — not used because 1B hybrid auto-decompresses everything.
-- **Benchmarks (v1.3.2, i5-1235U, 8 OMP threads, 30 tok, generate_c, warm)**:
-  - **1B hybrid**: 14.9 tok/s, ~1.4 GB
-  - **3B hybrid**: 4.6 tok/s, ~4 GB
-  - **7B hybrid**: 7.4 tok/s, ~7 GB
-  - **10B hybrid**: 4.8 tok/s, ~9.3 GB
-  - **10B int8 cache**: 5.4 tok/s, 10.8 GB
-  - **10B packed**: 1.5 tok/s, 7.5 GB
+- **Sampling optimized (v1.5.0-pre)**: `gumbel_sample` collects survivors into `static std::vector<int> sidx` after top_k pruning. Top_p softmax + max-heap operate on survivors only (not full V=131072). Survivor collection integrated into top_k mask loop (no extra pass). Gumbel noise only on survivors. Eliminates O(V log V) sort bottleneck — top_k+p overhead ≈ top_k overhead.
+- **Benchmarks (v1.5.0-pre, i5-1235U, 8 OMP threads, generate_c, warm)**:
+  - **1B int8 cache**: 30-33 tok/s, ~1.2 GB, load 2.7s
+  - **3B int8 cache**: 5-6 tok/s, ~4 GB, load 4.1s
+  - **7B int8 (no cache)**: 19-20 tok/s, ~7 GB, load 26.3s
+  - **10B int8 cache**: 10-13 tok/s, ~9 GB, load 25.0s
+  - Sampling overhead (1B, top_k=40+p): ~3 tok/s (survivor-list makes top_p ≈ free after top_k)
 - **128*row_sum correction**: REQUIRED for ALL uint8×int8 matmuls (activation quantization adds +128 bias, regardless of weight format).
 
 ## Custom Skills (.opencode/skills/)
