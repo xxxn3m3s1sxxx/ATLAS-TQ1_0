@@ -45,7 +45,8 @@
 - *(none)*
 
 ### Fixed
-- **Bug 12 [Stack overflow from alloca in forward_layer_internal]**: Four `alloca(B * qd * sizeof(float))` calls in attention section used ~2.9 MB stack at B=60+, exceeding the 1 MB default Windows stack. Floated all 4 buffers to heap via `attn_ws` field in struct, allocated in `ensure_buffers`. Also moved `scores` alloca in `atlas_attention_f32` outside the per-batch loop (was accumulating across B iterations). Total stack now ~210 KB max. All 4 models pass long-prompt test (60+ tokens). Fixed in v1.4.0.
+- **Bug 12 [Stack overflow from alloca in forward_layer_internal]**: Four `alloca(B * qd * sizeof(float))` calls in attention section used ~2.9 MB stack at B=60+, exceeding the 1 MB default Windows stack. Floated all 4 buffers to heap via `attn_ws` field in struct, allocated in `ensure_buffers`. Also moved `scores` alloca in `atlas_attention_f32` outside the per-batch loop (was accumulating across B iterations). Stack now ~200 KB max from remaining small allocas (B*sizeof(float)=240B, negligible). All 4 models pass long-prompt test (60+ tokens). Fixed in v1.4.0.
+- **Bug 12.1 [Remaining scores alloca in atlas_attention_f32]**: The `scores` buffer (~192 KB at 12×4096) was still on stack after Bug 12 — not critical (fits in 1 MB) but a risk for longer context. Replaced with heap-allocated static reusable buffer (`scores_buf`/`scores_cap`) inside `atlas_attention_f32`. Stack now fully sterile. Fixed as Task 0 in v2.5.0-alpha.
 - **Bug 11 [10B tokenizer_offset int32 overflow]**: `int` (signed 32-bit) fur `tokenizer_offset` overflowt bei >2 GB Dateigroese. 10B Offset bei ~3.3 GB -> negativ als int32. Fix: `uint32_t` + `ptrdiff_t` cast. Einziger Bug in v1.2.0-pre (behoben in v1.2.0).
 
 ## Key Decisions
@@ -57,7 +58,8 @@
 - **Shared gate+up quantization**: C++ fused path = single shared scale. Python per-layer = separate scales. 0.3% gap is EXPECTED.
 
 ## Next Steps (v2.5.0-alpha)
-1. **TQ1-LUT (Decompress-Hotpath)**: Replace `%3//3` modulo ops in inner decode loop with precomputed LUT (`int8_t[243][5]`). Directly reduces per-token decode latency.
+0. ✅ **scores-alloca → Heap**: `float* scores_buf` static inside `atlas_attention_f32` ersetzt `alloca(n_heads * max_seq)`. Stack bleibt unter 200 KB.
+1. **TQ1-LUT (Decompress-Hotpath)**: Replace `%3`/`/3` modulo ops in inner decode loop with precomputed LUT (`int8_t[243][5]`). Directly reduces per-token decode latency.
 2. **BPE-PQ (Encoder-Tuning)**: Priority-queue (max-heap) for C++ BPE merge loop — O(N log N) instead of O(N²) for long prompts.
 3. **F16C (Hardware-Kopplung)**: Native F16C instructions in matmul kernel for mixed-precision attention acceleration.
 4. **T=0.7 Benchmark-Standard**: `generate_c` test protocol switches from T=0.0 to T=0.7, top_k=40. Eliminates model-inherent deterministic degeneracy (1B newline collapse, 7B early EOS).

@@ -1258,9 +1258,18 @@ ATLAS_API void atlas_attention_f32(
     int n_rep = n_heads / n_kv_heads;
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
 
-    // Attention scores reused across batch — single stack allocation (max 12*4096=192KB)
+    // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
     int max_seq = seq_now;
-    float* scores = (float*)alloca(n_heads * max_seq * sizeof(float));
+    static float* scores_buf = nullptr;
+    static size_t scores_cap = 0;
+    size_t needed = (size_t)n_heads * max_seq;
+    if (needed > scores_cap) {
+        free(scores_buf);
+        scores_cap = needed;
+        scores_buf = (float*)malloc(scores_cap * sizeof(float));
+        if (!scores_buf) { scores_cap = 0; }
+    }
+    float* scores = scores_buf;
 
     for (int b = 0; b < B; b++) {
         int pos = positions[b];
