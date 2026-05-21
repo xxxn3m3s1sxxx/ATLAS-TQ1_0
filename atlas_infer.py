@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Atlas Inference Engine v1.2.1 — End-to-end Falcon3 TQ1.0 generation."""
-import ctypes, struct, os, sys, time, numpy as np
+import ctypes, struct, os, sys, time, json, numpy as np
 from safetensors import safe_open
-from transformers import AutoTokenizer
+# v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
 # ─── Load C++ DLL ────────────────────────────────────────────────────────
 # Resolve OpenMP runtime conflicts (numpy MKL vs libomp)
@@ -109,6 +109,21 @@ dll.atlas_get_tensor_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
 dll.atlas_get_tokenizer.restype = ctypes.POINTER(ctypes.c_uint8)
 dll.atlas_get_tokenizer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+
+dll.atlas_has_binary_tokenizer.restype = ctypes.c_int
+dll.atlas_has_binary_tokenizer.argtypes = [ctypes.c_void_p]
+
+dll.atlas_tokenizer_preencode.restype = ctypes.c_int
+dll.atlas_tokenizer_preencode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+
+dll.atlas_tokenizer_merge.restype = ctypes.c_int
+dll.atlas_tokenizer_merge.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int)]
+
+dll.atlas_tokenizer_decode.restype = ctypes.c_int
+dll.atlas_tokenizer_decode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
 
 dll.atlas_rmsnorm_f32.restype = None
 dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
@@ -248,29 +263,51 @@ class AtlasModel:
             dll.atlas_quantize_lmhead(self.model_ptr, idx_lm_head)
         print(f"[Atlas] lm_head quantized ({time.time()-t0:.1f}s)")
 
-        # Load embedded tokenizer (v5+), fallback to model_dir for v4
-        # Block format: [tokenizer_json_size:4][tokenizer.json bytes][config_size:4][config.json bytes]
+        # Load tokenizer — prefer v6 binary (C++), fallback to v5 JSON (Python)
         self._tok = None
+        self._use_cpp_tokenizer = False
+        self._eos_id = 0
         self._chat_template = None
+
+        # Read chat_template from embedded config JSON (present in both v5 and v6)
         tok_size = ctypes.c_int()
         tok_ptr = dll.atlas_get_tokenizer(self.model_ptr, tok_size)
         if tok_ptr and tok_size.value > 0:
-            import struct
             raw = ctypes.string_at(tok_ptr, tok_size.value)
             try:
                 pos = 0
                 js_size = struct.unpack_from('<I', raw, pos)[0]; pos += 4
-                tok_json = raw[pos:pos+js_size]; pos += js_size
+                pos += js_size  # skip tokenizer.json raw bytes
                 cfg_size = struct.unpack_from('<I', raw, pos)[0]; pos += 4
                 if cfg_size > 0:
-                    import json
                     cfg = json.loads(raw[pos:pos+cfg_size].decode('utf-8'))
                     self._chat_template = cfg.get('chat_template')
+                    # Get EOS token ID from config
+                    eos_cfg = cfg.get('eos_token')
+                    if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
+                        self._eos_id = eos_cfg['id']
+            except Exception:
+                pass
+
+        # Check for v6 binary tokenizer (C++ decode)
+        if dll.atlas_has_binary_tokenizer(self.model_ptr):
+            self._use_cpp_tokenizer = True
+            print("[Atlas] Using C++ tokenizer (v6 binary)")
+        # Always load Python tokenizer for encoding (handles GPT-2 ByteLevel pre-tokenization)
+        if tok_ptr and tok_size.value > 0:
+            if not self._use_cpp_tokenizer:
+                print("[Atlas] Also loading Python tokenizer for encode (v5 fallback)")
+            raw = ctypes.string_at(tok_ptr, tok_size.value)
+            try:
+                pos = 0
+                js_size = struct.unpack_from('<I', raw, pos)[0]; pos += 4
                 from tokenizers import Tokenizer
-                self._tok = Tokenizer.from_buffer(tok_json)
-                print("[Atlas] Loaded embedded tokenizer")
+                self._tok = Tokenizer.from_buffer(raw[pos:pos+js_size])
             except Exception as e:
-                print(f"[Atlas] Tokenizer load failed: {e}")
+                print(f"[Atlas] Python tokenizer load failed: {e}")
+        else:
+            if not self._use_cpp_tokenizer:
+                print("[Atlas] No embedded tokenizer found")
 
 
     def set_seed(self, seed):
@@ -594,31 +631,30 @@ class AtlasModel:
     def generate(self, prompt, max_new_tokens=50, temperature=1.0,
                  top_k=40, top_p=0.9):
         try:
-            if self._tok is not None:
+            if self._use_cpp_tokenizer:
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                input_ids = self._cpp_encode(self._apply_chat_template(prompt))
+                eos_id = self._eos_id
+            elif self._tok is not None:
                 from transformers import PreTrainedTokenizerFast
                 tok = PreTrainedTokenizerFast(
                     tokenizer_object=self._tok,
                     chat_template=self._chat_template)
                 tok.add_special_tokens({"pad_token": "<|pad|>"})
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+                input_ids = tok.encode(text)
+                eos_id = tok.eos_token_id
             else:
-                model_dir = getattr(self, '_model_dir', None)
-                if not model_dir:
-                    model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
-                tok = AutoTokenizer.from_pretrained(
-                    model_dir,
-                    local_files_only=True)
+                return "[TOKENIZER ERROR: No tokenizer available]"
         except Exception as e:
             return f"[TOKENIZER ERROR: {e}]"
 
-        eos_id = tok.eos_token_id
         stop_tokens = ['<|user|>', '<|system|>', '<|end|>']
 
-        if isinstance(prompt, str):
-            prompt = [{"role": "user", "content": prompt}]
-        text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-        input_ids = tok.encode(text, return_tensors='np')[0]
-
-        full_logits = self.forward(input_ids[None])
+        full_logits = self.forward(np.array([input_ids], dtype=np.int32))
         logits = full_logits[0, -1, :]
 
         output = []
@@ -645,11 +681,17 @@ class AtlasModel:
 
             if eos_id is not None and next_token == eos_id:
                 break
-            decoded = tok.decode(output, skip_special_tokens=False)
+            if self._use_cpp_tokenizer:
+                decoded = self._cpp_decode(output, skip_special=False)
+            else:
+                decoded = tok.decode(output, skip_special_tokens=False)
             if any(stop in decoded for stop in stop_tokens):
                 break
 
-        text = tok.decode(output, skip_special_tokens=True)
+        if self._use_cpp_tokenizer:
+            text = self._cpp_decode(output)
+        else:
+            text = tok.decode(output, skip_special_tokens=True)
         for stop in stop_tokens:
             idx = text.find(stop)
             if idx >= 0:
@@ -660,27 +702,27 @@ class AtlasModel:
                    top_k=40, top_p=0.9):
         """Generate via atlas_generate (single C call, v1.2.1)."""
         try:
-            if self._tok is not None:
+            if self._use_cpp_tokenizer:
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                text = self._apply_chat_template(prompt)
+                input_ids = self._cpp_encode(text)
+            elif self._tok is not None:
                 from transformers import PreTrainedTokenizerFast
                 tok = PreTrainedTokenizerFast(
                     tokenizer_object=self._tok,
                     chat_template=self._chat_template)
                 tok.add_special_tokens({"pad_token": "<|pad|>"})
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+                input_ids = tok.encode(text)
             else:
-                model_dir = getattr(self, '_model_dir', None)
-                if not model_dir:
-                    model_dir = os.path.dirname(self._safe_path) if self._safe_path else '.'
-                tok = AutoTokenizer.from_pretrained(
-                    model_dir, local_files_only=True)
+                return "[TOKENIZER ERROR: No tokenizer available]"
         except Exception as e:
             return f"[TOKENIZER ERROR: {e}]"
 
-        if isinstance(prompt, str):
-            prompt = [{"role": "user", "content": prompt}]
-        text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-        input_ids = tok.encode(text)
         n_input = len(input_ids)
-
         in_arr = (ctypes.c_int * n_input)(*input_ids)
         k_cache = self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         v_cache = self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
@@ -697,13 +739,105 @@ class AtlasModel:
             return "[ATLAS: atlas_generate failed]"
 
         output = list(out_arr[:n_gen])
-        decoded = tok.decode(output, skip_special_tokens=True)
+        if self._use_cpp_tokenizer:
+            decoded = self._cpp_decode(output)
+        else:
+            decoded = tok.decode(output, skip_special_tokens=True)
         stops = ['<|user|>', '<|system|>', '<|end|>']
         for stop in stops:
             idx = decoded.find(stop)
             if idx >= 0:
                 decoded = decoded[:idx]
         return decoded
+
+    def _cpp_encode(self, text):
+        """Encode text via Python tokenizers library (no transformers dependency).
+
+        Uses `tokenizers.Tokenizer` directly for the full encode (pre-tokenization + BPE),
+        then C++ for the decode path. This eliminates the `transformers` package dependency
+        while keeping the lightweight `tokenizers` C extension for correct GPT-2 ByteLevel
+        pre-tokenization.
+        """
+        if self._tok is None:
+            # Fallback: use pure C++ preencode (no BPE, raw byte encoding)
+            text_bytes = text.encode('utf-8')
+            max_ids = len(text_bytes) + 256
+            ids_arr = (ctypes.c_int * max_ids)()
+            n = dll.atlas_tokenizer_preencode(
+                self.model_ptr, text_bytes, len(text_bytes), ids_arr, max_ids)
+            if n < 0:
+                raise RuntimeError("C++ tokenizer preencode failed")
+            return list(ids_arr[:n])
+
+        # Use Python tokenizers library for full encode (handles GPT-2 ByteLevel correctly)
+        return self._tok.encode(text).ids
+
+    def _cpp_decode(self, ids, skip_special=True):
+        """Decode token IDs via C++ v6 binary tokenizer. Returns string.
+
+        Applies GPT-2 ByteLevel post-processing: converts Ġ→space, Ċ→newline, etc.
+        """
+        if not ids:
+            return ""
+        n = len(ids)
+        ids_arr = (ctypes.c_int * n)(*ids)
+        max_out = n * 16 + 64
+        out_buf = ctypes.create_string_buffer(max_out)
+        n_bytes = dll.atlas_tokenizer_decode(
+            self.model_ptr, ids_arr, n, out_buf, max_out)
+        if n_bytes < 0:
+            raise RuntimeError("C++ tokenizer decode failed")
+        raw = bytes(out_buf[:n_bytes])
+        # GPT-2 ByteLevel decoder: convert Unicode byte tokens back to raw bytes
+        # Build reverse bytes_to_unicode() mapping
+        bs = list(range(ord('!'), ord('~') + 1)) + list(range(ord('¡'), ord('¬') + 1)) + list(range(ord('®'), ord('ÿ') + 1))
+        unicode_to_byte = {}
+        n_count = 0
+        for b in range(256):
+            if b in bs:
+                unicode_to_byte[chr(b)] = b
+            else:
+                unicode_to_byte[chr(256 + n_count)] = b
+                n_count += 1
+        # Decode: map each char through unicode_to_byte, then interpret as Latin-1
+        result_bytes = bytearray()
+        for ch in raw.decode('utf-8', errors='replace'):
+            b = unicode_to_byte.get(ch)
+            if b is not None:
+                result_bytes.append(b)
+            else:
+                result_bytes.append(ord(ch) if ord(ch) < 256 else 32)  # fallback to space
+        text = result_bytes.decode('utf-8', errors='replace')
+        if skip_special:
+            stops = ['<|endoftext|>', '<|im_end|>', '<|pad|>']
+            for s in stops:
+                text = text.replace(s, '')
+        return text
+
+    def _apply_chat_template(self, messages, add_generation_prompt=True):
+        """Falcon3 chat template (no Jinja2/transformers dependency).
+        
+        Matches the HF Jinja2 template for the no-tools case:
+        <|role|>\ncontent\neos_token\n"""
+        eos = '<|endoftext|>'
+        result = ""
+        n = len(messages)
+        for i, msg in enumerate(messages):
+            role = msg['role']
+            content = msg.get('content', '')
+            if role == 'system':
+                result += f"<|system|>\n{content}\n"
+            elif role == 'user':
+                result += f"<|user|>\n{content}\n"
+            elif role == 'assistant':
+                is_last = (i == n - 1)
+                if not is_last:
+                    result += f"<|assistant|>\n{content}{eos}\n"
+                else:
+                    result += f"<|assistant|>\n{content}{eos}"
+        if add_generation_prompt:
+            result += '<|assistant|>\n'
+        return result
 
     def _lmhead_gemv(self, h_norm):
         """Logits via C++ int8 GEMV (per-row symmetric int8 lm_head + u8 activation)."""

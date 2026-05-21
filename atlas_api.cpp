@@ -250,6 +250,29 @@ struct AtlasModel {
     // Embedded tokenizer data (v5+)
     int tokenizer_size = 0;
     uint32_t tokenizer_offset = 0;
+    // v6 binary tokenizer
+    int tokenizer_binary_size = 0;
+    uint32_t tokenizer_binary_offset = 0;
+    const uint8_t* binary_tok_base = nullptr;  // pointer into mmap'd atlas file
+    struct {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t vocab_size;
+        uint32_t max_token_length;
+        uint32_t special_count;
+        uint32_t flags;
+        const uint32_t* offsets;       // [vocab_size]
+        const uint16_t* lengths;       // [vocab_size]
+        const char* pool;              // [pool_size]
+        uint64_t pool_size;
+        const uint32_t* merge_left;    // [vocab_size]
+        const uint32_t* merge_right;   // [vocab_size]
+        const uint32_t* merge_rank;    // [vocab_size]
+        const uint16_t* byte_encoder;  // [256]
+        const uint16_t* byte_decoder;  // [256]
+        const uint32_t* special;       // [7] eos/bos/pad/unk/mask/sep/cls
+        int* merge_lookup;             // hash table: (left<<12)|right → merged_id, size = vocab_size*2
+    } tok = {};
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
     int32_t* lm_head_offsets = nullptr;  // precomputed 128 * sum(w) per row
@@ -266,6 +289,7 @@ struct AtlasModel {
         if (lm_head_i8) atlas_vfree((uint8_t*)lm_head_i8);
         if (lm_head_offsets) atlas_vfree((uint8_t*)lm_head_offsets);
         if (lm_head_scales) atlas_vfree((uint8_t*)lm_head_scales);
+        delete[] tok.merge_lookup;
     }
 
     bool is_mapped(const uint8_t* ptr) const {
@@ -336,6 +360,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     // v5+ tokenizer header fields
     memcpy(&tmp32, hdr+29, 4); m->tokenizer_size = (int)tmp32;
     uint32_t tok_off_u32; memcpy(&tok_off_u32, hdr+33, 4); m->tokenizer_offset = tok_off_u32;
+    // v6 binary tokenizer header fields
+    memcpy(&tmp32, hdr+37, 4); m->tokenizer_binary_size = (int)tmp32;
+    uint32_t bin_off_u32; memcpy(&bin_off_u32, hdr+41, 4); m->tokenizer_binary_offset = bin_off_u32;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,
@@ -454,10 +481,66 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         }
     }
 
+    // Parse v6 binary tokenizer block if present
+    if (m->tokenizer_binary_size > 0 && m->atlas_mmap_base && m->tokenizer_binary_offset > 0) {
+        const uint8_t* base = (const uint8_t*)m->atlas_mmap_base + (ptrdiff_t)m->tokenizer_binary_offset;
+        m->binary_tok_base = base;
+
+        // Read header fields
+        const uint32_t* h = (const uint32_t*)base;
+        if (h[0] == 0x544F4B42) {  // "TOKB" magic
+            m->tok.magic = h[0];
+            m->tok.version = h[1];
+            m->tok.vocab_size = h[2];
+            m->tok.max_token_length = h[3];
+            m->tok.special_count = h[4];
+            m->tok.flags = h[5];
+            // Offsets are stored as uint64 starting at byte 24
+            const uint64_t* offs = (const uint64_t*)(base + 24);
+            m->tok.offsets = (const uint32_t*)(base + offs[0]);   // offset_offsets
+            m->tok.lengths = (const uint16_t*)(base + offs[1]);   // offset_lengths
+            m->tok.pool = (const char*)(base + offs[2]);          // offset_pool
+            m->tok.pool_size = offs[3];                            // pool_size
+            m->tok.merge_left = (const uint32_t*)(base + offs[4]); // offset_merge_left
+            m->tok.merge_right = (const uint32_t*)(base + offs[5]);// offset_merge_right
+            m->tok.merge_rank = (const uint32_t*)(base + offs[6]); // offset_merge_rank
+            m->tok.byte_encoder = (const uint16_t*)(base + offs[7]); // offset_byte_enc
+            m->tok.byte_decoder = (const uint16_t*)(base + offs[8]); // offset_byte_dec
+            m->tok.special = (const uint32_t*)(base + offs[9]);     // offset_special
+
+            // Build merge lookup hash table for O(1) pair → merged_id
+            // Open-addressing, table size = 2 * vocab_size (power of 2)
+            int V = (int)m->tok.vocab_size;
+            int ht_size = 1;
+            while (ht_size < V * 2) ht_size <<= 1;
+            m->tok.merge_lookup = new int[ht_size];
+            // Initialize to -1 (empty)
+            for (int i = 0; i < ht_size; i++) m->tok.merge_lookup[i] = -1;
+
+            for (int merged_id = 0; merged_id < V; merged_id++) {
+                uint32_t rank = m->tok.merge_rank[merged_id];
+                if (rank == 0) continue;  // base token, not a merge
+                uint32_t left = m->tok.merge_left[merged_id];
+                uint32_t right = m->tok.merge_right[merged_id];
+                if (left == 0xFFFFFFFF) continue;
+                // Hash: (left << 12) | right  (12 bits for right, up to 4096 — sufficient for BPE)
+                // Better: use full 32-bit hash
+                uint32_t h = (left * 2654435761u) ^ (right * 2246822519u);
+                int idx = (int)(h & (ht_size - 1));
+                while (m->tok.merge_lookup[idx] >= 0) {
+                    idx = (idx + 1) & (ht_size - 1);
+                }
+                // Store merged_id as value (always >= base_vocab_size)
+                m->tok.merge_lookup[idx] = merged_id;
+            }
+        }
+    }
+
     fclose(f);
     auto& last = m->tensors.back();
     int64_t total = last.file_offset + last.data_size;
-    printf("[ATLAS] Loaded %d tensors (%.2f MB)\n", n_tensors, total / 1048576.0);
+    printf("[ATLAS] Loaded %d tensors (%.2f MB)%s\n", n_tensors, total / 1048576.0,
+           m->tok.magic == 0x544F4B42 ? " (v6 binary tokenizer)" : "");
     return m;
 }
 
@@ -554,6 +637,135 @@ ATLAS_API const uint8_t* atlas_get_tokenizer(AtlasModel* m, int* size) {
     }
     if (size) *size = m->tokenizer_size;
     return (const uint8_t*)m->atlas_mmap_base + (ptrdiff_t)m->tokenizer_offset;
+}
+
+// ─── v6 Binary Tokenizer API ─────────────────────────────────────────
+ATLAS_API int atlas_has_binary_tokenizer(AtlasModel* m) {
+    if (!m) return 0;
+    return (m->tok.magic == 0x544F4B42) ? 1 : 0;
+}
+
+// Pre-encode UTF-8 text → byte-level token IDs (raw byte_encoder lookup, no BPE).
+// Returns number of tokens, or -1 on error.
+ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
+    const char* text, int text_len,
+    int* out_ids, int max_ids) {
+    if (!m || !text || !out_ids || m->tok.magic != 0x544F4B42)
+        return -1;
+    if (text_len <= 0 || max_ids <= 0) return 0;
+
+    const uint16_t* byte_enc = m->tok.byte_encoder;
+    int n = 0;
+    for (int i = 0; i < text_len && n < max_ids; i++) {
+        uint8_t b = (uint8_t)text[i];
+        uint16_t tid = byte_enc[b];
+        if (tid == 0xFFFF) {
+            uint32_t unk = m->tok.special ? m->tok.special[3] : 0;
+            out_ids[n++] = (int)unk;
+        } else {
+            out_ids[n++] = (int)tid;
+        }
+    }
+    return n;
+}
+
+// Run BPE merge loop on pre-encoded byte token IDs. Modifies ids in-place.
+// n_ids is updated to the final token count. Returns 0 on success, -1 on error.
+ATLAS_API int atlas_tokenizer_merge(AtlasModel* m,
+    int* ids, int* n_ids) {
+    if (!m || !ids || !n_ids || m->tok.magic != 0x544F4B42)
+        return -1;
+
+    const int V = (int)m->tok.vocab_size;
+    const int* merge_lookup = m->tok.merge_lookup;
+    const uint32_t* merge_rank = m->tok.merge_rank;
+    int ht_size = 1;
+    while (ht_size < V * 2) ht_size <<= 1;
+
+    int n = *n_ids;
+    while (n > 1) {
+        int best_pos = -1;
+        uint32_t best_rank = 0xFFFFFFFF;
+        int best_merged_id = -1;
+
+        for (int i = 0; i < n - 1; i++) {
+            int left = ids[i];
+            int right = ids[i + 1];
+            if (left < 0 || left >= V) continue;
+            if (right < 0 || right >= V) continue;
+
+            uint32_t h = ((uint32_t)left * 2654435761u) ^ ((uint32_t)right * 2246822519u);
+            int idx = (int)(h & (ht_size - 1));
+            int merged_id = -1;
+            while (true) {
+                int mid = merge_lookup[idx];
+                if (mid < 0) break;
+                if ((int)m->tok.merge_left[mid] == left &&
+                    (int)m->tok.merge_right[mid] == right) {
+                    merged_id = mid;
+                    break;
+                }
+                idx = (idx + 1) & (ht_size - 1);
+            }
+            if (merged_id < 0) continue;
+
+            uint32_t rank = merge_rank[merged_id];
+            if (rank > 0 && rank < best_rank) {
+                best_rank = rank;
+                best_pos = i;
+                best_merged_id = merged_id;
+            }
+        }
+
+        if (best_pos < 0) break;
+
+        ids[best_pos] = best_merged_id;
+        // Shift remaining IDs down
+        for (int j = best_pos + 1; j < n - 1; j++) {
+            ids[j] = ids[j + 1];
+        }
+        n--;
+    }
+
+    *n_ids = n;
+    return 0;
+}
+
+// Decode token IDs → UTF-8 text via pool lookup.
+// Returns number of bytes written, or -1 on error.
+ATLAS_API int atlas_tokenizer_decode(AtlasModel* m,
+    const int* ids, int n_ids,
+    char* out_text, int max_out) {
+    if (!m || !ids || !out_text || m->tok.magic != 0x544F4B42)
+        return -1;
+    if (n_ids <= 0 || max_out <= 0) return 0;
+
+    const uint32_t* offsets = m->tok.offsets;
+    const uint16_t* lengths = m->tok.lengths;
+    const char* pool = m->tok.pool;
+    // special tokens array available at m->tok.special
+
+    int pos = 0;
+    for (int i = 0; i < n_ids; i++) {
+        int tid = ids[i];
+        if (tid < 0 || tid >= (int)m->tok.vocab_size) continue;
+        uint32_t off = offsets[tid];
+        uint16_t len = lengths[tid];
+        if (off + len > m->tok.pool_size) continue;
+        if (pos + (int)len > max_out - 1) {
+            // Truncate, but don't overflow
+            int copy = max_out - 1 - pos;
+            if (copy > 0) {
+                memcpy(out_text + pos, pool + off, copy);
+                pos += copy;
+            }
+            break;
+        }
+        memcpy(out_text + pos, pool + off, len);
+        pos += len;
+    }
+    out_text[pos] = '\0';
+    return pos;
 }
 
 ATLAS_API int atlas_get_tensor_index(AtlasModel* m, const char* name) {

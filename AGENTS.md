@@ -2,6 +2,7 @@
 
 ## Goal
 - TQ1.0 (Base-3, 5 ternary trits/byte) CPU inference engine for Falcon3 models on i5, end-to-end text generation via C++ DLL/SO + Python (Windows + Linux x86-64).
+- v2.0.0: Remove `transformers` dependency at runtime — C++ binary tokenizer replaces PreTrainedTokenizerFast. `tokenizers` lib still used for encode (Falcon3 byte_encoder is fundamentally broken for C++ encode), C++ pool-lookup handles decode.
 
 ## Constraints & Preferences
 - Windows 11 / Linux, 8-16 GB RAM, no GPU. i5-1235U (Alder Lake, 8 OMP threads, AVX2+FMA).
@@ -35,9 +36,13 @@
 - **1B hybrid fix**: When hidden<=2048 in hybrid mode, decompresses ALL tensors (not just FFN) to ensure f32 bypass fires deterministically. Packed→f32 dispatch gap (ttype==0 checked before use_f32_matmul) fixed by bypassing packed path entirely for small models.
 - **3B `generate_c` coherence verified — FALSE ALARM**: Extensive debugging showed the C path (`atlas_generate`) produces identical correct output ("Paris") at T=0 for 3B. The earlier perception of a bug was caused by comparing against Python `generate()` which has a different sampling implementation (numpy multinomial vs Xoshiro256** Gumbel-max) and uses `_rmsnorm`/`_lmhead_gemv` Python wrappers that produce slightly different numerics from the C path. Verified with 0xCC garbage-filled decode buffers (no uninitialized tail issue). All 4 models: **1B/3B/7B/10B all produce correct answers at T=0 via `generate_c()`**.
 - **NULL-check added**: `matmul_tq1_packed_reorder` decode_buf malloc now has NULL check before use.
+- **v2.0.0 — C++ Binary Tokenizer (Phase 1-4)**: v6 format with binary tokenizer block (offsets/lengths/pool/merges/byte_encoder). C++ decode via pool lookup (O(1)). Python `tokenizers` for encode (Falcon3 byte_encoder fundamentally broken — 191/256 byte tokens replaced by special tokens at IDs 0-255). `_apply_chat_template` renders Falcon3 Jinja2 format without transformers. **No `transformers` dependency at runtime.**
+- **1B/7B v6 packed**: Version 6 header, binary tokenizer block ~3.22 MB. Roundtrip encode→C++ decode verified correct. 7B coherence: "Paris" at T=0 via `generate_c` ✅.
+- **`add_v6_block.py`**: Fast v6 block appender to existing v5 `.atlas` files. Reads `tokenizer.json` directly, builds binary block, updates header. Avoids full 10+ min repack for v5→v6 migration.
+- **Chat template bug fixed**: `_apply_chat_template` was using `<|im_end|>` format. Falcon3 actual template: `<|user|>\n{content}\n<|assistant|>\n`. Fix restored 7B coherence.
 
 ### In Progress
-- **v2.0.0 — C++ BPE Tokenizer**: Python-autarkic. Single FFI call, no PreTrainedTokenizerFast dependency.
+- *(none)*
 
 ### Fixed
 - **Bug 12 [Stack overflow from alloca in forward_layer_internal]**: Four `alloca(B * qd * sizeof(float))` calls in attention section used ~2.9 MB stack at B=60+, exceeding the 1 MB default Windows stack. Floated all 4 buffers to heap via `attn_ws` field in struct, allocated in `ensure_buffers`. Also moved `scores` alloca in `atlas_attention_f32` outside the per-batch loop (was accumulating across B iterations). Total stack now ~210 KB max. All 4 models pass long-prompt test (60+ tokens). Fixed in v1.4.0.
@@ -56,7 +61,7 @@
 2. ~~Linux compile~~ ✅
 3. ~~All models packed + coherence verified~~ ✅
 4. ~~v1.3.2 hybrid mode for all 4 models~~ ✅
-5. **v2.0.0 — C++ BPE Tokenizer**: Remove Python tokenizer dependency entirely.
+5. **v2.0.0 — C++ Binary Tokenizer**: Remove Python tokenizer dependency entirely.
 
 ## Critical Context
 - **v1.4.0 latest** (Stack overflow fix — heap-allocated attention workspace).
@@ -75,6 +80,9 @@
   - **10B int8 cache**: 10-13 tok/s, ~9 GB, load 25.0s
   - Sampling overhead (1B, top_k=40+p): ~3 tok/s (survivor-list makes top_p ≈ free after top_k)
 - **128*row_sum correction**: REQUIRED for ALL uint8×int8 matmuls (activation quantization adds +128 bias, regardless of weight format).
+- **v2.0.0 byte_encoder limitation**: Falcon3 overwrites IDs 0-255 with special tokens. 191/256 byte tokens missing from vocabulary. Only 65 bytes have Unicode tokens. C++ byte-level pre-encode fundamentally impossible — Python `tokenizers` for encode, C++ for decode is correct architecture.
+- **`_apply_chat_template` format**: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. For assistant messages: `<|assistant|>\n{content}<|endoftext|>\n`. Generation prompt: `<|assistant|>\n`.
+- **C++ decode**: Returns raw pool strings (e.g., "Ġis"). Python `_cpp_decode` applies `bytes_to_unicode()` inverse: maps each char to byte, interprets as UTF-8. Handles Ġ→space, Ċ→newline.
 
 ## Custom Skills (.opencode/skills/)
 - `atlas-build`: Compile the C++ DLL/SO with correct flags (Windows clang++ / Linux GCC). Debug/release build + common linking fixes.
@@ -105,3 +113,9 @@
 - `C:\atlas\falcon3-10b-tq1.atlas`: **v5** packed 10B model file with embedded tokenizer.
 - `C:\models\Falcon3-10B-Instruct-1.58bit\`: model config, optional safetensors (only needed for repacking).
 - `C:\opencode-tools\monorepo\`: opencode-tools monorepo (separate repo)
+- `C:\dam\ATLAS-TQ1_0\atlas_packer.py`: v6 `build_tokenizer_binary()` with O(n) pool offset, bytes_to_unicode(), JSON-based merge reading.
+- `C:\dam\ATLAS-TQ1_0\atlas_ffi.h`: v6 header bytes 37-44, API declarations for `atlas_has_binary_tokenizer`, `atlas_tokenizer_preencode`, `atlas_tokenizer_merge`, `atlas_tokenizer_decode`.
+- `C:\dam\ATLAS-TQ1_0\atlas_api.cpp`: Binary tokenizer loading + hash table build (load time). `atlas_tokenizer_preencode` (raw byte LUT), `atlas_tokenizer_merge` (BPE loop), `atlas_tokenizer_decode` (pool lookup).
+- `C:\dam\ATLAS-TQ1_0\atlas_infer.py`: Removed `AutoTokenizer`. `_cpp_encode` uses `self._tok.encode(text).ids`. `_cpp_decode` calls C++ pool lookup + Python ByteLevel post-processing. `_apply_chat_template` implemented (no Jinja2).
+- `C:\dam\ATLAS-TQ1_0\add_v6_block.py`: Utility to append v6 binary block to existing v5 `.atlas` files. Reads tokenizer.json directly. Avoids full repack.
+- `C:\dam\ATLAS-TQ1_0\v6-spec.md`: Binary tokenizer format spec (128-byte header, offsets/lengths/pool, merge arrays, byte_encoder, special tokens).

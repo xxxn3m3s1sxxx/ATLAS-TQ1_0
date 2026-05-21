@@ -1,10 +1,232 @@
 #!/usr/bin/env python3
-"""Atlas Packer v2 - Streaming TQ1.0 packer for Falcon3 BitNet"""
+"""Atlas Packer v2/v6 - Streaming TQ1.0 packer for Falcon3 BitNet"""
 import struct, torch, numpy as np, json, os, sys
 from safetensors import safe_open
 
 BITNET_MUL = np.array([1, 3, 9, 27], dtype=np.uint32)
 TQ1_MUL    = np.array([1, 3, 9, 27, 81], dtype=np.uint32)
+
+def build_tokenizer_binary(model_dir):
+    """Build v6 binary tokenizer block from tokenizer.json.
+
+    Returns bytes of the binary block, or b'' if tokenizer.json not found.
+    Format: [128-byte header][offsets][lengths][pool][merge_left][merge_right][merge_rank][byte_encoder][byte_decoder][special_tokens]
+    """
+    tok_path = os.path.join(model_dir, 'tokenizer.json')
+    if not os.path.exists(tok_path):
+        return b''
+
+    from tokenizers import Tokenizer, decoders
+    tok = Tokenizer.from_file(tok_path)
+
+    # vocab: dict token_str → id, sorted by id
+    vocab = tok.get_vocab()
+    V = len(vocab)
+    sorted_items = sorted(vocab.items(), key=lambda kv: kv[1])
+
+    # Build decoder arrays: offsets[], lengths[], pool
+    offsets = np.empty(V, dtype=np.uint32)
+    lengths = np.empty(V, dtype=np.uint16)
+    pool_parts = []
+    offset_acc = 0
+    for i, (token_str, tid) in enumerate(sorted_items):
+        token_bytes = token_str.encode('utf-8')
+        offsets[i] = offset_acc
+        lengths[i] = len(token_bytes)
+        pool_parts.append(token_bytes)
+        offset_acc += len(token_bytes)
+    pool = b''.join(pool_parts)
+    max_token_length = int(max(lengths))
+
+    # Get merges from tokenizer.json directly (model object doesn't expose them)
+    merge_left = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_right = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_rank = np.zeros(V, dtype=np.uint32)
+
+    with open(tok_path, 'r', encoding='utf-8') as jf:
+        tok_json_data = json.load(jf)
+    merges_list = tok_json_data.get('model', {}).get('merges', [])
+    base_vocab_size = V - len(merges_list)
+    for i, merge_pair in enumerate(merges_list):
+        if isinstance(merge_pair, list) and len(merge_pair) == 2:
+            left_str, right_str = merge_pair
+        elif isinstance(merge_pair, str):
+            parts = merge_pair.split()
+            if len(parts) != 2: continue
+            left_str, right_str = parts
+        else:
+            continue
+        left_id = vocab.get(left_str)
+        right_id = vocab.get(right_str)
+        if left_id is not None and right_id is not None:
+            merged_id = base_vocab_size + i
+            if merged_id < V:
+                merge_left[merged_id] = left_id
+                merge_right[merged_id] = right_id
+                merge_rank[merged_id] = i + 1
+
+    # Build byte_encoder[256]: byte value → base token ID (0xFFFF = unmapped)
+    # GPT-2 ByteLevel uses bytes_to_unicode() mapping: bytes → Unicode chars (U+0100-U+01FF)
+    byte_encoder = np.full(256, 0xFFFF, dtype=np.uint16)
+
+    # Replicate bytes_to_unicode() from GPT-2/transformers
+    printable = list(range(ord('!'), ord('~') + 1)) + list(range(ord('¡'), ord('¬') + 1)) + list(range(ord('®'), ord('ÿ') + 1))
+    byte_to_token = {}
+    n = 0
+    for b in range(256):
+        if b in printable:
+            byte_to_token[b] = chr(b)
+        else:
+            byte_to_token[b] = chr(256 + n)
+            n += 1
+
+    # Map each byte through its Unicode representation to vocabulary
+    for b in range(256):
+        token_str = byte_to_token[b]
+        tid = vocab.get(token_str)
+        if tid is not None:
+            byte_encoder[b] = tid
+        elif b == 32:
+            # Space is a special case — it's often Ġ (U+0120) in the byte vocabulary
+            # Try the Ġ mapping: space → U+0120 → UTF-8 [0xC4, 0xA0]
+            # Actually, in bytes_to_unicode, space (0x20) = chr(0x20) = ' '
+            # This should map normally via the printable list
+            pass
+
+    # Verify and report gaps
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        # Last resort: try Ġ-based mapping (GPT-2 ByteLevel alternative)
+        # Ġ = chr(288) = U+0120, used as space prefix in pre-tokenizer
+        for b in missing:
+            # Bytes 0-255 may be mapped to Unicode range 256-511
+            unicode_char = chr(256 + b)
+            tid = vocab.get(unicode_char)
+            if tid is not None:
+                byte_encoder[b] = tid
+
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        print(f'  WARNING: {len(missing)} bytes unmapped in byte_encoder (first 8: {missing[:8]})')
+
+    # byte_decoder[256]: reverse mapping — token ID → byte value
+    # For GPT-2 ByteLevel, the decoder processes UTF-8 bytes through the ByteLevel decoder
+    # which converts Ġ back to space. So byte_decoder is identity for all mapped bytes.
+    byte_decoder = np.full(256, 0xFFFF, dtype=np.uint16)
+    for b in range(256):
+        if byte_encoder[b] != 0xFFFF:
+            byte_decoder[b] = b
+
+    # Detect special tokens by scanning token strings
+    special_map = {
+        '<|endoftext|>': 0, '<|im_end|>': 0,
+        '<|pad|>': 2, '<unk>': 3, '<|startoftext|>': 1,
+    }
+    # More robust: check tokenizer_config.json for special token IDs
+    cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
+    special_ids = {'eos': 0xFFFFFFFF, 'bos': 0xFFFFFFFF, 'pad': 0xFFFFFFFF,
+                   'unk': 0xFFFFFFFF, 'mask': 0xFFFFFFFF, 'sep': 0xFFFFFFFF, 'cls': 0xFFFFFFFF}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'r') as f:
+            cfg = json.load(f)
+        for key in ['eos_token', 'bos_token', 'pad_token', 'unk_token', 'mask_token', 'sep_token', 'cls_token']:
+            val = cfg.get(key)
+            if val and isinstance(val, dict) and 'id' in val:
+                special_ids[key.split('_')[0]] = val['id']
+    # Fallback: scan by token string
+    for token_str, tid in vocab.items():
+        if tid == 0:
+            special_ids['eos'] = tid if special_ids['eos'] == 0xFFFFFFFF else special_ids['eos']
+        for pattern, idx_key in [('<|endoftext|>', 'eos'), ('<|im_end|>', 'eos'),
+                                  ('<|pad|>', 'pad'), ('<unk>', 'unk')]:
+            if token_str == pattern and special_ids[idx_key] == 0xFFFFFFFF:
+                special_ids[idx_key] = tid
+    # Set defaults if not found
+    if special_ids['eos'] == 0xFFFFFFFF: special_ids['eos'] = 0
+    if special_ids['pad'] == 0xFFFFFFFF: special_ids['pad'] = 0
+    if special_ids['unk'] == 0xFFFFFFFF: special_ids['unk'] = 0
+    if special_ids['bos'] == 0xFFFFFFFF: special_ids['bos'] = 0xFFFFFFFF  # not mapped
+
+    special_tokens_arr = np.array([
+        special_ids['eos'], special_ids['bos'], special_ids['pad'],
+        special_ids['unk'], special_ids['mask'], special_ids['sep'], special_ids['cls']
+    ], dtype=np.uint32)
+
+    # ─── Pack binary block ──────────────────────────────────────────────
+    # Layout:
+    #   128 bytes header
+    #   offsets[V]: uint32 × V
+    #   lengths[V]: uint16 × V
+    #   pool: raw bytes
+    #   (padding to 4 bytes)
+    #   merge_left[V]: uint32 × V
+    #   merge_right[V]: uint32 × V
+    #   merge_rank[V]: uint32 × V
+    #   byte_encoder[256]: uint16 × 256
+    #   byte_decoder[256]: uint16 × 256
+    #   special_tokens[7]: uint32 × 7
+
+    # Compute offsets relative to block start
+    off = 128
+    off_offsets = off
+    off += V * 4
+    off_lengths = off
+    off += V * 2
+    off_pool = off
+    off += len(pool)
+    # Align to 4
+    pool_pad = (4 - len(pool) % 4) % 4
+    off += pool_pad
+    off_merge_left = off
+    off += V * 4
+    off_merge_right = off
+    off += V * 4
+    off_merge_rank = off
+    off += V * 4
+    off_byte_enc = off
+    off += 512  # 256 * 2
+    off_byte_dec = off
+    off += 512
+    off_special = off
+    total_size = off + 28  # 7 * 4
+
+    # Build header (128 bytes)
+    header = bytearray(128)
+    struct.pack_into('<I', header, 0, 0x544F4B42)  # magic "TOKB"
+    struct.pack_into('<I', header, 4, 1)             # version
+    struct.pack_into('<I', header, 8, V)              # vocab_size
+    struct.pack_into('<I', header, 12, int(max_token_length))
+    struct.pack_into('<I', header, 16, 0)             # special_count (reserved)
+    struct.pack_into('<I', header, 20, 0)             # flags
+    struct.pack_into('<Q', header, 24, off_offsets)
+    struct.pack_into('<Q', header, 32, off_lengths)
+    struct.pack_into('<Q', header, 40, off_pool)
+    struct.pack_into('<Q', header, 48, len(pool))
+    struct.pack_into('<Q', header, 56, off_merge_left)
+    struct.pack_into('<Q', header, 64, off_merge_right)
+    struct.pack_into('<Q', header, 72, off_merge_rank)
+    struct.pack_into('<Q', header, 80, off_byte_enc)
+    struct.pack_into('<Q', header, 88, off_byte_dec)
+    struct.pack_into('<Q', header, 96, off_special)
+    # reserved[16] at 104-119 stays zero
+
+    # Assemble binary block
+    buf = bytearray(total_size)
+    buf[:128] = header
+    buf[off_offsets:off_offsets + V * 4] = offsets.tobytes()
+    buf[off_lengths:off_lengths + V * 2] = lengths.tobytes()
+    buf[off_pool:off_pool + len(pool)] = pool
+    # pool padding already zero-initialized
+    buf[off_merge_left:off_merge_left + V * 4] = merge_left.tobytes()
+    buf[off_merge_right:off_merge_right + V * 4] = merge_right.tobytes()
+    buf[off_merge_rank:off_merge_rank + V * 4] = merge_rank.tobytes()
+    buf[off_byte_enc:off_byte_enc + 512] = byte_encoder.tobytes()
+    buf[off_byte_dec:off_byte_dec + 512] = byte_decoder.tobytes()
+    buf[off_special:off_special + 28] = special_tokens_arr.tobytes()
+
+    print(f"  Binary tokenizer: {total_size/1024/1024:.2f} MB "
+          f"(pool={len(pool)/1024:.1f} KB, V={V})")
+    return bytes(buf)
 
 def pack_tensor_row_wise(tensor):
     """BitNet uint8 [OUT/4, IN] → TQ1.0 [OUT, IN/4*5] row-major.
@@ -174,6 +396,21 @@ def create_atlas_from_config(safetensors_path, output_path):
             current_offset = tokenizer_offset + len(tokenizer_block)
             struct.pack_into('<I', header, 29, len(tokenizer_block))
             struct.pack_into('<I', header, 33, tokenizer_offset)
+
+        # v6: Append binary tokenizer block
+        binary_tok_block = build_tokenizer_binary(model_dir)
+        if binary_tok_block:
+            # Set version to 6
+            struct.pack_into('<H', header, 5, 6)
+            binary_offset = current_offset
+            if binary_offset % 32 != 0:
+                pad = 32 - (binary_offset % 32)
+                binary_offset += pad
+                out.write(b'\x00' * pad)
+            out.write(binary_tok_block)
+            current_offset = binary_offset + len(binary_tok_block)
+            struct.pack_into('<I', header, 37, len(binary_tok_block))
+            struct.pack_into('<I', header, 41, binary_offset)
 
         out.seek(64)
         out.write(directory)

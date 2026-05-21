@@ -191,10 +191,10 @@ def verify_model(path, cfg_dir, label):
 if __name__ == '__main__':
     results = []
     for name, path, cfg_dir in [
-        ('1B',  'C:/atlas/falcon3-1b-tq1.atlas',  'C:/models/Falcon3-1B-Instruct-1.58bit'),
-        ('3B',  'C:/atlas/falcon3-3b-tq1.atlas',  'C:/models/Falcon3-3B-Instruct-1.58bit'),
-        ('7B',  'C:/atlas/falcon3-7b-tq1.atlas',  'C:/models/Falcon3-7B-Instruct-1.58bit'),
-        ('10B', 'C:/atlas/falcon3-10b-tq1.atlas', 'C:/models/Falcon3-10B-Instruct-1.58bit'),
+        ('1B',  'C:/atlas/falcon3-1b-tq1.atlas',  'C:/dam/models/Falcon3-1B-Instruct-1.58bit'),
+        ('3B',  'C:/atlas/falcon3-3b-tq1.atlas',  'C:/dam/models/Falcon3-3B-Instruct-1.58bit'),
+        ('7B',  'C:/atlas/falcon3-7b-tq1.atlas',  'C:/dam/models/Falcon3-7B-Instruct-1.58bit'),
+        ('10B', 'C:/atlas/falcon3-10b-tq1.atlas', 'C:/dam/models/Falcon3-10B-Instruct-1.58bit'),
     ]:
         ok = verify_model(path, cfg_dir, name)
         results.append((name, ok))

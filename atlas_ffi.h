@@ -14,6 +14,8 @@
 //   [21:8]  float64 rope_theta (version>=3), else 10000.0
 //   [29:4]  int32  tokenizer_size (v5+), 0 if no embedded tokenizer
 //   [33:4]  uint32 tokenizer_offset (v5+), absolute file offset
+//   [37:4]  uint32 tokenizer_binary_size (v6+), 0 if no binary block
+//   [41:4]  uint32 tokenizer_binary_offset (v6+), absolute file offset
 //   [56:4]  int32  name_block_size (v4+)
 //   [60:4]  int32  n_tensors
 //   [64:]   tensor directory: n × [ttype:1][file_offset:4][row_dim:4][packed_cols:3]
@@ -99,6 +101,39 @@ ATLAS_API int atlas_get_tensor_index(void* model, const char* name);
 // size: set to tokenizer length in bytes, or 0 if not available.
 // Pointer is valid until atlas_free. Data is mmap'd from atlas file.
 ATLAS_API const uint8_t* atlas_get_tokenizer(void* model, int* size);
+
+// ─── v6 Tokenizer Binary Block ─────────────────────────────────────────
+// Check if v6 binary tokenizer is available. Returns 1 if present, 0 otherwise.
+ATLAS_API int atlas_has_binary_tokenizer(void* model);
+
+// Pre-encode text to byte-level token IDs using raw byte_encoder lookup (no BPE merge).
+// This is the "pre-tokenization" step — produces initial byte tokens that the
+// BPE merge loop operates on. Use atlas_tokenizer_merge to complete encoding.
+// text:      UTF-8 input bytes
+// text_len:  length of input in bytes
+// out_ids:   pre-allocated buffer for output byte token IDs
+// max_ids:   capacity of out_ids
+// Returns:   number of byte tokens written (>=0), or -1 on error
+ATLAS_API int atlas_tokenizer_preencode(void* model,
+    const char* text, int text_len,
+    int* out_ids, int max_ids);
+
+// Run BPE merge loop on pre-encoded byte token IDs. Modifies out_ids in-place.
+// ids:       input byte token IDs (modified in-place to produce merged tokens)
+// n_ids:     number of input byte tokens (modified to final token count)
+// Returns:   0 on success, -1 on error
+ATLAS_API int atlas_tokenizer_merge(void* model,
+    int* ids, int* n_ids);
+
+// Decode token IDs back to UTF-8 text using C++ tokenizer (v6 binary block).
+// ids:       input token IDs
+// n_ids:     number of input tokens
+// out_text:  pre-allocated buffer for output UTF-8 text
+// max_out:   capacity of out_text in bytes
+// Returns:   number of bytes written (>=0), or -1 on error
+ATLAS_API int atlas_tokenizer_decode(void* model,
+    const int* ids, int n_ids,
+    char* out_text, int max_out);
 
 // ─── Decompression + cache ────────────────────────────────────────────
 // Decompress all TQ1 tensors (ttype==0) to int8 (ttype==3) in-place.
