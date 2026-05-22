@@ -92,6 +92,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.3.1** | **Windows MSVCRT File-Buffer Hotfix**: `out.flush()` vor `out.seek(64)` im `atlas_packer.py` hinzugefügt. Verhindert Directory-Korruption bei Modellen >2 GB (7B v6). 7B v6 lädt nun fehlerfrei und generiert korrekt. |
 | **v2.3.0** | **Int8 KV-Cache Quantisierung**: FP16→int8 mit dynamischer Skalierung pro (KV-Head, Position). Cache aus API-Signaturen entfernt, vollständig intern im `AtlasModel`-Struct via `ensure_cache()`. SIMD-In-Flight-Dequantisierung im Attention-Hotpath. 10B@4K: 320 MB → 173 MB RAM. Python-Schnittstelle bereinigt (kein manuelles Cache-Array-Management mehr). |
 | v2.0.4 | softmax sampling (replace Gumbel-max), thread_local→static revert, AGENTS.md benchmarks corrected, default T=0.7 |
 | v2.1.0 | Streaming `atlas_generate_stream` callback C API, Python `generate_stream` generator, `set_system_prompt`, chat history via `list[dict]` messages |

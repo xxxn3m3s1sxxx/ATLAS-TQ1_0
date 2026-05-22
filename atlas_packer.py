@@ -412,6 +412,9 @@ def create_atlas_from_config(safetensors_path, output_path):
             struct.pack_into('<I', header, 37, len(binary_tok_block))
             struct.pack_into('<I', header, 41, binary_offset)
 
+        # Flush before seeking back — Windows MSVCRT can't seek past 2GB
+        # without an explicit flush (buffer contains unwritten data).
+        out.flush()
         out.seek(64)
         out.write(directory)
         out.seek(0)
