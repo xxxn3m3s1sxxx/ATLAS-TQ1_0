@@ -74,9 +74,9 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 void* atlas_load(const char* path);
 void atlas_free(void* model);
 int atlas_generate(void* model, const int* input_ids, int n_input,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
+    float repetition_penalty,
     int* output_ids);
 void atlas_set_seed(uint64_t seed);
 void atlas_set_num_threads(int n);

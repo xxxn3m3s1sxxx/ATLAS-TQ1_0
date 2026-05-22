@@ -6,7 +6,7 @@
 
 CPU inference engine for Falcon3 BitNet b1.58 ternary-quantized models. Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **Architecture Scope:** ATLAS v2.0.3 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **Architecture Scope:** ATLAS v2.3.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
 
 ## Supported Models
 
@@ -28,18 +28,30 @@ pip install numpy
 pip install numpy safetensors transformers
 ```
 
-### Pack → Infer
+### Generate (C++ core)
 
 ```python
 from atlas_infer import AtlasModel
 
-# Load and generate (hybrid mode is default)
 model = AtlasModel('falcon3-10b-tq1.atlas')
+
+# Deterministic generation
 print(model.generate_c("What is the capital of France?", temperature=0.0))
 
-# Deterministic sampling
+# Sampling with repetition penalty
 model.set_seed(42)
-print(model.generate_c("What is the capital of France?", temperature=0.7, top_k=40, top_p=0.9))
+print(model.generate_c("Tell me about Paris", temperature=0.7, top_k=40, top_p=0.9, repetition_penalty=1.1))
+
+# Streaming
+for chunk in model.generate_stream("Write a short poem", max_new_tokens=100):
+    print(chunk, end="", flush=True)
+
+# Chat with system prompt
+model.set_system_prompt("You are a helpful assistant.")
+messages = [
+    {"role": "user", "content": "What is the capital of France?"}
+]
+print(model.generate_c(messages, temperature=0.7))
 ```
 
 ### Build from source
@@ -58,9 +70,9 @@ Requires Clang (Windows) or GCC (Linux) with OpenMP, AVX2+FMA.
 
 ## Performance
 
-Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3, 16 GB DDR4). All benchmarks via `m.generate_c()` at 30 tokens, warm (after 1+ runs). **All modes produce "Paris" at T=0** across all 4 models (coherence verified).
+Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3, 16 GB DDR4). All benchmarks via `m.generate_c()` at 30 tokens, warm (after 1+ runs). **All modes produce "Paris" at T=0** across all 4 models (coherence verified). Performance benchmarks shown below are from v2.2.2 — see version history for subsequent F16C/attention optimizations.
 
-### v1.4.0 — Three Matmul Modes
+### v2.2.2 — Three Matmul Modes (+ F16C in attention score + weighted sum)
 
 | Mode | 1B | 3B | 7B | 10B |
 |------|:--:|:--:|:--:|:---:|
@@ -78,13 +90,22 @@ These numbers reflect the interplay of SIMD throughput, cache pressure, and memo
 
 - **10B (hybrid dominance):** Hybrid leads at **11.0 tok/s** vs int8 (8.8). On the i7-7700T's 8 MB L3 cache, the full int8 path causes constant cache evictions across 40 layers. Hybrid's packed QKV slashes memory traffic by 5×, keeping the FFN-heavy pipeline fed and avoiding L3 thrashing.
 
+### v2.2.x Optimization Gains
+
+| Optimization | TQ1-LUT + F16C RMSNorm (v2.2.0) | BPE-PQ Tokenizer (v2.2.1) | F16C Attention (v2.2.2) |
+|---|---|---|---|
+| **3B** | ~30% throughput | 1401 tokens in 24ms | +5.7% |
+| **10B** | ~30% throughput | — | **+47%** |
+
+The F16C half-precision conversion intrinsics (`_mm256_cvtph_ps`) accelerated fp16→fp32 in RMSNorm (v2.2.0) and attention score/weighted sum (v2.2.2), providing the largest single-token speedups since hybrid mode.
+
 ### Hybrid Mode (default, v1.3.2+)
 
-Best speed/RAM balance. FFN projections (gate/up/down) run as decompressed int8 — they dominate compute. QKV/O projections stay in TQ1-packed format — they're memory-bound and benefit from 5× fewer bytes read.
+Best speed/RAM balance. FFN projections (gate/up/down) run as decompressed int8 — they dominate compute. QKV/O projections stay in TQ1-packed format — they're memory-bound and benefit from 5× fewer bytes read. KV-cache uses int8 quantization with per-position scaling (v2.3.0).
 
 For 1B (hidden=2048), the f32 bypass activates automatically to eliminate activation quantization noise.
 
-### Int8 Cache
+### Int8 Weight Cache (Disk)
 
 On first load, a `.i8` companion file is created (decompressed int8 tensors). Subsequent loads mmap it directly — sub-second startup:
 
@@ -108,6 +129,12 @@ Decodes TQ1→int8 on-the-fly per matmul. No cache file needed. Loads in **1.2s*
 
 First load is dominated by decompression (TQ1→int8), lm_head quantization, and disk write. Subsequent loads with `.i8` cache mmap in under 2s.
 
+### Int8 KV-Cache (v2.3.0, Internal)
+
+The KV-cache is int8-quantized with dynamic per-position scaling (one float32 scale per KV-head per position). No manual allocation or management needed — `atlas_forward` calls `ensure_cache(max_seq_len)` internally. API signatures no longer carry `k_cache`/`v_cache` parameters.
+
+**RAM savings**: 10B@4K context: 320 MB (fp16) → 173 MB (int8). SIMD in-flight dequantization in attention hotpath adds no measurable overhead.
+
 ### 🛠️ Windows Runtime Troubleshooting
 
 If you compile using the LLVM-MinGW toolchain and encounter a `FileNotFoundError` or activation error when loading `atlas.dll` via ctypes, ensure the following MinGW runtime DLLs are placed in your working directory (next to `atlas.dll`):
@@ -127,7 +154,7 @@ safetensors → atlas_packer.py → .atlas file → atlas_infer.py → atlas.dll
                                                          |
                                               ┌──────────┼──────────┐
                                           RMSNorm  Attention  FFN(SiLU)
-                                         (C++)      (C++)     (int8/packed)
+                                         (C++)   (int8 KV)   (int8/packed)
                                                          |
                                                Final RMSNorm + LM head GEMV (int8)
 ```
@@ -136,14 +163,17 @@ safetensors → atlas_packer.py → .atlas file → atlas_infer.py → atlas.dll
 
 1. **Packer** (`atlas_packer.py`): De-interleaves BitNet's 4-row-packed uint8 → Base-3 TQ1. 5 trits per byte, padded with ternary-0.
 2. **v5/v6 file format**: v5: 64-byte header (magic `"ATLAS"`, version=5, model hyperparameters, tokenizer offset/size), 12-byte tensor directory, name block, data, embedded tokenizer.json. v6: same structure + binary tokenizer block (128-byte header, pool offsets/lengths, BPE merges, byte_encoder, special tokens) — enables C++ pool-lookup decode without `transformers` or `tokenizers` libraries. C API `atlas_get_tokenizer()` exposes v5 JSON or v6 binary block. `AtlasModel('model.atlas')` suffices, no external model directory.
-3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. TQ1 tensors are decompressed to int8 with per-tensor `valloc`/`vfree` (`VirtualAlloc` on Windows, `mmap` on Linux). `atlas_forward` runs all N layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) — with no Python round-trips between layers. Ping-pong buffers avoid per-layer copies.
-4. **Tokenizer (v6)**: Python `tokenizers` for encode (Falcon3's byte_encoder is fundamentally incompatible with C++ byte-level pre-encode — 191/256 byte tokens overwritten by special tokens). C++ pool-lookup for decode (`O(1)` per token). `_apply_chat_template` renders Falcon3 Jinja2 format without `transformers`.
-5. **Matmul modes**: int8 (`vpmaddubs_epi16`), f32 bypass (`vfmadd231ps`), ternary-add (`vpsignb`), TQ1-packed (chunked decode + SIMD). Switched at runtime.
-6. **Sampling**: Xoshiro256** PRNG + Gumbel-max top-k/top-p. T=0 → argmax. Optimized survivor-list collection (top-k prunes to ~40 candidates, top-p operates on survivors only — eliminates O(V log V) sort).
+3. **C++ library** (`atlas_api.cpp`, single source for Windows + Linux): Loads the atlas file into memory. TQ1 tensors are decompressed to int8 with per-tensor `valloc`/`vfree` (`VirtualAlloc` on Windows, `mmap` on Linux). `atlas_forward` runs all N layers in one fused C++ call — RMSNorm + 7× int8 matmul (Q/K/V/O/gate/up/down) + fused GQA attention (RoPE + int8 KV-cache + causal softmax + weighted sum) + fused FFN (gate+up in one OMP region, SiLU+mul+quantize fused into down projection) — with no Python round-trips between layers. Ping-pong buffers avoid per-layer copies. KV-cache is int8-quantized with per-position scaling (`v2.3.0`), fully internal — no manual cache management needed.
+4. **Int8 KV-Cache (v2.3.0)**: FP16→int8 quantization with dynamic scale per (KV-head, position). 10B@4K: 320 MB → 173 MB RAM. SIMD in-flight dequantization in attention hotpath. Cache is fully encapsulated in the C++ model struct — no k_cache/v_cache parameters in `atlas_forward` or Python API.
+5. **Tokenizer (v6)**: Python `tokenizers` for encode (Falcon3's byte_encoder is fundamentally incompatible with C++ byte-level pre-encode — 191/256 byte tokens overwritten by special tokens). C++ pool-lookup for decode (`O(1)` per token). `_apply_chat_template` renders Falcon3 Jinja2 format without `transformers`.
+6. **Matmul modes**: int8 (`vpmaddubs_epi16`), f32 bypass (`vfmadd231ps`), ternary-add (`vpsignb`), TQ1-packed (chunked decode + SIMD). Switched at runtime.
+7. **Sampling**: Softmax multinomial with top-k/top-p (v2.0.4, replaced Gumbel-max). Xoshiro256** PRNG. T=0 → argmax. Optimized survivor-list collection (top-k prunes to ~40 candidates, top-p operates on survivors only — eliminates O(V log V) sort).
+8. **Streaming** (v2.1.0): `atlas_generate_stream` callback C API, Python `generate_stream` generator. `set_system_prompt()` for context injection. Chat history via `list[dict]` messages with `_apply_chat_template`.
+9. **Repetition penalty** (v2.1.1): Applied in C-core before top-k pruning, exposed in `generate_c`/`generate_stream`.
 
 ## Bugfix Chronology
 
-Ten critical bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
+Twenty bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
 
 ### Bug 1 [FIXED]: `fseek` 32-bit overflow
 
@@ -220,6 +250,20 @@ Corr=0.23 test failure traced to **two bugs in Python test script**, not engine:
 
 **Result with fixes**: corr=0.9967, max_diff=4.0. Engine correct.
 
+### v2.0.x Bugfix Summary
+
+Twelve additional bugs found and fixed during the v2.0.x cycle:
+
+| Bug | Severity | Fix | Version |
+|-----|----------|-----|---------|
+| Memory leak: `__del__` fehlte | HIGH | `atlas_free` in Python destructor | v2.0.2 |
+| KV-cache overflow: `pos < max_seq_len` ungeprüft | HIGH | Defense-in-depth clamp in generate + attention | v2.0.2 |
+| Stale `.i8` cache loading | MEDIUM | File-size validation + tensor shape check | v2.0.2 |
+| Thread-unsafe static vectors | MEDIUM | `thread_local` + `std::call_once` | v2.0.2 |
+| `atlas_set_seed(0)` → garbage | LOW | Pass seed 0 directly | v2.0.2 |
+| `n_input >= max_seq_len` vor Prefill | CRITICAL | Early return with -1 | v2.0.3 |
+| `scores_buf` null-deref bei OOM | LOW | Guard + early return | v2.0.3 |
+
 ### Verification
 
 All four Falcon3 models (1B, 3B, 7B, 10B) pass coherence: "The capital of France is Paris." at T=0 across all 3 matmul modes (12/12 test passes). The 1B model requires sampling (T ≥ 0.7) — greedy decoding degenerates due to model-inherent distribution (`"` with p=0.43), not engine.
@@ -231,17 +275,24 @@ All four Falcon3 models (1B, 3B, 7B, 10B) pass coherence: "The capital of France
 | `atlas_packer.py` | safetensors → TQ1 v5/v6 (embedded tokenizer + optional binary tokenizer block) |
 | `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
 | `atlas_infer.py` | Python inference engine |
-| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer) |
+| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer, int8 KV-cache) |
 | `atlas_ffi.h` | C API contract |
-| `atlas.dll` / `libatlas.so` | Prebuilt binaries |
 | `falcon3-{1,3,7,10}b-tq1.atlas` | Packed models |
 
 ## Version History
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.3.1** | Windows packer hotfix (`out.flush()` before `seek`), 7B v6 repair |
+| **v2.3.0** | Int8 KV-Cache (fp16→int8, dynamic scaling, internal `ensure_cache()`), 10B@4K: 320→173 MB |
+| **v2.2.2** | F16C in attention score + weighted sum (batch `_mm256_cvtph_ps` + FMA), 10B +47%, 3B +5.7% |
+| **v2.2.1** | BPE-PQ priority queue in tokenizer merge (O(n²)→O(n log n)), 1401 tokens in 24ms |
+| **v2.2.0** | TQ1-LUT in decompression (replace %3//3 with lookup), F16C (`_mm256_cvtph_ps`) for fp16→fp32 in RMSNorm + scalar, ~30% throughput |
+| **v2.1.1** | Repetition penalty in C-core (before top-k), exposed in Python API |
+| **v2.1.0** | Streaming (`atlas_generate_stream` callback C API, Python `generate_stream` generator), `set_system_prompt`, chat history via `list[dict]` messages |
+| **v2.0.4** | Softmax sampling (replace Gumbel-max), thread_local→static revert, default T=0.7 |
 | **v2.0.3** | n_input ≥ max_seq_len guard (CRITICAL), scores_buf OOM guard (Bug 9) |
-| **v2.0.2** | Memory leak fix (__del__), KV-cache overflow clamp, stale .i8 cache validation, thread-local statics, seed=0 pass-through |
+| **v2.0.2** | Memory leak fix (`__del__`), KV-cache overflow clamp, stale .i8 cache validation, thread-local statics, seed=0 pass-through |
 | **v2.0.1** | `scores` alloca → heap (stack fully sterile) |
 | **v2.0.0** | C++ binary tokenizer (v6 format) — no `transformers` dependency at runtime |
 | **v1.4.0** | Stack overflow fix, survivor-list sampling optimization |
