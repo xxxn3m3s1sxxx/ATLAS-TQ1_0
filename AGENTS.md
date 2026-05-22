@@ -88,6 +88,18 @@ const char* atlas_get_tokenizer(void* model, int* size);
 
 See `atlas_ffi.h` for full API.
 
+## Roadmap
+
+### v2.4.0 — Context Window Extension
+- **RoPE NTK-scaling**: Interpolation factor im C++-Core (`rope_theta` adjust + freq scaling)
+- **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten Positionen, dynamisches `max_seq_len` pro `atlas_generate`-Aufruf
+- **Target**: 8K Kontext für 10B bei ~346 MB Cache (2× heutige Reichweite bei ~gleichem RAM)
+- Abhängigkeit: int8 KV-Cache (v2.3.0) — liefert die RAM-Reserve für die Verdopplung
+
+### Deferred
+- **F16C-Rester**: Diminishing returns (heiße Pfade bereits erledigt)
+- **SSE Web-Server**: ~50 Zeilen FastAPI/SSE-Wrapper, jederzeit nachrüstbar
+
 ## Version History
 
 | Version | Key Changes |
