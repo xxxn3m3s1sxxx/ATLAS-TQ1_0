@@ -92,7 +92,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
-| v2.0.4 | fix: revert thread_local → static (Windows+clang+OMP perf regression, -20% 10B) |
+| v2.0.4 | softmax sampling (replace Gumbel-max), thread_local→static revert, AGENTS.md benchmarks corrected, default T=0.7 |
 | v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
 | v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
 | v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |
