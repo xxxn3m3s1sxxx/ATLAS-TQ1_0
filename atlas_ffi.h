@@ -214,7 +214,7 @@ ATLAS_API void atlas_forward(void* model,
 // Seed the internal Xoshiro256** PRNG. Call once before generation.
 ATLAS_API void atlas_set_seed(uint64_t seed);
 
-// Sample one token from logits using Gumbel-max with top-k/top-p.
+// Sample one token from logits using softmax with top-k/top-p.
 // logits: [vocab_size] float32 — modified in-place (used as scratch).
 // output: [1] int32 — receives the sampled token ID.
 ATLAS_API void atlas_sample(void* model, float* logits, int* output,
@@ -236,6 +236,22 @@ ATLAS_API int atlas_generate(void* model,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     int* output_ids);
+
+// ─── v2.3.0: Streaming generation ─────────────────────────────────────
+// Callback type for streaming token output. Fired once per generated token.
+// token_id: the sampled token ID
+// user_data: opaque pointer passed to atlas_generate_stream (e.g., Python queue)
+typedef void (*atlas_token_callback)(int token_id, void* user_data);
+
+// Streaming variant of atlas_generate. Same parameters + callback + user_data.
+// Instead of writing to output_ids, fires callback for each token.
+// Returns number of tokens generated, or -1 on error.
+ATLAS_API int atlas_generate_stream(void* model,
+    const int* input_ids, int n_input,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int max_seq_len, int max_new_tokens,
+    float temperature, int top_k, float top_p,
+    atlas_token_callback callback, void* user_data);
 
 // ─── Int8 lm_head ─────────────────────────────────────────────────────
 // Quantize lm_head from fp16 to per-row symmetric int8 (~403 MB vs 1.5 GB fp32).

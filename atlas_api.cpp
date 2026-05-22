@@ -233,6 +233,9 @@ static int gumbel_sample(float* logits, int V,
 
 extern "C" {
 
+// Callback for streaming generation (v2.3.0)
+typedef void (*atlas_token_callback)(int token_id, void* user_data);
+
 static inline float fp16_to_fp32(uint16_t h) {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
     uint32_t f32 = (e == 0) ? ((s << 31) | (0 << 23) | (m << 13))
@@ -2695,6 +2698,124 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         output_ids[n_gen++] = next_token;
 
         if (next_token == eos_id) break;  // EOS
+    }
+
+    atlas_vfree((uint8_t*)embed_buf);
+    atlas_vfree((uint8_t*)h_norm);
+    atlas_vfree((uint8_t*)logits);
+
+    return n_gen;
+}
+
+// ─── v2.3.0: Streaming generation (callback per token) ───────────────────
+ATLAS_API int atlas_generate_stream(AtlasModel* m,
+    const int* input_ids, int n_input,
+    uint16_t* k_cache, uint16_t* v_cache,
+    int max_seq_len, int max_new_tokens,
+    float temperature, int top_k, float top_p,
+    atlas_token_callback callback, void* user_data)
+{
+    if (!m || !input_ids || !callback || n_input < 1 || max_new_tokens < 1)
+        return -1;
+    if (n_input >= max_seq_len) {
+        fprintf(stderr, "[ATLAS] atlas_generate_stream: prompt (%d) >= max_seq_len (%d)\n",
+                n_input, max_seq_len);
+        return -1;
+    }
+
+    int idx_norm = -1, idx_embed = -1;
+    for (int i = 0; i < (int)m->tensor_names.size(); i++) {
+        if (m->tensor_names[i] == "model.norm.weight") idx_norm = i;
+        if (m->tensor_names[i] == "model.embed_tokens.weight") idx_embed = i;
+    }
+    if (idx_norm < 0 || idx_embed < 0) return -1;
+
+    int H = m->hidden_dim;
+    int V = m->vocab_size;
+    uint16_t* embed_w = (uint16_t*)m->tensors[idx_embed].data;
+    uint8_t* norm_w = m->tensors[idx_norm].data;
+
+    if (!m->lm_head_quantized) return -1;
+
+    ensure_layer_idx(m);
+    const int* layer_idx = m->layer_idx_cache.data();
+
+    float* embed_buf = (float*)atlas_valloc((size_t)n_input * H * sizeof(float));
+    float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
+    float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
+    if (!embed_buf || !h_norm || !logits) {
+        if (embed_buf) atlas_vfree((uint8_t*)embed_buf);
+        if (h_norm) atlas_vfree((uint8_t*)h_norm);
+        if (logits) atlas_vfree((uint8_t*)logits);
+        return -1;
+    }
+
+    // ─── Prefill ───
+    int n_gen = 0;
+    for (int i = 0; i < n_input; i++) {
+        int tid = input_ids[i];
+        if (tid < 0 || tid >= V) tid = 0;
+        for (int j = 0; j < H; j++)
+            embed_buf[i * H + j] = fp16_to_fp32(embed_w[tid * H + j]);
+    }
+
+    int* positions = (int*)atlas_valloc((size_t)n_input * sizeof(int));
+    if (!positions) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); return -1;
+    }
+    for (int i = 0; i < n_input; i++) positions[i] = i;
+
+    atlas_forward(m, embed_buf, n_input, positions,
+                  k_cache, v_cache, max_seq_len, n_input,
+                  layer_idx, m->n_layers);
+
+    {
+        const float* x = embed_buf + (int64_t)(n_input - 1) * H;
+        atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
+        atlas_lmhead_gemv(m, h_norm, logits, 1);
+    }
+
+    int next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
+    callback(next_token, user_data);
+    n_gen++;
+
+    const int eos_id = 11;
+    if (next_token == eos_id) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
+        return n_gen;
+    }
+
+    // ─── Decode loop ───
+    atlas_vfree((uint8_t*)positions);
+    int max_possible = max_seq_len - n_input;
+    if (max_possible <= 0) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); return 0;
+    }
+    if (max_new_tokens > max_possible) max_new_tokens = max_possible;
+    for (int step = 1; step < max_new_tokens; step++) {
+        int tid = next_token;
+        if (tid < 0 || tid >= V) tid = 0;
+        float* h = embed_buf;
+        for (int j = 0; j < H; j++)
+            h[j] = fp16_to_fp32(embed_w[tid * H + j]);
+
+        int seq_now = n_input + step;
+        int pos = seq_now - 1;
+        atlas_forward(m, h, 1, &pos,
+                      k_cache, v_cache, max_seq_len, seq_now,
+                      layer_idx, m->n_layers);
+
+        atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
+        atlas_lmhead_gemv(m, h_norm, logits, 1);
+
+        next_token = gumbel_sample(logits, V, temperature, top_k, top_p);
+        callback(next_token, user_data);
+        n_gen++;
+
+        if (next_token == eos_id) break;
     }
 
     atlas_vfree((uint8_t*)embed_buf);

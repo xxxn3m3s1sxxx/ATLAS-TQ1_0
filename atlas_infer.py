@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Atlas Inference Engine v1.2.1 — End-to-end Falcon3 TQ1.0 generation."""
-import ctypes, struct, os, sys, time, json, numpy as np
+"""Atlas Inference Engine v2.1.0 — End-to-end Falcon3 TQ1.0 generation."""
+import ctypes, struct, os, sys, time, json, queue, threading, numpy as np
 from safetensors import safe_open
 # v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
@@ -168,6 +168,16 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
     ctypes.POINTER(ctypes.c_int)]
+
+# v2.1.0: Streaming callback type
+TOKEN_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
+    ctypes.c_int, ctypes.c_int,
+    ctypes.c_float, ctypes.c_int, ctypes.c_float,
+    TOKEN_CALLBACK, ctypes.c_void_p]
+dll.atlas_generate_stream.restype = ctypes.c_int
 
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
@@ -703,6 +713,10 @@ class AtlasModel:
                 text = text[:idx]
         return text
 
+    def set_system_prompt(self, prompt):
+        """Set system prompt injected before every user message."""
+        self._system_prompt = prompt
+
     def generate_c(self, prompt, max_new_tokens=50, temperature=0.7,
                    top_k=40, top_p=0.9):
         """Generate via atlas_generate (single C call, v1.2.1)."""
@@ -710,6 +724,9 @@ class AtlasModel:
             if self._use_cpp_tokenizer:
                 if isinstance(prompt, str):
                     prompt = [{"role": "user", "content": prompt}]
+                sysp = getattr(self, '_system_prompt', None)
+                if sysp and not any(m.get('role') == 'system' for m in prompt):
+                    prompt = [{"role": "system", "content": sysp}] + prompt
                 text = self._apply_chat_template(prompt)
                 input_ids = self._cpp_encode(text)
             elif self._tok is not None:
@@ -754,6 +771,67 @@ class AtlasModel:
             if idx >= 0:
                 decoded = decoded[:idx]
         return decoded
+
+    def generate_stream(self, prompt, max_new_tokens=200, temperature=0.7,
+                        top_k=40, top_p=0.9):
+        """Streaming generator — yields token IDs as they are produced.
+
+        Usage:
+            for token_id in model.generate_stream("Write an article"):
+                token_text = model._cpp_decode([token_id])
+                send_to_frontend(token_text)
+
+        Yields int token IDs. Caller is responsible for decoding.
+        """
+        try:
+            if self._use_cpp_tokenizer:
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                sysp = getattr(self, '_system_prompt', None)
+                if sysp and not any(m.get('role') == 'system' for m in prompt):
+                    prompt = [{"role": "system", "content": sysp}] + prompt
+                text = self._apply_chat_template(prompt)
+                input_ids = self._cpp_encode(text)
+            elif self._tok is not None:
+                from transformers import PreTrainedTokenizerFast
+                tok = PreTrainedTokenizerFast(
+                    tokenizer_object=self._tok,
+                    chat_template=self._chat_template)
+                tok.add_special_tokens({"pad_token": "<|pad|>"})
+                if isinstance(prompt, str):
+                    prompt = [{"role": "user", "content": prompt}]
+                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+                input_ids = tok.encode(text)
+            else:
+                return
+        except Exception as e:
+            return
+
+        n_input = len(input_ids)
+        in_arr = (ctypes.c_int * n_input)(*input_ids)
+        k_cache = self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+        v_cache = self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
+
+        # Thread-safe token queue
+        q = queue.Queue()
+        def on_token(tid, _):
+            q.put(tid)
+        cb = TOKEN_CALLBACK(on_token)
+
+        t = threading.Thread(target=dll.atlas_generate_stream,
+            args=(self.model_ptr, in_arr, n_input, k_cache, v_cache,
+                  self.max_seq_len, max_new_tokens,
+                  temperature, top_k, top_p, cb, None))
+        t.start()
+
+        n_gen = 0
+        while t.is_alive() or not q.empty():
+            try:
+                tid = q.get(timeout=0.1)
+                yield tid
+                n_gen += 1
+            except queue.Empty:
+                continue
 
     def _cpp_encode(self, text):
         """Encode text via Python tokenizers library (no transformers dependency).

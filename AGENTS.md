@@ -93,6 +93,7 @@ See `atlas_ffi.h` for full API.
 | Version | Key Changes |
 |---------|-------------|
 | v2.0.4 | softmax sampling (replace Gumbel-max), thread_local→static revert, AGENTS.md benchmarks corrected, default T=0.7 |
+| v2.1.0 | Streaming `atlas_generate_stream` callback C API, Python `generate_stream` generator, `set_system_prompt`, chat history via `list[dict]` messages |
 | v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
 | v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
 | v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |
