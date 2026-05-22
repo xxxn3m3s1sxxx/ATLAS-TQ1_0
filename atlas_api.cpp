@@ -174,17 +174,61 @@ static int gumbel_sample(float* logits, int V,
         }
     }
 
-    // Gumbel-max on survivors only
-    int best = 0;
-    float best_val = -FLT_MAX / 4;
-    for (int i : sidx) {
-        if (logits[i] <= -FLT_MAX / 8) continue;
-        float u = xoshiro_float();
-        if (u <= 0.0f) u = 1e-38f;
-        float val = logits[i] + -logf(-logf(u));
-        if (val > best_val) { best_val = val; best = i; }
+    // Multinomial sampling on survivors (replaces Gumbel-max for stability)
+    {
+        // Collect valid survivors (skip -inf pruned entries)
+        // Use a small array on the stack — at most top_k → 40 entries
+        int valid[128];
+        float val_buf[128];
+        int n_valid = 0;
+        for (int i : sidx) {
+            if (logits[i] <= -FLT_MAX / 8) continue;
+            valid[n_valid] = i;
+            val_buf[n_valid] = logits[i];
+            n_valid++;
+            if (n_valid >= 128) break;
+        }
+
+        if (n_valid <= 1) {
+            return (n_valid == 1) ? valid[0] : (sidx.empty() ? 0 : sidx[0]);
+        }
+
+        bool has_probs = (top_p > 0.0f && top_p < 1.0f);
+
+        float target;
+        if (has_probs) {
+            // Survivors already have probabilities (from top_p step): sample directly
+            float sum_p = 0.0f;
+            for (int i = 0; i < n_valid; i++) sum_p += val_buf[i];
+            float r = xoshiro_float();
+            if (r <= 0.0f) r = 1e-38f;
+            target = r * sum_p;
+            float cum = 0.0f;
+            for (int i = 0; i < n_valid; i++) {
+                cum += val_buf[i];
+                if (target <= cum) return valid[i];
+            }
+        } else {
+            // Survivors have temperature-scaled logits: compute softmax
+            float max_l = val_buf[0];
+            for (int i = 1; i < n_valid; i++)
+                if (val_buf[i] > max_l) max_l = val_buf[i];
+            float sum_exp = 0.0f;
+            for (int i = 0; i < n_valid; i++) {
+                val_buf[i] = expf(val_buf[i] - max_l);
+                sum_exp += val_buf[i];
+            }
+            float r = xoshiro_float();
+            if (r <= 0.0f) r = 1e-38f;
+            target = r * sum_exp;
+            float cum = 0.0f;
+            for (int i = 0; i < n_valid; i++) {
+                cum += val_buf[i];
+                if (target <= cum) return valid[i];
+            }
+        }
+        return valid[n_valid - 1];
     }
-    return best;
 }
 
 extern "C" {
