@@ -703,7 +703,7 @@ class AtlasModel:
                 text = text[:idx]
         return text
 
-    def generate_c(self, prompt, max_new_tokens=50, temperature=1.0,
+    def generate_c(self, prompt, max_new_tokens=200, temperature=0.7,
                    top_k=40, top_p=0.9):
         """Generate via atlas_generate (single C call, v1.2.1)."""
         try:

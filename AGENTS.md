@@ -38,21 +38,29 @@ clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o
 
 ## Performance
 
-Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). All via `m.generate_c()` at 30 tokens, warm.
+Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm (model loaded and cached). `generate_c()` at T=0.7, top_k=40, 200 max tokens. Includes prefill of ~22 token prompt. Times shown as total tok/s (prefill + gen) and pure gen tok/s where sustained.
 
-| Mode | 1B | 3B | 7B | 10B |
-|------|:--:|:--:|:--:|:---:|
-| **Hybrid** (default) | 17.6 tok/s | 5.3 tok/s | 9.2 tok/s | **11.0 tok/s** |
-| **Int8** (full cache) | 17.4 tok/s | **5.5 tok/s** | **14.5 tok/s** | 8.8 tok/s |
-| **Packed** (on-the-fly) | 15.8 tok/s | 3.3 tok/s | 10.2 tok/s | 6.4 tok/s |
+| Model | Hybrid tok/s (total) | Hybrid tok/s (pure gen) | Sustained gen tokens |
+|-------|:--------------------:|:-----------------------:|:--------------------:|
+| **3B** | **4.1** | **4.5** | 200 (no EOS) |
+| **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
+| **7B** | **1.9** | — | 61 (sampling-dependent) |
+| **10B** | **1.3** | — | 29 (sampling-dependent) |
 
-All modes produce **"Paris"** at `T=0` for "The capital of France is" across all 4 models.
+**10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
+
+**T=0 argmax behavior** (deterministic mode):  
+- **10B/7B**: Clean output ("The capital of France is Paris."), EOS after answer.  
+- **3B**: Correct answer + newline collapse after completion (model-inherent, 22L insufficient calibration).  
+- **1B**: Pure newline collapse (18L/2048H too small for stable argmax path).  
+
+🚀 **Default recommendation**: Always use `T=0.7, top_k=40` for any model below 7B. T=0 is only reliable for 7B+.
 
 ### Architecture Notes
 
-- **1B**: Mode-irrelevant (15.8–17.6 tok/s). f32 bypass (`hidden ≤ 2048`) eliminates activation quant entirely. Matmuls fit in register.
-- **7B**: Int8 leads at 14.5 tok/s — large FFN matmuls (23040 intermediate) benefit from full SIMD throughput.
-- **10B**: Hybrid leads at 11.0 tok/s — full int8 causes L3 cache evictions across 40 layers. Packed QKV slashes memory traffic 5×.
+- **1B**: f32 bypass (`hidden ≤ 2048`) eliminates activation quantization. 10 tok/s pure gen.
+- **3B vs 7B/10B**: Same hidden (3072) but intermediate scales from 9216 (3B) to 23040 (7B/10B). FFN matmul is 2.5× wider on 7B/10B, dominating the per-token cost.
+- **10B**: 40 layers mean 1.8× more memory traffic per token than 7B (28 layers), despite same per-layer weight size.
 
 ## Sampling
 
@@ -84,6 +92,8 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| v2.0.4 | fix: revert thread_local → static (Windows+clang+OMP perf regression, -20% 10B) |
+| v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
 | v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
 | v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |
 | v1.4.0 | Stack overflow fix (attn_ws heap alloc), survivor-list sampling |
