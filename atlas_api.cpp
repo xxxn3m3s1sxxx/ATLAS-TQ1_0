@@ -122,10 +122,10 @@ static int gumbel_sample(float* logits, int V,
         for (int i = 0; i < V; i++) logits[i] *= invT;
     }
 
-    thread_local std::vector<int> sidx;
+    static std::vector<int> sidx;
 
     if (top_k > 0 && top_k < V) {
-        thread_local std::vector<float> scopy;
+        static std::vector<float> scopy;
         if ((int)scopy.size() < V) scopy.resize(V);
         memcpy(scopy.data(), logits, V * sizeof(float));
         std::nth_element(scopy.begin(), scopy.begin() + top_k - 1, scopy.end(),
@@ -1320,8 +1320,8 @@ ATLAS_API void atlas_attention_f32(
 
     // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
     int max_seq = seq_now > max_seq_len ? max_seq_len : seq_now;
-    thread_local float* scores_buf = nullptr;
-    thread_local size_t scores_cap = 0;
+    static float* scores_buf = nullptr;
+    static size_t scores_cap = 0;
     size_t needed = (size_t)n_heads * max_seq;
     if (needed > scores_cap) {
         free(scores_buf);
