@@ -85,8 +85,6 @@ dll.atlas_forward.argtypes = [
     ctypes.POINTER(ctypes.c_float),               # hidden_states (in-place)
     ctypes.c_int,                                  # B
     ctypes.POINTER(ctypes.c_int),                  # positions
-    ctypes.POINTER(ctypes.c_uint16),               # k_cache (flat)
-    ctypes.POINTER(ctypes.c_uint16),               # v_cache (flat)
     ctypes.c_int,                                  # max_seq_len
     ctypes.c_int,                                  # seq_now
     ctypes.POINTER(ctypes.c_int),                  # layer_idx [n_layers * 9]
@@ -141,8 +139,10 @@ dll.atlas_attention_f32.argtypes = [
     ctypes.POINTER(ctypes.c_float),   # k
     ctypes.POINTER(ctypes.c_float),   # v
     ctypes.POINTER(ctypes.c_int),     # positions
-    ctypes.POINTER(ctypes.c_uint16),  # k_cache
-    ctypes.POINTER(ctypes.c_uint16),  # v_cache
+    ctypes.POINTER(ctypes.c_int8),    # k_cache (int8)
+    ctypes.POINTER(ctypes.c_float),   # k_scale_cache
+    ctypes.POINTER(ctypes.c_int8),    # v_cache (int8)
+    ctypes.POINTER(ctypes.c_float),   # v_scale_cache
     ctypes.c_int,     # max_seq_len
     ctypes.c_int,     # seq_now
     ctypes.c_int,     # B
@@ -164,7 +164,6 @@ dll.atlas_sample.argtypes = [ctypes.c_void_p,
 dll.atlas_generate.restype = ctypes.c_int
 dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-    ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
     ctypes.c_float,
@@ -174,7 +173,6 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
 dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-    ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
     ctypes.c_float,
@@ -260,11 +258,8 @@ class AtlasModel:
             if self.hidden <= 2048:
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
-        # Precompute KV cache
-        self.max_seq_len = 4096  # conservative for 16GB
-        kvc_size = (self.n_layers, self.n_kv_heads, self.max_seq_len, self.head_dim)
-        self.k_cache = np.zeros(kvc_size, dtype=np.float16)
-        self.v_cache = np.zeros(kvc_size, dtype=np.float16)
+        # Max sequence length for KV cache (allocated inside C++)
+        self.max_seq_len = 4096
 
         # Quantize lm_head to per-row int8 in C++ (saves ~1.1 GB vs full fp32)
         # Frees the fp16 data from C++ memory (~768 MB).
@@ -579,15 +574,11 @@ class AtlasModel:
 
         out = x.copy()
         idx_slice = self._layer_idx_arr[layer_idx * 9 : (layer_idx + 1) * 9].copy()
-        # Offset K/V cache to this specific layer (atlas_forward loop starts at L=0)
-        kc = self.k_cache[layer_idx].reshape(-1).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        vc = self.v_cache[layer_idx].reshape(-1).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         dll.atlas_forward(
             self.model_ptr,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             B,
             positions_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            kc, vc,
             self.max_seq_len, seq_now,
             idx_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             1)
@@ -608,8 +599,6 @@ class AtlasModel:
             h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             n,
             positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-            self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
             self.max_seq_len, seq_now,
             self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             self.n_layers)
@@ -685,8 +674,6 @@ class AtlasModel:
                     self.model_ptr,
                     h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     1, pos.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                    self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-                    self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
                     self.max_seq_len, len(input_ids) + step,
                     self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                     self.n_layers)
@@ -748,13 +735,10 @@ class AtlasModel:
 
         n_input = len(input_ids)
         in_arr = (ctypes.c_int * n_input)(*input_ids)
-        k_cache = self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        v_cache = self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
         out_arr = (ctypes.c_int * max_new_tokens)()
 
         n_gen = dll.atlas_generate(
             self.model_ptr, in_arr, n_input,
-            k_cache, v_cache,
             self.max_seq_len, max_new_tokens,
             float(temperature), int(top_k), float(top_p),
             float(repetition_penalty),
@@ -812,8 +796,6 @@ class AtlasModel:
 
         n_input = len(input_ids)
         in_arr = (ctypes.c_int * n_input)(*input_ids)
-        k_cache = self.k_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
-        v_cache = self.v_cache.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16))
 
         # Thread-safe token queue
         q = queue.Queue()
@@ -822,7 +804,7 @@ class AtlasModel:
         cb = TOKEN_CALLBACK(on_token)
 
         t = threading.Thread(target=dll.atlas_generate_stream,
-            args=(self.model_ptr, in_arr, n_input, k_cache, v_cache,
+            args=(self.model_ptr, in_arr, n_input,
                   self.max_seq_len, max_new_tokens,
                   temperature, top_k, top_p,
                   float(repetition_penalty),

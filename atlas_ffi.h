@@ -200,13 +200,15 @@ ATLAS_API const int8_t* atlas_get_int8(void* model, int idx, int* rows,
 // k_cache, v_cache: [n_layers × n_kv_heads × max_seq_len × head_dim] uint16 (fp16)
 // seq_now: current sequence length (positions will be < seq_now for decode)
 //
+// v2.3.0: KV cache is internal to the model (int8 quantized with per-position scale).
+// k_cache and v_cache parameters removed — allocation/management handled inside.
+//
 // Final RMSNorm + LM head matmul should be applied in Python (numpy/MKL is faster).
 // Memory: buffers allocated internally via valloc (mmap/VirtualAlloc).
 //   ~4 × B × max(inter_dim, hidden_dim, n_heads*head_dim) × sizeof(float)
 ATLAS_API void atlas_forward(void* model,
     float* hidden_states, int B,
     const int* positions,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int seq_now,
     const int* layer_idx, int n_layers);
 
@@ -221,18 +223,16 @@ ATLAS_API void atlas_sample(void* model, float* logits, int* output,
                              float temperature, int top_k, float top_p);
 
 // End-to-end autoregressive generation. Single C call for the entire decode loop.
-// Allocates internal scratch buffers (embedding, norm, logits). KV cache must be
-// pre-allocated by the caller.
+// Allocates internal scratch buffers (embedding, norm, logits). KV cache is
+// managed internally (int8 quantized, allocated for max_seq_len).
 //
 // input_ids:  [n_input] int32 — tokenized prompt IDs
-// k/v_cache:  [n_layers × n_kv_heads × max_seq_len × head_dim] uint16 (zero-filled or reused)
 // output_ids: [max_new_tokens] int32 — receives generated token IDs
 //
 // Returns: number of tokens actually generated ( ≤ max_new_tokens ), or -1 on error.
 // Stops when EOS token (id=0) is produced or max_new_tokens is reached.
 ATLAS_API int atlas_generate(void* model,
     const int* input_ids, int n_input,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
@@ -245,11 +245,10 @@ ATLAS_API int atlas_generate(void* model,
 typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
 // Streaming variant of atlas_generate. Same parameters + callback + user_data.
-// Instead of writing to output_ids, fires callback for each token.
+// KV cache is managed internally. Fires callback for each token.
 // Returns number of tokens generated, or -1 on error.
 ATLAS_API int atlas_generate_stream(void* model,
     const int* input_ids, int n_input,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
@@ -287,13 +286,16 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 // ─── Fused attention (RoPE + GQA + softmax + weighted sum) ───────────
 // q, k, v: [B × n_heads*head_dim / n_kv_heads*head_dim] float32
 //   q: RoPE applied in-place;  k, v: read only (cache used for attn)
-// k_cache, v_cache: [n_kv_heads × max_seq × head_dim] uint16 (fp16)
+// k_cache (int8), k_scale_cache (float): [n_kv_heads × max_seq × head_dim] int8 + per-position scaling
+// v_cache (int8), v_scale_cache (float): same layout for V
 // output: [B × n_heads × head_dim] float32
 //
-// Updates k_cache, v_cache at given positions with fp16 values.
+// v2.3.0: Int8 KV cache with per-kv_head, per-position scaling.
+// Read: cache_row[h, s] = (float)k_cache[h, s, d] * k_scale_cache[h, s]
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
-    const uint16_t* k_cache, const uint16_t* v_cache,
+    int8_t* k_cache, float* k_scale_cache,
+    int8_t* v_cache, float* v_scale_cache,
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
     float rope_theta, float* output);

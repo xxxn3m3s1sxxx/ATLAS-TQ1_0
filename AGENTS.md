@@ -92,11 +92,13 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.3.0** | **Int8 KV-Cache Quantisierung**: FP16→int8 mit dynamischer Skalierung pro (KV-Head, Position). Cache aus API-Signaturen entfernt, vollständig intern im `AtlasModel`-Struct via `ensure_cache()`. SIMD-In-Flight-Dequantisierung im Attention-Hotpath. 10B@4K: 320 MB → 173 MB RAM. Python-Schnittstelle bereinigt (kein manuelles Cache-Array-Management mehr). |
 | v2.0.4 | softmax sampling (replace Gumbel-max), thread_local→static revert, AGENTS.md benchmarks corrected, default T=0.7 |
 | v2.1.0 | Streaming `atlas_generate_stream` callback C API, Python `generate_stream` generator, `set_system_prompt`, chat history via `list[dict]` messages |
 | v2.1.1 | Repetition penalty in C-core (before top-k), exposed in Python generate_c/generate_stream |
 | v2.2.0 | TQ1-LUT in decompression (replace %3//3 with lookup), F16C (_mm256_cvtph_ps) for fp16→fp32 in RMSNorm + scalar, ~30% throughput gain on 3B/10B |
 | v2.2.1 | BPE-PQ priority queue in tokenizer merge (O(n²)→O(n log n)), 1401 tokens in 24ms |
+| v2.2.2 | F16C in attention score + weighted sum (batch _mm256_cvtph_ps + FMA), 10B +47%, 3B +5.7% |
 | v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
 | v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
 | v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |

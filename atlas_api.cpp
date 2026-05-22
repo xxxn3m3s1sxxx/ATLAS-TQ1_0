@@ -303,6 +303,29 @@ struct AtlasModel {
     void* mmap_base = nullptr;      // MapViewOfFile base (.i8 cache)
     void* mmap_handle = nullptr;    // CreateFileMapping handle (Win) / file size (Lin)
     void* mmap_file = nullptr;      // CreateFile handle (Win) / fd (Lin)
+
+    // v2.3.0: Int8 KV cache (internal, auto-allocated)
+    int8_t* k_cache = nullptr;
+    int8_t* v_cache = nullptr;
+    float* k_scale_cache = nullptr;
+    float* v_scale_cache = nullptr;
+    int cache_max_seq_len = 0;
+
+    // Ensure KV cache is allocated for at least max_seq_len
+    void ensure_cache(int max_seq_len) {
+        if (max_seq_len <= cache_max_seq_len) return;
+        size_t layer_sz = (size_t)n_kv_heads * max_seq_len * head_dim;
+        size_t scale_sz = (size_t)n_kv_heads * max_seq_len;
+        if (k_cache) atlas_vfree((uint8_t*)k_cache);
+        if (k_scale_cache) atlas_vfree((uint8_t*)k_scale_cache);
+        if (v_cache) atlas_vfree((uint8_t*)v_cache);
+        if (v_scale_cache) atlas_vfree((uint8_t*)v_scale_cache);
+        k_cache = (int8_t*)atlas_valloc(layer_sz * n_layers);
+        k_scale_cache = (float*)atlas_valloc(scale_sz * n_layers * sizeof(float));
+        v_cache = (int8_t*)atlas_valloc(layer_sz * n_layers);
+        v_scale_cache = (float*)atlas_valloc(scale_sz * n_layers * sizeof(float));
+        cache_max_seq_len = max_seq_len;
+    }
     size_t mmap_size = 0;           // actual file size for range checks
     // mmap atlas file handles (for fp16 tensor data — demand-paged by OS)
     void* atlas_mmap_base = nullptr;
@@ -651,6 +674,11 @@ ATLAS_API void atlas_free(AtlasModel* m) {
         close((int)(intptr_t)m->atlas_mmap_file);
 #endif
     }
+    // Free KV cache (v2.3.0: int8 internal)
+    if (m->k_cache) atlas_vfree((uint8_t*)m->k_cache);
+    if (m->k_scale_cache) atlas_vfree((uint8_t*)m->k_scale_cache);
+    if (m->v_cache) atlas_vfree((uint8_t*)m->v_cache);
+    if (m->v_scale_cache) atlas_vfree((uint8_t*)m->v_scale_cache);
     delete m;
 }
 
@@ -1428,16 +1456,20 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 }
 
 // ─── Fused attention: RoPE + GQA + softmax + weighted sum ────────────
+// v2.3.0: Int8 KV cache with per-position scaling (half memory bandwidth)
 // q: [B, n_heads * head_dim] float32 — RoPE applied in-place, modified
 // k: [B, n_kv_heads * head_dim] float32 — RoPE applied in-place, modified
 // v: [B, n_kv_heads * head_dim] float32
 // positions: [B] int32
-// k_cache: [n_kv_heads, max_seq, head_dim] uint16 (fp16) — updated + read
-// v_cache: [n_kv_heads, max_seq, head_dim] uint16 (fp16) — updated + read
+// k_cache: [n_kv_heads, max_seq, head_dim] int8 — quantized K cache
+// k_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for K
+// v_cache: [n_kv_heads, max_seq, head_dim] int8 — quantized V cache
+// v_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for V
 // output: [B, n_heads * head_dim] float32
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
-    const uint16_t* k_cache, const uint16_t* v_cache,
+    int8_t* k_cache, float* k_scale_cache,
+    int8_t* v_cache, float* v_scale_cache,
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
     float rope_theta, float* output) {
@@ -1487,43 +1519,56 @@ ATLAS_API void atlas_attention_f32(
             }
         }
 
-        // Store K, V into cache (fp32 -> fp16 on the fly)
+        // Store K, V into cache (fp32 -> int8 quantized, per-kv_head scaling)
         for (int h = 0; h < n_kv_heads; h++) {
+            float* k_row = kb + h * head_dim;
+            float* v_row = vb + h * head_dim;
+            float k_max = 1e-10f, v_max = 1e-10f;
             for (int d = 0; d < head_dim; d++) {
-                uint16_t* kc = (uint16_t*)k_cache + h * max_seq_len * head_dim + pos * head_dim + d;
-                uint16_t* vc = (uint16_t*)v_cache + h * max_seq_len * head_dim + pos * head_dim + d;
-                auto f32_to_f16 = [](float val) -> uint16_t {
-                    uint32_t b; memcpy(&b, &val, 4);
-                    uint16_t s = (b >> 16) & 0x8000;
-                    int exp_f32 = (b >> 23) & 0xFF;
-                    int exp_f16 = exp_f32 - 127 + 15;
-                    if (exp_f16 <= 0) return s;
-                    if (exp_f16 >= 31) return (uint16_t)(s | 0x7C00 | ((b >> 13) & 0x3FF));
-                    return (uint16_t)(s | ((uint16_t)exp_f16 << 10) | ((b >> 13) & 0x3FF));
-                };
-                *kc = f32_to_f16(kb[h * head_dim + d]);
-                *vc = f32_to_f16(vb[h * head_dim + d]);
+                float ka = fabsf(k_row[d]), va = fabsf(v_row[d]);
+                if (ka > k_max) k_max = ka;
+                if (va > v_max) v_max = va;
             }
+            float k_scale = k_max / 127.0f;
+            float v_scale = v_max / 127.0f;
+            float k_inv = 127.0f / k_max;
+            float v_inv = 127.0f / v_max;
+            int8_t* kc = k_cache + (size_t)h * max_seq_len * head_dim + (size_t)pos * head_dim;
+            int8_t* vc = v_cache + (size_t)h * max_seq_len * head_dim + (size_t)pos * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                int kq = (int)(k_row[d] * k_inv);
+                int vq = (int)(v_row[d] * v_inv);
+                if (kq < -128) kq = -128; if (kq > 127) kq = 127;
+                if (vq < -128) vq = -128; if (vq > 127) vq = 127;
+                kc[d] = (int8_t)kq;
+                vc[d] = (int8_t)vq;
+            }
+            k_scale_cache[(size_t)h * max_seq_len + pos] = k_scale;
+            v_scale_cache[(size_t)h * max_seq_len + pos] = v_scale;
         }
 
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             for (int s = 0; s < max_seq; s++) {
-                const uint16_t* k_row = ((uint16_t*)k_cache) + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
+                const int8_t* k_row = k_cache + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
+                float k_scale = k_scale_cache[(size_t)kh * max_seq_len + s];
                 const float* qh = qb + h * head_dim;
-                __m256 sum_v = _mm256_setzero_ps();
                 int d = 0;
+                __m256 sum_v = _mm256_setzero_ps();
                 for (; d + 8 <= head_dim; d += 8) {
-                    __m128i k8 = _mm_loadu_si128((const __m128i*)(k_row + d));
-                    __m256 k32 = _mm256_cvtph_ps(k8);
+                    // Load 8 int8 values, sign-extend to int16, then to int32, then to float
+                    __m128i k8 = _mm_loadl_epi64((const __m128i*)(k_row + d));
+                    __m256i k16 = _mm256_cvtepi8_epi16(k8);
+                    __m256i k32_i = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(k16));
+                    __m256 k32 = _mm256_cvtepi32_ps(k32_i);
                     __m256 qv8 = _mm256_loadu_ps(qh + d);
                     sum_v = _mm256_fmadd_ps(qv8, k32, sum_v);
                 }
                 float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
                           + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
                 for (; d < head_dim; d++)
-                    sum += qh[d] * fp16_to_fp32(k_row[d]);
-                scores[h * max_seq + s] = sum * inv_sqrt_d;
+                    sum += qh[d] * (float)k_row[d];
+                scores[h * max_seq + s] = sum * k_scale * inv_sqrt_d;
             }
         }
 
@@ -1546,29 +1591,30 @@ ATLAS_API void atlas_attention_f32(
             for (int s = 0; s < max_seq; s++) sh[s] *= inv_sum;
         }
 
-        // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
-        // Vectorized: process 8 d-values per s with F16C + FMA
+        // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d] * v_scale
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             float* sh = scores + h * max_seq;
             float* out_h = output + b * n_heads * head_dim + h * head_dim;
-            // Zero output
             for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
             for (int s = 0; s < max_seq; s++) {
-                const uint16_t* v_row = ((uint16_t*)v_cache)
+                const int8_t* v_row = v_cache
                     + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
+                float v_scale = v_scale_cache[(size_t)kh * max_seq_len + s];
                 float score = sh[s];
-                __m256 sv = _mm256_set1_ps(score);
+                __m256 sv = _mm256_set1_ps(score * v_scale);
                 int d = 0;
                 for (; d + 8 <= head_dim; d += 8) {
-                    __m128i v8 = _mm_loadu_si128((const __m128i*)(v_row + d));
-                    __m256 v32 = _mm256_cvtph_ps(v8);
+                    __m128i v8 = _mm_loadl_epi64((const __m128i*)(v_row + d));
+                    __m256i v16 = _mm256_cvtepi8_epi16(v8);
+                    __m256i v32_i = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(v16));
+                    __m256 v32 = _mm256_cvtepi32_ps(v32_i);
                     __m256 out_v = _mm256_loadu_ps(out_h + d);
                     out_v = _mm256_fmadd_ps(sv, v32, out_v);
                     _mm256_storeu_ps(out_h + d, out_v);
                 }
                 for (; d < head_dim; d++)
-                    out_h[d] += score * fp16_to_fp32(v_row[d]);
+                    out_h[d] += score * (float)v_row[d] * v_scale;
             }
         }
     }
@@ -1844,12 +1890,13 @@ static void matmul_reorder_deq(int rows, int input_dim,
 // ─── Internal: forward one transformer layer ──────────────────────────
 // input: [B, H] float32 (read-only, preserved for residual)
 // output: [B, H] float32 (must not alias input)
-// Per-layer K/V cache offset is computed from k_cache/v_cache + layer * n_kv * max_seq * hd
+// K/V cache is accessed from model struct (int8 + per-position scaling)
 static void forward_layer_internal(
     AtlasModel* m,
     const float* input, float* output, int B,
     const int* positions,
-    uint16_t* k_cache_layer, uint16_t* v_cache_layer,
+    int8_t* k_cache_layer, float* k_scale_layer,
+    int8_t* v_cache_layer, float* v_scale_layer,
     int max_seq_len, int seq_now,
     int idx_ln1, int idx_q, int idx_k, int idx_v, int idx_o,
     int idx_ln2, int idx_gate, int idx_up, int idx_down) {
@@ -2025,7 +2072,8 @@ static void forward_layer_internal(
         memcpy(v_f32 + b * kvd, m->buf_up + b * tv.row_dim, kvd * sizeof(float));
     }
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
-        k_cache_layer, v_cache_layer, max_seq_len, seq_now, B,
+        k_cache_layer, k_scale_layer, v_cache_layer, v_scale_layer,
+        max_seq_len, seq_now, B,
         nH, nKV, hd, theta, attn_out);
 
     // ─── 4. O projection (int8) ───
@@ -2444,16 +2492,16 @@ static void forward_layer_internal(
 // positions: [B] int32 position indices
 // layer_idx: [n_layers * 9] int32 — flat array of tensor indices per layer
 //           (ln1, q, k, v, o, ln2, gate, up, down) repeated for each layer
-// k_cache, v_cache: flat buffers [n_layers * n_kv_heads * max_seq * head_dim] uint16
+// K/V cache is internal to the model (int8 + per-position scales)
 ATLAS_API void atlas_forward(
     AtlasModel* m,
     float* hidden_states, int B,
     const int* positions,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int seq_now,
     const int* layer_idx, int n_layers) {
 
     m->ensure_buffers(B);
+    m->ensure_cache(max_seq_len);
     int H = m->hidden_dim;
     int nKV = m->n_kv_heads, hd = m->head_dim;
 
@@ -2463,10 +2511,12 @@ ATLAS_API void atlas_forward(
 
     for (int L = 0; L < n_layers; L++) {
         const int* idx = layer_idx + L * 9;
-        uint16_t* kc = k_cache + L * nKV * max_seq_len * hd;
-        uint16_t* vc = v_cache + L * nKV * max_seq_len * hd;
+        int8_t* kc = m->k_cache + (size_t)L * nKV * max_seq_len * hd;
+        float* ksc = m->k_scale_cache + (size_t)L * nKV * max_seq_len;
+        int8_t* vc = m->v_cache + (size_t)L * nKV * max_seq_len * hd;
+        float* vsc = m->v_scale_cache + (size_t)L * nKV * max_seq_len;
         forward_layer_internal(m, buf_a, buf_b, B, positions,
-            kc, vc, max_seq_len, seq_now,
+            kc, ksc, vc, vsc, max_seq_len, seq_now,
             idx[0], idx[1], idx[2], idx[3], idx[4],
             idx[5], idx[6], idx[7], idx[8]);
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
@@ -2661,7 +2711,6 @@ static void ensure_layer_idx(AtlasModel* m) {
 
 ATLAS_API int atlas_generate(AtlasModel* m,
     const int* input_ids, int n_input,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
@@ -2732,7 +2781,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     // Fused forward for all prompt tokens at once
     atlas_forward(m, embed_buf, n_input, positions,
-                  k_cache, v_cache, max_seq_len, n_input,
+                  max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
     // Final RMSNorm + LM head — only the last prompt token's logits are needed
@@ -2776,7 +2825,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         int seq_now = n_input + step;
         int pos = seq_now - 1;
         atlas_forward(m, h, 1, &pos,
-                      k_cache, v_cache, max_seq_len, seq_now,
+                      max_seq_len, seq_now,
                       layer_idx, m->n_layers);
 
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
@@ -2801,7 +2850,6 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 // ─── v2.3.0: Streaming generation (callback per token) ───────────────────
 ATLAS_API int atlas_generate_stream(AtlasModel* m,
     const int* input_ids, int n_input,
-    uint16_t* k_cache, uint16_t* v_cache,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
@@ -2862,7 +2910,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     for (int i = 0; i < n_input; i++) positions[i] = i;
 
     atlas_forward(m, embed_buf, n_input, positions,
-                  k_cache, v_cache, max_seq_len, n_input,
+                  max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
     {
@@ -2903,7 +2951,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         int seq_now = n_input + step;
         int pos = seq_now - 1;
         atlas_forward(m, h, 1, &pos,
-                      k_cache, v_cache, max_seq_len, seq_now,
+                      max_seq_len, seq_now,
                       layer_idx, m->n_layers);
 
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
