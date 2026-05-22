@@ -748,6 +748,7 @@ ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
 }
 
 // Run BPE merge loop on pre-encoded byte token IDs. Modifies ids in-place.
+// Uses priority queue for O(n log n) instead of O(n²) scan.
 // n_ids is updated to the final token count. Returns 0 on success, -1 on error.
 ATLAS_API int atlas_tokenizer_merge(AtlasModel* m,
     int* ids, int* n_ids) {
@@ -757,52 +758,85 @@ ATLAS_API int atlas_tokenizer_merge(AtlasModel* m,
     const int V = (int)m->tok.vocab_size;
     const int* merge_lookup = m->tok.merge_lookup;
     const uint32_t* merge_rank = m->tok.merge_rank;
-    int ht_size = 1;
-    while (ht_size < V * 2) ht_size <<= 1;
+    auto find_merge = [&](int left, int right) -> int {
+        if (left < 0 || left >= V || right < 0 || right >= V) return -1;
+        uint32_t h = ((uint32_t)left * 2654435761u) ^ ((uint32_t)right * 2246822519u);
+        int ht_size = 1;
+        while (ht_size < V * 2) ht_size <<= 1;
+        int idx = (int)(h & (ht_size - 1));
+        while (true) {
+            int mid = merge_lookup[idx];
+            if (mid < 0) break;
+            if ((int)m->tok.merge_left[mid] == left &&
+                (int)m->tok.merge_right[mid] == right)
+                return mid;
+            idx = (idx + 1) & (ht_size - 1);
+        }
+        return -1;
+    };
 
     int n = *n_ids;
-    while (n > 1) {
-        int best_pos = -1;
-        uint32_t best_rank = 0xFFFFFFFF;
-        int best_merged_id = -1;
+    if (n <= 1) return 0;
 
-        for (int i = 0; i < n - 1; i++) {
-            int left = ids[i];
-            int right = ids[i + 1];
-            if (left < 0 || left >= V) continue;
-            if (right < 0 || right >= V) continue;
+    // Min-heap of merge candidates: (rank, position, merged_id)
+    // Use std::vector + std::make_heap for cache-friendly flat heap
+    struct PQEntry {
+        uint32_t rank;
+        int pos;
+        int merged_id;
+    };
+    auto heap_cmp = [](const PQEntry& a, const PQEntry& b) {
+        return a.rank > b.rank;  // higher rank = lower priority (min-heap)
+    };
+    std::vector<PQEntry> heap;
+    heap.reserve((size_t)n * 2);
 
-            uint32_t h = ((uint32_t)left * 2654435761u) ^ ((uint32_t)right * 2246822519u);
-            int idx = (int)(h & (ht_size - 1));
-            int merged_id = -1;
-            while (true) {
-                int mid = merge_lookup[idx];
-                if (mid < 0) break;
-                if ((int)m->tok.merge_left[mid] == left &&
-                    (int)m->tok.merge_right[mid] == right) {
-                    merged_id = mid;
-                    break;
-                }
-                idx = (idx + 1) & (ht_size - 1);
-            }
-            if (merged_id < 0) continue;
-
-            uint32_t rank = merge_rank[merged_id];
-            if (rank > 0 && rank < best_rank) {
-                best_rank = rank;
-                best_pos = i;
-                best_merged_id = merged_id;
-            }
+    for (int i = 0; i < n - 1; i++) {
+        int mid = find_merge(ids[i], ids[i + 1]);
+        if (mid >= 0) {
+            uint32_t r = merge_rank[mid];
+            if (r > 0) heap.push_back({r, i, mid});
         }
+    }
+    std::make_heap(heap.begin(), heap.end(), heap_cmp);
 
-        if (best_pos < 0) break;
+    while (!heap.empty() && n > 1) {
+        std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+        auto [rank, pos, merged_id] = heap.back();
+        heap.pop_back();
 
-        ids[best_pos] = best_merged_id;
-        // Shift remaining IDs down
-        for (int j = best_pos + 1; j < n - 1; j++) {
+        // Validate: pair still valid?
+        if (pos < 0 || pos + 1 >= n) continue;
+        if (find_merge(ids[pos], ids[pos + 1]) != merged_id) continue;
+
+        // Merge
+        ids[pos] = merged_id;
+        // Shift down
+        for (int j = pos + 1; j < n - 1; j++)
             ids[j] = ids[j + 1];
-        }
         n--;
+
+        // Push new pairs adjacent to merge point
+        if (pos > 0) {
+            int mid = find_merge(ids[pos - 1], ids[pos]);
+            if (mid >= 0) {
+                uint32_t r = merge_rank[mid];
+                if (r > 0) {
+                    heap.push_back({r, pos - 1, mid});
+                    std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                }
+            }
+        }
+        if (pos < n - 1) {
+            int mid = find_merge(ids[pos], ids[pos + 1]);
+            if (mid >= 0) {
+                uint32_t r = merge_rank[mid];
+                if (r > 0) {
+                    heap.push_back({r, pos, mid});
+                    std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                }
+            }
+        }
     }
 
     *n_ids = n;
