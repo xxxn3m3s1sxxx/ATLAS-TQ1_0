@@ -167,6 +167,7 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
+    ctypes.c_float,
     ctypes.POINTER(ctypes.c_int)]
 
 # v2.1.0: Streaming callback type
@@ -176,6 +177,7 @@ dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
+    ctypes.c_float,
     TOKEN_CALLBACK, ctypes.c_void_p]
 dll.atlas_generate_stream.restype = ctypes.c_int
 
@@ -718,7 +720,7 @@ class AtlasModel:
         self._system_prompt = prompt
 
     def generate_c(self, prompt, max_new_tokens=50, temperature=0.7,
-                   top_k=40, top_p=0.9):
+                   top_k=40, top_p=0.9, repetition_penalty=1.0):
         """Generate via atlas_generate (single C call, v1.2.1)."""
         try:
             if self._use_cpp_tokenizer:
@@ -755,6 +757,7 @@ class AtlasModel:
             k_cache, v_cache,
             self.max_seq_len, max_new_tokens,
             float(temperature), int(top_k), float(top_p),
+            float(repetition_penalty),
             out_arr)
 
         if n_gen < 0:
@@ -773,7 +776,7 @@ class AtlasModel:
         return decoded
 
     def generate_stream(self, prompt, max_new_tokens=200, temperature=0.7,
-                        top_k=40, top_p=0.9):
+                        top_k=40, top_p=0.9, repetition_penalty=1.0):
         """Streaming generator — yields token IDs as they are produced.
 
         Usage:
@@ -821,7 +824,9 @@ class AtlasModel:
         t = threading.Thread(target=dll.atlas_generate_stream,
             args=(self.model_ptr, in_arr, n_input, k_cache, v_cache,
                   self.max_seq_len, max_new_tokens,
-                  temperature, top_k, top_p, cb, None))
+                  temperature, top_k, top_p,
+                  float(repetition_penalty),
+                  cb, None))
         t.start()
 
         n_gen = 0
