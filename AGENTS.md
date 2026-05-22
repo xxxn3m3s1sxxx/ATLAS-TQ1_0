@@ -96,6 +96,7 @@ See `atlas_ffi.h` for full API.
 | v2.1.0 | Streaming `atlas_generate_stream` callback C API, Python `generate_stream` generator, `set_system_prompt`, chat history via `list[dict]` messages |
 | v2.1.1 | Repetition penalty in C-core (before top-k), exposed in Python generate_c/generate_stream |
 | v2.2.0 | TQ1-LUT in decompression (replace %3//3 with lookup), F16C (_mm256_cvtph_ps) for fp16→fp32 in RMSNorm + scalar, ~30% throughput gain on 3B/10B |
+| v2.2.1 | BPE-PQ priority queue in tokenizer merge (O(n²)→O(n log n)), 1401 tokens in 24ms |
 | v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
 | v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
 | v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |

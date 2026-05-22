@@ -1509,13 +1509,20 @@ ATLAS_API void atlas_attention_f32(
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             for (int s = 0; s < max_seq; s++) {
-                float sum = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    float qv = qb[h * head_dim + d];
-                    uint16_t kv_raw = ((uint16_t*)k_cache)[kh * max_seq_len * head_dim + s * head_dim + d];
-                    float kv = fp16_to_fp32(kv_raw);
-                    sum += qv * kv;
+                const uint16_t* k_row = ((uint16_t*)k_cache) + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
+                const float* qh = qb + h * head_dim;
+                __m256 sum_v = _mm256_setzero_ps();
+                int d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    __m128i k8 = _mm_loadu_si128((const __m128i*)(k_row + d));
+                    __m256 k32 = _mm256_cvtph_ps(k8);
+                    __m256 qv8 = _mm256_loadu_ps(qh + d);
+                    sum_v = _mm256_fmadd_ps(qv8, k32, sum_v);
                 }
+                float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
+                          + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
+                for (; d < head_dim; d++)
+                    sum += qh[d] * fp16_to_fp32(k_row[d]);
                 scores[h * max_seq + s] = sum * inv_sqrt_d;
             }
         }
@@ -1540,17 +1547,28 @@ ATLAS_API void atlas_attention_f32(
         }
 
         // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
+        // Vectorized: process 8 d-values per s with F16C + FMA
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             float* sh = scores + h * max_seq;
-            for (int d = 0; d < head_dim; d++) {
-                float sum = 0.0f;
-                for (int s = 0; s < max_seq; s++) {
-                    uint16_t vv_raw = ((uint16_t*)v_cache)[kh * max_seq_len * head_dim + s * head_dim + d];
-                    float vv = fp16_to_fp32(vv_raw);
-                    sum += sh[s] * vv;
+            float* out_h = output + b * n_heads * head_dim + h * head_dim;
+            // Zero output
+            for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+            for (int s = 0; s < max_seq; s++) {
+                const uint16_t* v_row = ((uint16_t*)v_cache)
+                    + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
+                float score = sh[s];
+                __m256 sv = _mm256_set1_ps(score);
+                int d = 0;
+                for (; d + 8 <= head_dim; d += 8) {
+                    __m128i v8 = _mm_loadu_si128((const __m128i*)(v_row + d));
+                    __m256 v32 = _mm256_cvtph_ps(v8);
+                    __m256 out_v = _mm256_loadu_ps(out_h + d);
+                    out_v = _mm256_fmadd_ps(sv, v32, out_v);
+                    _mm256_storeu_ps(out_h + d, out_v);
                 }
-                output[b * n_heads * head_dim + h * head_dim + d] = sum;
+                for (; d < head_dim; d++)
+                    out_h[d] += score * fp16_to_fp32(v_row[d]);
             }
         }
     }
