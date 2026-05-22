@@ -251,11 +251,11 @@ extern "C" {
 typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
 static inline float fp16_to_fp32(uint16_t h) {
-    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
-    uint32_t f32 = (e == 0) ? ((s << 31) | (0 << 23) | (m << 13))
-                : (e == 31) ? ((s << 31) | (0xFF << 23) | (m << 13))
-                : ((s << 31) | ((e + 112) << 23) | (m << 13));
-    float r; memcpy(&r, &f32, 4); return r;
+    float r;
+    __m128i h4 = _mm_cvtsi32_si128((int)(unsigned)h);  // zero-extend to 32-bit
+    __m128 f4 = _mm_cvtph_ps(h4);                       // F16C: fp16→fp32
+    _mm_store_ss(&r, f4);
+    return r;
 }
 
 // ─── Tensor info ────────────────────────────────────────────────────────
@@ -392,7 +392,23 @@ struct AtlasModel {
     }
 };
 
-static void init_tq1_decode_lut();
+// ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
+// Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
+static std::once_flag tq1_decode_init_flag;
+alignas(32) static int8_t tq1_decode[256][5];
+
+static void init_tq1_decode_lut() {
+    std::call_once(tq1_decode_init_flag, [&]() {
+    for (int b = 0; b < 256; b++) {
+        int t = b;
+        tq1_decode[b][0] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][1] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][2] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][3] = (int8_t)((t % 3) - 1); t /= 3;
+        tq1_decode[b][4] = (int8_t)((t % 3) - 1);
+    }
+    }); // std::call_once
+}
 
 // ─── Load model ─────────────────────────────────────────────────────────
 ATLAS_API AtlasModel* atlas_load(const char* path) {
@@ -1121,6 +1137,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
 
+        init_tq1_decode_lut();
         int8_t* i8 = (int8_t*)(new_data + 2);
         int32_t* rs = (int32_t*)(i8 + n_vals);
         const uint8_t* packed = t.data + 2;
@@ -1129,12 +1146,12 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
             int sum = 0;
             int pos = 0;
             for (int c = 0; c < t.packed_cols; c++) {
-                uint8_t b = packed[r * t.packed_cols + c];
-                int v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1;        i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                i8[r * input_dim + pos++] = l[0]; sum += l[0];
+                i8[r * input_dim + pos++] = l[1]; sum += l[1];
+                i8[r * input_dim + pos++] = l[2]; sum += l[2];
+                i8[r * input_dim + pos++] = l[3]; sum += l[3];
+                i8[r * input_dim + pos++] = l[4]; sum += l[4];
             }
             rs[r] = sum;
         }
@@ -1170,6 +1187,7 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
 
+        init_tq1_decode_lut();
         int8_t* i8 = (int8_t*)(new_data + 2);
         int32_t* rs = (int32_t*)(i8 + n_vals);
         const uint8_t* packed = t.data + 2;
@@ -1178,12 +1196,12 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
             int sum = 0;
             int pos = 0;
             for (int c = 0; c < t.packed_cols; c++) {
-                uint8_t b = packed[r * t.packed_cols + c];
-                int v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1; b /= 3; i8[r * input_dim + pos++] = (int8_t)v; sum += v;
-                v = (b % 3) - 1;        i8[r * input_dim + pos++] = (int8_t)v; sum += v;
+                const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                i8[r * input_dim + pos++] = l[0]; sum += l[0];
+                i8[r * input_dim + pos++] = l[1]; sum += l[1];
+                i8[r * input_dim + pos++] = l[2]; sum += l[2];
+                i8[r * input_dim + pos++] = l[3]; sum += l[3];
+                i8[r * input_dim + pos++] = l[4]; sum += l[4];
             }
             rs[r] = sum;
         }
@@ -1321,10 +1339,24 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
 ATLAS_API void atlas_rmsnorm_f32(const float* x, const uint8_t* weight_f16,
                                   float* output, int n, float eps) {
     float ss = 0.0f;
-    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 x2 = _mm256_mul_ps(xv, xv);
+        ss += x2[0] + x2[1] + x2[2] + x2[3] + x2[4] + x2[5] + x2[6] + x2[7];
+    }
+    for (; i < n; i++) ss += x[i] * x[i];
     float rms = 1.0f / sqrtf(ss / n + eps);
 
-    for (int i = 0; i < n; i++) {
+    __m256 rv = _mm256_set1_ps(rms);
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m128i w8 = _mm_loadu_si128((const __m128i*)(weight_f16 + i * 2));
+        __m256 w32 = _mm256_cvtph_ps(w8);
+        __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 r = _mm256_mul_ps(_mm256_mul_ps(xv, rv), w32);
+        _mm256_storeu_ps(output + i, r);
+    }
+    for (; i < n; i++) {
         uint16_t w;
         memcpy(&w, weight_f16 + i * 2, 2);
         output[i] = x[i] * rms * fp16_to_fp32(w);
@@ -1608,24 +1640,6 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
             dst[3 * rows_packed + ur] = out4[3];
         }
     }
-}
-
-// ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
-// Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
-static std::once_flag tq1_decode_init_flag;
-alignas(32) static int8_t tq1_decode[256][5];
-
-static void init_tq1_decode_lut() {
-    std::call_once(tq1_decode_init_flag, [&]() {
-    for (int b = 0; b < 256; b++) {
-        int t = b;
-        tq1_decode[b][0] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][1] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][2] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][3] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][4] = (int8_t)((t % 3) - 1);
-    }
-    }); // std::call_once
 }
 
 // ─── Fused TQ1 decode + int32 dot product for packed weights ──────────

@@ -170,7 +170,7 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.c_float,
     ctypes.POINTER(ctypes.c_int)]
 
-# v2.1.0: Streaming callback type
+# v2.1.0: Streaming callback type + repetition_penalty
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
 dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_int), ctypes.c_int,
