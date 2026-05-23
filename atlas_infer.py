@@ -293,6 +293,7 @@ class AtlasModel:
         self._use_cpp_tokenizer = False
         self._eos_id = 0
         self._chat_template = None
+        self._is_qwen3 = (self.head_dim <= 128 or self.vocab_size > 131072)
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
         tok_size = ctypes.c_int()
@@ -311,6 +312,17 @@ class AtlasModel:
                     eos_cfg = cfg.get('eos_token')
                     if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
                         self._eos_id = eos_cfg['id']
+            except Exception:
+                pass
+
+        # Fallback: read EOS/PAD from file header bytes 45-52
+        if self._eos_id == 0:
+            try:
+                with open(self._atlas_path, 'rb') as f:
+                    f.seek(45)
+                    hdr = f.read(8)
+                    if len(hdr) == 8:
+                        self._eos_id = struct.unpack('<I', hdr[:4])[0]
             except Exception:
                 pass
 
@@ -740,26 +752,13 @@ class AtlasModel:
                    top_k=40, top_p=0.9, repetition_penalty=1.0):
         """Generate via atlas_generate (single C call, v1.2.1)."""
         try:
-            if self._use_cpp_tokenizer:
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                sysp = getattr(self, '_system_prompt', None)
-                if sysp and not any(m.get('role') == 'system' for m in prompt):
-                    prompt = [{"role": "system", "content": sysp}] + prompt
-                text = self._apply_chat_template(prompt)
-                input_ids = self._cpp_encode(text)
-            elif self._tok is not None:
-                from transformers import PreTrainedTokenizerFast
-                tok = PreTrainedTokenizerFast(
-                    tokenizer_object=self._tok,
-                    chat_template=self._chat_template)
-                tok.add_special_tokens({"pad_token": "<|pad|>"})
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-                input_ids = tok.encode(text)
-            else:
-                return "[TOKENIZER ERROR: No tokenizer available]"
+            if isinstance(prompt, str):
+                prompt = [{"role": "user", "content": prompt}]
+            sysp = getattr(self, '_system_prompt', None)
+            if sysp and not any(m.get('role') == 'system' for m in prompt):
+                prompt = [{"role": "system", "content": sysp}] + prompt
+            text = self._apply_chat_template(prompt)
+            input_ids = self._cpp_encode(text)
         except Exception as e:
             return f"[TOKENIZER ERROR: {e}]"
 
@@ -778,11 +777,8 @@ class AtlasModel:
             return "[ATLAS: atlas_generate failed]"
 
         output = list(out_arr[:n_gen])
-        if self._use_cpp_tokenizer:
-            decoded = self._cpp_decode(output)
-        else:
-            decoded = tok.decode(output, skip_special_tokens=True)
-        stops = ['<|user|>', '<|system|>', '<|end|>']
+        decoded = self._cpp_decode(output)
+        stops = ['<|user|>', '<|system|>', '<|end|>', '<|im_end|>']
         for stop in stops:
             idx = decoded.find(stop)
             if idx >= 0:
@@ -801,26 +797,13 @@ class AtlasModel:
         Yields int token IDs. Caller is responsible for decoding.
         """
         try:
-            if self._use_cpp_tokenizer:
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                sysp = getattr(self, '_system_prompt', None)
-                if sysp and not any(m.get('role') == 'system' for m in prompt):
-                    prompt = [{"role": "system", "content": sysp}] + prompt
-                text = self._apply_chat_template(prompt)
-                input_ids = self._cpp_encode(text)
-            elif self._tok is not None:
-                from transformers import PreTrainedTokenizerFast
-                tok = PreTrainedTokenizerFast(
-                    tokenizer_object=self._tok,
-                    chat_template=self._chat_template)
-                tok.add_special_tokens({"pad_token": "<|pad|>"})
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-                input_ids = tok.encode(text)
-            else:
-                return
+            if isinstance(prompt, str):
+                prompt = [{"role": "user", "content": prompt}]
+            sysp = getattr(self, '_system_prompt', None)
+            if sysp and not any(m.get('role') == 'system' for m in prompt):
+                prompt = [{"role": "system", "content": sysp}] + prompt
+            text = self._apply_chat_template(prompt)
+            input_ids = self._cpp_encode(text)
         except Exception as e:
             return
 
@@ -873,12 +856,11 @@ class AtlasModel:
         return self._tok.encode(text).ids
 
     def _cpp_decode(self, ids, skip_special=True):
-        """Decode token IDs via C++ v6 binary tokenizer. Returns string.
-
-        Applies GPT-2 ByteLevel post-processing: converts Ġ→space, Ċ→newline, etc.
-        """
+        """Decode token IDs. Uses C++ v6 binary tokenizer; falls back to Python for v5."""
         if not ids:
             return ""
+        if not self._use_cpp_tokenizer and self._tok is not None:
+            return self._tok.decode(ids, skip_special_tokens=skip_special)
         n = len(ids)
         ids_arr = (ctypes.c_int * n)(*ids)
         max_out = n * 16 + 64
@@ -915,10 +897,23 @@ class AtlasModel:
         return text
 
     def _apply_chat_template(self, messages, add_generation_prompt=True):
-        """Falcon3 chat template (no Jinja2/transformers dependency).
-        
-        Matches the HF Jinja2 template for the no-tools case:
-        <|role|>\ncontent\neos_token\n"""
+        """Chat template (no Jinja2/transformers dependency).
+
+        Matches model-specific format:
+        - Falcon3: <|role|>\ncontent\n
+        - Qwen3:   <|im_start|>role\ncontent<|im_end|>\n
+        """
+        if self._is_qwen3:
+            eos = '<|im_end|>'
+            result = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg.get('content', '')
+                result += f"<|im_start|>{role}\n{content}{eos}\n"
+            if add_generation_prompt:
+                result += '<|im_start|>assistant\n'
+            return result
+
         eos = '<|endoftext|>'
         result = ""
         n = len(messages)
