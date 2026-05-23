@@ -114,7 +114,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
-| **v2.4.0** | **Qwen3/Bonsai**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab, Packer |
+| **v2.4.0** | **Qwen3/Bonsai-4B**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab (151669), EOS/PAD aus Header, Bonsai-4B Packer (`atlas_packer_qwen.py`). C++: `rope_scale`/`layer_stride`-Setters, `ensure_layer_idx` mit stride-11-Detektion, QK-Norm in `atlas_attention_f32`, NTK-YaRN in RoPE-Schleife. ✅ Falcon3-1B Regression, ✅ Bonsai-4B 100 Tokens (kein Crash). |
 | **v2.3.1** | **Windows MSVCRT File-Buffer Hotfix**: `out.flush()` vor `out.seek(64)` im `atlas_packer.py` hinzugefügt. Verhindert Directory-Korruption bei Modellen >2 GB (7B v6). 7B v6 lädt nun fehlerfrei und generiert korrekt. |
 | **v2.3.0** | **Int8 KV-Cache Quantisierung**: FP16→int8 mit dynamischer Skalierung pro (KV-Head, Position). Cache aus API-Signaturen entfernt, vollständig intern im `AtlasModel`-Struct via `ensure_cache()`. SIMD-In-Flight-Dequantisierung im Attention-Hotpath. 10B@4K: 320 MB → 173 MB RAM. Python-Schnittstelle bereinigt (kein manuelles Cache-Array-Management mehr). |
 | v2.2.2 | F16C in attention score + weighted sum (batch _mm256_cvtph_ps + FMA), 10B +47%, 3B +5.7% |

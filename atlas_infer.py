@@ -54,7 +54,7 @@ dll.atlas_prefetch_int8.restype = None
 dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 
 dll.atlas_quantize_lmhead.restype = None
-dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int]
+dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 
 dll.atlas_set_use_f32_matmul.restype = None
 dll.atlas_set_use_f32_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -67,6 +67,12 @@ dll.atlas_set_use_packed_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_use_hybrid_matmul.restype = None
 dll.atlas_set_use_hybrid_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_rope_scale.restype = None
+dll.atlas_set_rope_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
+
+dll.atlas_set_layer_stride.restype = None
+dll.atlas_set_layer_stride.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_num_threads.restype = None
 dll.atlas_set_num_threads.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -150,7 +156,10 @@ dll.atlas_attention_f32.argtypes = [
     ctypes.c_int,     # n_kv_heads
     ctypes.c_int,     # head_dim
     ctypes.c_float,   # rope_theta
+    ctypes.c_float,   # rope_scale
     ctypes.POINTER(ctypes.c_float),   # output
+    ctypes.c_void_p,  # q_norm_w (NULL = skip)
+    ctypes.c_void_p,  # k_norm_w (NULL = skip)
 ]
 
 dll.atlas_set_seed.restype = None
@@ -226,6 +235,11 @@ class AtlasModel:
         # Cache tensor indices for fast lookup
         self._cache_indices()
 
+        # v2.4.0: Detect Qwen3 (Bonsai) models by rope_theta — YaRN NTK scaling
+        if self.rope_theta >= 3000000.0:
+            self.set_rope_scale(4.0)
+            print(f"[Atlas] Qwen3 detected: YaRN RoPE scale=4.0 (theta={self.rope_theta:.0f})")
+
         if use_packed_matmul:
             # v1.3.1: Direct TQ1-packed matmul — keep raw TQ1 data, skip cache/decomp
             dll.atlas_set_use_packed_matmul(self.model_ptr, 1)
@@ -262,12 +276,16 @@ class AtlasModel:
         self.max_seq_len = 4096
 
         # Quantize lm_head to per-row int8 in C++ (saves ~1.1 GB vs full fp32)
-        # Frees the fp16 data from C++ memory (~768 MB).
+        # For tie embeddings (Qwen3/Bonsai), lm_head = embed_tokens
         print("[Atlas] Quantizing lm_head to int8...")
         t0 = time.time()
         idx_lm_head = self.idx.get("lm_head.weight", -1)
         if idx_lm_head >= 0:
-            dll.atlas_quantize_lmhead(self.model_ptr, idx_lm_head)
+            dll.atlas_quantize_lmhead(self.model_ptr, idx_lm_head, 0)
+        else:
+            idx_embed = self.idx.get("model.embed_tokens.weight", -1)
+            if idx_embed >= 0:
+                dll.atlas_quantize_lmhead(self.model_ptr, idx_embed, 1)  # keep embed data
         print(f"[Atlas] lm_head quantized ({time.time()-t0:.1f}s)")
 
         # Load tokenizer — prefer v6 binary (C++), fallback to v5 JSON (Python)
@@ -330,6 +348,10 @@ class AtlasModel:
         """v1.3.2: Enable/disable f32 bypass (no activation quantization)."""
         dll.atlas_set_use_f32_matmul(self.model_ptr, 1 if enable else 0)
 
+    def set_rope_scale(self, scale=1.0):
+        """v2.4.0: Set YaRN NTK RoPE scaling factor (4.0 for Bonsai-4B)."""
+        dll.atlas_set_rope_scale(self.model_ptr, ctypes.c_float(scale))
+
     def set_use_ternary_matmul(self, enable=True):
         """v1.3.0: Enable/disable ternary-add kernel (vpsignb, no multiplication)."""
         dll.atlas_set_use_ternary_matmul(self.model_ptr, 1 if enable else 0)
@@ -356,13 +378,21 @@ class AtlasModel:
         self._tq1_cache = {}
         self._f16_cache = {}
         self._i8_cache = {}
+        # Detect QK-Norm (Qwen3): if layer 0 has q_norm, stride = 11
+        has_qk_norm = "model.layers.0.self_attn.q_norm.weight" in self.idx
+        stride = 11 if has_qk_norm else 9
+        dll.atlas_set_layer_stride(self.model_ptr, stride)
         # Build flat index array for atlas_forward (fused C++ layer loop)
         idx = self.idx
         per_layer = ['input_layernorm.weight',
             'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
             'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
             'post_attention_layernorm.weight',
-            'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight']
+            'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
+            'self_attn.q_norm.weight', 'self_attn.k_norm.weight']
+        if not has_qk_norm:
+            # Falcon3: remove q_norm/k_norm from per_layer
+            per_layer = [n for n in per_layer if 'q_norm' not in n and 'k_norm' not in n]
         arrs = []
         for L in range(self.n_layers):
             for n in per_layer:

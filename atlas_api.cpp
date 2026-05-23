@@ -277,6 +277,10 @@ struct AtlasModel {
     int head_dim;
     int vocab_size;
     float rope_theta;
+    float rope_scale = 1.0f; // YaRN NTK scaling (1.0 = off, 4.0 = Bonsai)
+    int layer_stride = 9;    // tensors per layer (9 Falcon3, 11 Qwen3 with QK-Norm)
+    int eos_id = 11;   // default Falcon3 endoftext
+    int pad_id = 0;    // default padding token
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
     bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4× less memory)
@@ -464,6 +468,12 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     // v6 binary tokenizer header fields
     memcpy(&tmp32, hdr+37, 4); m->tokenizer_binary_size = (int)tmp32;
     uint32_t bin_off_u32; memcpy(&bin_off_u32, hdr+41, 4); m->tokenizer_binary_offset = bin_off_u32;
+
+    // EOS/PAD IDs from header (bytes 45-52), fallback to defaults
+    uint32_t eos_val; memcpy(&eos_val, hdr+45, 4);
+    uint32_t pad_val; memcpy(&pad_val, hdr+49, 4);
+    if (eos_val != 0 || hdr[45]|hdr[46]|hdr[47]|hdr[48]) m->eos_id = (int)eos_val;
+    if (pad_val != 0 || hdr[49]|hdr[50]|hdr[51]|hdr[52]) m->pad_id = (int)pad_val;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,
@@ -1393,6 +1403,7 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
             output[t * rows + r] = (float)result;
         }
     }
+
 }
 
 // ─── Norm: float16 tensor → RMSNorm ────────────────────────────────────
@@ -1466,16 +1477,23 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 // v_cache: [n_kv_heads, max_seq, head_dim] int8 — quantized V cache
 // v_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for V
 // output: [B, n_heads * head_dim] float32
+// q_norm_w, k_norm_w: [head_dim] uint8 fp16 RMSNorm weights (QK-Norm, Qwen3), NULL = skip
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
     int8_t* k_cache, float* k_scale_cache,
     int8_t* v_cache, float* v_scale_cache,
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
-    float rope_theta, float* output) {
+    float rope_theta, float rope_scale, float* output,
+    const uint8_t* q_norm_w, const uint8_t* k_norm_w) {
 
     int n_rep = n_heads / n_kv_heads;
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+    // YaRN NTK-aware effective theta (rope_scale=4.0 for Bonsai-4B)
+    float eff_theta = rope_theta;
+    if (rope_scale > 1.001f) {
+        eff_theta *= powf(rope_scale, (float)head_dim / (float)(head_dim - 2));
+    }
 
     // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
     int max_seq = seq_now > max_seq_len ? max_seq_len : seq_now;
@@ -1496,11 +1514,11 @@ ATLAS_API void atlas_attention_f32(
         float* kb = k + b * n_kv_heads * head_dim;
         float* vb = v + b * n_kv_heads * head_dim;
 
-        // RoPE on Q
+        // RoPE on Q (YaRN NTK-aware: use eff_theta instead of raw rope_theta)
         for (int h = 0; h < n_heads; h++) {
             float* qh = qb + h * head_dim;
             for (int i = 0; i < head_dim / 2; i++) {
-                float freq = 1.0f / powf(rope_theta, 2.0f * i / head_dim);
+                float freq = 1.0f / powf(eff_theta, 2.0f * i / head_dim);
                 float c = cosf(pos * freq), s = sinf(pos * freq);
                 float a = qh[2*i], b0 = qh[2*i+1];
                 qh[2*i]   = a * c - b0 * s;
@@ -1511,11 +1529,37 @@ ATLAS_API void atlas_attention_f32(
         for (int h = 0; h < n_kv_heads; h++) {
             float* kh = kb + h * head_dim;
             for (int i = 0; i < head_dim / 2; i++) {
-                float freq = 1.0f / powf(rope_theta, 2.0f * i / head_dim);
+                float freq = 1.0f / powf(eff_theta, 2.0f * i / head_dim);
                 float c = cosf(pos * freq), s = sinf(pos * freq);
                 float a = kh[2*i], b0 = kh[2*i+1];
                 kh[2*i]   = a * c - b0 * s;
                 kh[2*i+1] = a * s + b0 * c;
+            }
+        }
+
+        // QK-Norm (Qwen3: RMSNorm on Q/K after RoPE, before cache + score)
+        if (q_norm_w) {
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = qb + h * head_dim;
+                float ss = 0.0f;
+                for (int d = 0; d < head_dim; d++) ss += qh[d] * qh[d];
+                float rms = 1.0f / sqrtf(ss / head_dim + 1e-6f);
+                for (int d = 0; d < head_dim; d++) {
+                    uint16_t w16; memcpy(&w16, q_norm_w + d * 2, 2);
+                    qh[d] *= rms * fp16_to_fp32(w16);
+                }
+            }
+        }
+        if (k_norm_w) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = kb + h * head_dim;
+                float ss = 0.0f;
+                for (int d = 0; d < head_dim; d++) ss += kh[d] * kh[d];
+                float rms = 1.0f / sqrtf(ss / head_dim + 1e-6f);
+                for (int d = 0; d < head_dim; d++) {
+                    uint16_t w16; memcpy(&w16, k_norm_w + d * 2, 2);
+                    kh[d] *= rms * fp16_to_fp32(w16);
+                }
             }
         }
 
@@ -1672,6 +1716,16 @@ ATLAS_API void atlas_set_num_threads(AtlasModel* m, int n) {
     #ifdef _OPENMP
     omp_set_num_threads(n > 0 ? n : omp_get_max_threads());
     #endif
+}
+
+// ─── v2.4.0: Set YaRN NTK RoPE scaling factor ────────────────────────
+ATLAS_API void atlas_set_rope_scale(AtlasModel* m, float scale) {
+    if (m) m->rope_scale = scale;
+}
+
+// ─── v2.4.0: Set layer stride (9 Falcon3, 11 Qwen3 with QK-Norm) ────
+ATLAS_API void atlas_set_layer_stride(AtlasModel* m, int stride) {
+    if (m) m->layer_stride = stride;
 }
 
 // ─── Helper: horizontal sum of __m256 float ──────────────────────────
@@ -1899,7 +1953,8 @@ static void forward_layer_internal(
     int8_t* v_cache_layer, float* v_scale_layer,
     int max_seq_len, int seq_now,
     int idx_ln1, int idx_q, int idx_k, int idx_v, int idx_o,
-    int idx_ln2, int idx_gate, int idx_up, int idx_down) {
+    int idx_ln2, int idx_gate, int idx_up, int idx_down,
+    int idx_q_norm = -1, int idx_k_norm = -1) {
 
     int H = m->hidden_dim;
     int nH = m->n_heads, nKV = m->n_kv_heads, hd = m->head_dim;
@@ -2060,6 +2115,7 @@ static void forward_layer_internal(
         }
     }
 
+
     // ─── 3. Fused attention (reuse atlas_attention_f32) ───
     int ws = B * nH * hd;
     float* attn_out = m->attn_ws;
@@ -2071,10 +2127,12 @@ static void forward_layer_internal(
         memcpy(k_f32 + b * kvd, m->buf_hidden + b * tk.row_dim, kvd * sizeof(float));
         memcpy(v_f32 + b * kvd, m->buf_up + b * tv.row_dim, kvd * sizeof(float));
     }
+    const uint8_t* qn_w = (idx_q_norm >= 0) ? m->tensors[idx_q_norm].data : nullptr;
+    const uint8_t* kn_w = (idx_k_norm >= 0) ? m->tensors[idx_k_norm].data : nullptr;
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
         k_cache_layer, k_scale_layer, v_cache_layer, v_scale_layer,
         max_seq_len, seq_now, B,
-        nH, nKV, hd, theta, attn_out);
+        nH, nKV, hd, theta, m->rope_scale, attn_out, qn_w, kn_w);
 
     // ─── 4. O projection (int8) ───
     {
@@ -2510,15 +2568,18 @@ ATLAS_API void atlas_forward(
     float* buf_b = m->buf_out;
 
     for (int L = 0; L < n_layers; L++) {
-        const int* idx = layer_idx + L * 9;
+        const int* idx = layer_idx + L * m->layer_stride;
         int8_t* kc = m->k_cache + (size_t)L * nKV * max_seq_len * hd;
         float* ksc = m->k_scale_cache + (size_t)L * nKV * max_seq_len;
         int8_t* vc = m->v_cache + (size_t)L * nKV * max_seq_len * hd;
         float* vsc = m->v_scale_cache + (size_t)L * nKV * max_seq_len;
+        int qn_i = (m->layer_stride >= 11) ? idx[9] : -1;
+        int kn_i = (m->layer_stride >= 11) ? idx[10] : -1;
         forward_layer_internal(m, buf_a, buf_b, B, positions,
             kc, ksc, vc, vsc, max_seq_len, seq_now,
             idx[0], idx[1], idx[2], idx[3], idx[4],
-            idx[5], idx[6], idx[7], idx[8]);
+            idx[5], idx[6], idx[7], idx[8],
+            qn_i, kn_i);
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
     }
 
@@ -2533,10 +2594,10 @@ ATLAS_API void atlas_forward(
 // Reads the fp16 tensor at idx, quantizes each row to int8, stores in
 // AtlasModel fields. Frees the fp16 data (saves 768 MB).
 // Call after Python has created its fp32 copy (never before step 4 above).
-ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx) {
+ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx, int keep_data) {
     if (!m || idx < 0 || idx >= (int)m->tensors.size()) return;
     auto& t = m->tensors[idx];
-    if (t.ttype != 2 || t.data == nullptr) return;
+    if ((t.ttype != 2 && t.ttype != 1) || t.data == nullptr) return;
 
     int V = t.row_dim;
     int H = m->hidden_dim;
@@ -2569,9 +2630,11 @@ ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx) {
         offs[r] = 128 * row_sum;
     }
 
-    if (!m->is_mapped(t.data)) atlas_vfree(t.data);
-    t.data = nullptr;
-    t.data_size = 0;
+    if (!keep_data) {
+        if (!m->is_mapped(t.data)) atlas_vfree(t.data);
+        t.data = nullptr;
+        t.data_size = 0;
+    }
 
     m->lm_head_i8 = i8;
     m->lm_head_offsets = offs;
@@ -2688,8 +2751,14 @@ static void ensure_layer_idx(AtlasModel* m) {
             if (names[i] == n) return i;
         return -1;
     };
+    // Detect QK-Norm (Qwen3): stride = 11 if q_norm exists
+    int stride = 9;
+    char test_name[128];
+    snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.q_norm.weight");
+    if (find(test_name) >= 0) stride = 11;
+    m->layer_stride = stride;
     m->layer_idx_cache.clear();
-    m->layer_idx_cache.reserve(m->n_layers * 9);
+    m->layer_idx_cache.reserve(m->n_layers * stride);
     for (int L = 0; L < m->n_layers; L++) {
         char buf[128];
         auto push = [&](const char* suffix) {
@@ -2705,6 +2774,10 @@ static void ensure_layer_idx(AtlasModel* m) {
         push("mlp.gate_proj.weight");
         push("mlp.up_proj.weight");
         push("mlp.down_proj.weight");
+        if (stride >= 11) {
+            push("self_attn.q_norm.weight");
+            push("self_attn.k_norm.weight");
+        }
     }
     m->has_layer_idx = true;
 }
@@ -2797,7 +2870,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     context[n_input] = next_token;
     output_ids[n_gen++] = next_token;
 
-    const int eos_id = 11;  // Falcon3: <|endoftext|>
+    const int eos_id = m->eos_id;
     if (next_token == eos_id) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
@@ -2925,7 +2998,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     callback(next_token, user_data);
     n_gen++;
 
-    const int eos_id = 11;
+    const int eos_id = m->eos_id;
     if (next_token == eos_id) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);

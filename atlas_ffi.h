@@ -174,6 +174,13 @@ ATLAS_API void atlas_set_num_threads(void* model, int n);
 // Best speed/RAM balance: ~90% of full int8 speed, ~8 GB RAM.
 ATLAS_API void atlas_set_use_hybrid_matmul(void* model, int val);
 
+// v2.4.0: Set YaRN NTK RoPE scaling factor (1.0 = off, 4.0 = Bonsai-4B).
+ATLAS_API void atlas_set_rope_scale(void* model, float scale);
+
+// v2.4.0: Set layer stride — tensors per transformer layer.
+// 9 for Falcon3, 11 for Qwen3 (adds q_norm + k_norm).
+ATLAS_API void atlas_set_layer_stride(void* model, int stride);
+
 // v1.3.2: Decompress only FFN tensors (gate/up/down) to int8, leave QKV packed.
 ATLAS_API void atlas_decompress_ffn(void* model);
 
@@ -257,8 +264,9 @@ ATLAS_API int atlas_generate_stream(void* model,
 // ─── Int8 lm_head ─────────────────────────────────────────────────────
 // Quantize lm_head from fp16 to per-row symmetric int8 (~403 MB vs 1.5 GB fp32).
 // idx: tensor index of lm_head in the model's tensor list.
-// Frees the original fp16 data. Call after Python has created its fp32 copy.
-ATLAS_API void atlas_quantize_lmhead(void* model, int idx);
+// keep_data: set to 1 for tie embeddings (embed_tokens also used for lookup).
+// Frees the original fp16 data unless keep_data=1.
+ATLAS_API void atlas_quantize_lmhead(void* model, int idx, int keep_data);
 
 // GEMV: B tokens [B × hidden_dim] → logits [B × vocab_size] via int8 lm_head.
 // AVX2 maddubs + offset trick + per-row dequant. OpenMP parallel over vocab.
@@ -298,7 +306,8 @@ ATLAS_API void atlas_attention_f32(
     int8_t* v_cache, float* v_scale_cache,
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
-    float rope_theta, float* output);
+    float rope_theta, float rope_scale, float* output,
+    const uint8_t* q_norm_w, const uint8_t* k_norm_w);
 
 #ifdef __cplusplus
 }
