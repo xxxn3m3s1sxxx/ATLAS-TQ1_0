@@ -90,7 +90,14 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
-### v2.4.0 — Context Window Extension
+### v2.4.0 — Qwen/Bonsai-Okosystem-Upgrade (AKTIV)
+- **Packer (`atlas_packer_qwen.py`)**: Tensor-Mapping (Qwen→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
+- **Dynamisches Vocab**: `vocab_size` aus Datei-Header statt hardcoded 131072 (Bonsai: 151936). Betrifft `lm_head` + `embed_tokens` Allokation.
+- **SwiGLU-Hotpath**: `gate`/`up` parallel berechnet, SiLU fusioniert, `down`-Projektor logisch getrennt.
+- **RoPE Base 1M**: Auf Qwen-Basis (`rope_theta=1000000`) umstellbar im C++-Core.
+- **Target**: Bonsai-8B TQ1.0 ~2.6 GB. Kompatibilität mit Qwen-2.5 Familie.
+
+### v2.5.0 — Context Window Extension
 - **RoPE NTK-scaling**: Interpolation factor im C++-Core (`rope_theta` adjust + freq scaling)
 - **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten Positionen, dynamisches `max_seq_len` pro `atlas_generate`-Aufruf
 - **Target**: 8K Kontext für 10B bei ~346 MB Cache (2× heutige Reichweite bei ~gleichem RAM)
