@@ -64,27 +64,36 @@ jobs:
           # Add to PATH for runtime loading
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Smoke test + pytest (Linux)
+      - name: Install test deps (Linux)
+        if: runner.os == 'Linux'
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+
+      - name: Install test deps (macOS)
+        if: runner.os == 'macOS'
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+
+      - name: Install test deps (Windows)
+        if: runner.os == 'Windows'
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+
+      - name: Test (Linux)
         if: runner.os == 'Linux'
         run: |
           python tests/ci_smoke.py
-          pip install --quiet pytest
           python -m pytest tests/test_dll.py -v
 
-      - name: Smoke test + pytest (macOS)
+      - name: Test (macOS)
         if: runner.os == 'macOS'
         run: |
           python tests/ci_smoke.py
-          pip install --quiet pytest
           python -m pytest tests/test_dll.py -v
 
-      - name: Smoke test + pytest (Windows)
+      - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $env:KMP_DUPLICATE_LIB_OK="TRUE"
           python tests/ci_smoke.py
-          pip install numpy pytest
           python -m pytest tests/test_dll.py -v
 
       - name: Upload artifact (release only)
