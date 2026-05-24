@@ -122,7 +122,6 @@ def create_atlas_qwen(model_dir, output_path):
             idx = json.load(f)
         weight_map = idx['weight_map']
     else:
-        from safetensors import safe_open
         weight_map = {}
         sf_path = os.path.join(model_dir, 'model.safetensors')
         with safe_open(sf_path, framework='np') as sf:

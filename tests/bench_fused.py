@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark fused vs per-layer 10B decode speed."""
 import ctypes, os, time, sys, numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from atlas_infer import AtlasModel, dll
 
 def run_decode(model, input_ids, eos_id, n_gen, mode="fused"):

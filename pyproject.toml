@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "atlas-tq1"
+version = "2.4.1"
+description = "BitNet b1.58 TQ1.0 CPU inference engine for ternary-quantized LLMs"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "safetensors>=0.4",
+]
+keywords = ["bitnet", "ternary", "llm", "inference", "cpu", "tq1"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/anomalyco/atlas"
+Source = "https://github.com/anomalyco/atlas"
+
+[project.scripts]
+atlas-pack = "atlas_pack:main"
+
+[tool.setuptools.packages.find]
+include = ["atlas*"]

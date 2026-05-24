@@ -2,7 +2,7 @@
 """v2.4.1 benchmark: all available models, modes."""
 import os, sys, time, gc
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from atlas_infer import AtlasModel
 
 MODELS = [

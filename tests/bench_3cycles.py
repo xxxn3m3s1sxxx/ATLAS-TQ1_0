@@ -1,4 +1,5 @@
-import time, os, ctypes, gc
+import time, os, ctypes, gc, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 from atlas_infer import AtlasModel, dll
 from transformers import PreTrainedTokenizerFast

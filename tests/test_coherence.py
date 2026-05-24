@@ -2,7 +2,7 @@
 """Verify 0.999999 correlation: C++ fused forward vs Python reference (int8)."""
 import sys, os, time, numpy as np, ctypes
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-sys.path.insert(0, r'C:\atlas')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from atlas_infer import dll, AtlasModel
 
 def verify_model(path, cfg_dir, label):
