@@ -58,9 +58,9 @@ print(model.generate_c("What is the capital of France?", temperature=0.0))
 model.set_seed(42)
 print(model.generate_c("Tell me about Paris", temperature=0.7, top_k=40, top_p=0.9, repetition_penalty=1.1))
 
-# Streaming
-for chunk in model.generate_stream("Write a short poem", max_new_tokens=100):
-    print(chunk, end="", flush=True)
+# Streaming — yields token IDs, decode via _cpp_decode
+for token_id in model.generate_stream("Write a short poem", max_new_tokens=100):
+    print(model._cpp_decode([token_id]), end="", flush=True)
 
 # Chat with system prompt
 model.set_system_prompt("You are a helpful assistant.")
@@ -110,9 +110,9 @@ output = model.generate_c("Your prompt", temperature=0.0)
 output = model.generate_c("Your prompt", temperature=0.7, top_k=40, top_p=0.9,
                           max_new_tokens=200, repetition_penalty=1.1)
 
-# Streaming
-for chunk in model.generate_stream("Tell me a story", max_new_tokens=100):
-    print(chunk, end="", flush=True)
+# Streaming — yields token IDs (caller decodes)
+for token_id in model.generate_stream("Tell me a story", max_new_tokens=100):
+    print(model._cpp_decode([token_id]), end="", flush=True)
 
 # Chat with system prompt
 model.set_system_prompt("You are a helpful assistant.")
@@ -142,7 +142,7 @@ model.set_num_threads(4)
 |--------|-------------|
 | `AtlasModel(path)` | Load `.atlas` model. Optional `model_dir` for tokenizer config fallback. |
 | `generate_c(text, ...)` | Generate text. Accepts string or `list[dict]` messages. Returns string. |
-| `generate_stream(text, ...)` | Generator yielding token strings as they're produced. |
+| `generate_stream(text, ...)` | Generator yielding int token IDs (caller decodes via `_cpp_decode`). |
 | `set_system_prompt(text)` | Set system prompt for chat mode. |
 | `set_seed(seed)` | Seed the RNG (default: random). |
 | `set_num_threads(n)` | Set OpenMP thread count. |
