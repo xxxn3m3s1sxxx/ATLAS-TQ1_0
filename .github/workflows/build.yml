@@ -53,12 +53,34 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $llvmDir = if (Test-Path "C:\Program Files\LLVM") { "C:\Program Files\LLVM" } else { throw "LLVM not found" }
+          $llvmDir = "C:\Program Files\LLVM"
+          if (-not (Test-Path $llvmDir)) { throw "LLVM not found at $llvmDir" }
           Write-Output "LLVM: $llvmDir"
+          # Build
           clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
-          # Add LLVM bin to PATH so libomp.dll is found at runtime
+          # Find libomp.dll — try multiple locations
+          $ompPaths = @(
+            "$llvmDir\bin\libomp.dll",
+            "${env:VCPKG_ROOT}\installed\x64-windows\bin\libomp.dll",
+            "${env:VCPKG_INSTALLATION_ROOT}\installed\x64-windows\bin\libomp.dll"
+          )
+          $ompDll = $null
+          foreach ($pattern in $ompPaths) {
+            $dll = Resolve-Path $pattern -ErrorAction SilentlyContinue
+            if ($dll) { $ompDll = $dll.Path; break }
+          }
+          if ($ompDll) {
+            Copy-Item $ompDll -Destination . -Force
+            Write-Output "libomp.dll: $ompDll"
+          } else {
+            Write-Output "::warning::libomp.dll not found — downloading"
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/OpenMP-19.1.7-win64.zip"
+            Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\openmp.zip"
+            Expand-Archive "$env:TEMP\openmp.zip" -DestinationPath "$env:TEMP\openmp" -Force
+            Copy-Item "$env:TEMP\openmp\bin\libomp.dll" -Destination . -Force
+          }
+          # Add to PATH for runtime loading
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          Get-ChildItem "$llvmDir\bin\libomp*" | Select-Object Name
 
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
