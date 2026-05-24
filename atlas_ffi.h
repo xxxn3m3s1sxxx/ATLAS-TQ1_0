@@ -181,6 +181,11 @@ ATLAS_API void atlas_set_use_hybrid_matmul(void* model, int val);
 // v2.4.0: Set YaRN NTK RoPE scaling factor (1.0 = off, 4.0 = Bonsai-4B).
 ATLAS_API void atlas_set_rope_scale(void* model, float scale);
 
+// v2.5.0: Set base sequence length for NTK context extension.
+// Default 4096. Set to model's trained context length (e.g., 2048 for Bonsai-1.7B).
+// When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied.
+ATLAS_API void atlas_set_base_seq_len(void* model, int seq_len);
+
 // v2.4.0: Set layer stride — tensors per transformer layer.
 // 9 for Falcon3, 11 for Qwen3 (adds q_norm + k_norm).
 ATLAS_API void atlas_set_layer_stride(void* model, int stride);
@@ -304,6 +309,7 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 //
 // v2.3.0: Int8 KV cache with per-kv_head, per-position scaling.
 // Read: cache_row[h, s] = (float)k_cache[h, s, d] * k_scale_cache[h, s]
+// v2.5.0: Ring buffer KV cache + NTK context extension (base_seq_len)
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
     int8_t* k_cache, float* k_scale_cache,
@@ -311,7 +317,8 @@ ATLAS_API void atlas_attention_f32(
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
     float rope_theta, float rope_scale, float* output,
-    const uint8_t* q_norm_w, const uint8_t* k_norm_w);
+    const uint8_t* q_norm_w, const uint8_t* k_norm_w,
+    int base_seq_len);
 
 #ifdef __cplusplus
 }

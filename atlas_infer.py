@@ -71,6 +71,9 @@ dll.atlas_set_use_hybrid_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 dll.atlas_set_rope_scale.restype = None
 dll.atlas_set_rope_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
 
+dll.atlas_set_base_seq_len.restype = None
+dll.atlas_set_base_seq_len.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
 dll.atlas_set_layer_stride.restype = None
 dll.atlas_set_layer_stride.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
@@ -191,10 +194,12 @@ dll.atlas_generate_stream.restype = ctypes.c_int
 # ─── Model class ─────────────────────────────────────────────────────────
 class AtlasModel:
     def __init__(self, atlas_path, safetensors_path=None, model_dir=None,
-                 use_packed_matmul=False, use_hybrid_matmul=False):
+                 use_packed_matmul=False, use_hybrid_matmul=False,
+                 max_seq_len=4096, base_seq_len=None):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
+        self._base_seq_len = base_seq_len or max_seq_len
         self.model_ptr = dll.atlas_load(atlas_path.encode())
         if not self.model_ptr:
             raise RuntimeError("Failed to load model")
@@ -272,8 +277,10 @@ class AtlasModel:
             if self.hidden <= 2048:
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
-        # Max sequence length for KV cache (allocated inside C++)
-        self.max_seq_len = 4096
+        # Max sequence length for KV cache ring buffer (v2.5.0: configurable)
+        self.max_seq_len = max_seq_len
+        # Set base sequence length for NTK context extension
+        dll.atlas_set_base_seq_len(self.model_ptr, self._base_seq_len)
 
         # Quantize lm_head to per-row int8 in C++ (saves ~1.1 GB vs full fp32)
         # For tie embeddings (Qwen3/Bonsai), lm_head = embed_tokens
@@ -294,6 +301,7 @@ class AtlasModel:
         self._eos_id = 0
         self._chat_template = None
         self._is_qwen3 = (self.head_dim <= 128 or self.vocab_size > 131072)
+        self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
         tok_size = ctypes.c_int()
@@ -308,6 +316,9 @@ class AtlasModel:
                 if cfg_size > 0:
                     cfg = json.loads(raw[pos:pos+cfg_size].decode('utf-8'))
                     self._chat_template = cfg.get('chat_template')
+                    # Bonsai has no embedded template → no thinking support
+                    if not self._chat_template and self._is_qwen3:
+                        self._enable_thinking = False
                     # Get EOS token ID from config
                     eos_cfg = cfg.get('eos_token')
                     if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
@@ -363,6 +374,19 @@ class AtlasModel:
     def set_rope_scale(self, scale=1.0):
         """v2.4.0: Set YaRN NTK RoPE scaling factor (4.0 for Bonsai-4B)."""
         dll.atlas_set_rope_scale(self.model_ptr, ctypes.c_float(scale))
+
+    def set_base_seq_len(self, seq_len):
+        """v2.5.0: Set base sequence length for NTK context extension.
+        E.g., 4096 for Falcon3, 2048 for Bonsai-1.7B, 8192 for Bonsai-4B.
+        When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied."""
+        dll.atlas_set_base_seq_len(self.model_ptr, seq_len)
+        self._base_seq_len = seq_len
+
+    def set_max_seq_len(self, seq_len):
+        """v2.5.0: Set max sequence length (ring buffer window size).
+        Larger values allocate more KV cache memory but enable longer context.
+        When > base_seq_len, NTK context extension is auto-applied."""
+        self.max_seq_len = seq_len
 
     def set_use_ternary_matmul(self, enable=True):
         """v1.3.0: Enable/disable ternary-add kernel (vpsignb, no multiplication)."""
@@ -744,8 +768,10 @@ class AtlasModel:
         self._system_prompt = prompt
 
     def generate_c(self, prompt, max_new_tokens=50, temperature=0.7,
-                   top_k=40, top_p=0.9, repetition_penalty=1.0):
-        """Generate via atlas_generate (single C call, v1.2.1)."""
+                   top_k=40, top_p=0.9, repetition_penalty=1.0,
+                   max_seq_len=None):
+        """Generate via atlas_generate (single C call, v1.2.1).
+        max_seq_len: override KV cache window (default: self.max_seq_len)."""
         try:
             if isinstance(prompt, str):
                 prompt = [{"role": "user", "content": prompt}]
@@ -763,7 +789,8 @@ class AtlasModel:
 
         n_gen = dll.atlas_generate(
             self.model_ptr, in_arr, n_input,
-            self.max_seq_len, max_new_tokens,
+            max_seq_len if max_seq_len is not None else self.max_seq_len,
+            max_new_tokens,
             float(temperature), int(top_k), float(top_p),
             float(repetition_penalty),
             out_arr)
@@ -781,8 +808,10 @@ class AtlasModel:
         return decoded
 
     def generate_stream(self, prompt, max_new_tokens=200, temperature=0.7,
-                        top_k=40, top_p=0.9, repetition_penalty=1.0):
+                        top_k=40, top_p=0.9, repetition_penalty=1.0,
+                        max_seq_len=None):
         """Streaming generator — yields token IDs as they are produced.
+        max_seq_len: override KV cache window (default: self.max_seq_len).
 
         Usage:
             for token_id in model.generate_stream("Write an article"):
@@ -813,7 +842,8 @@ class AtlasModel:
 
         t = threading.Thread(target=dll.atlas_generate_stream,
             args=(self.model_ptr, in_arr, n_input,
-                  self.max_seq_len, max_new_tokens,
+                  max_seq_len if max_seq_len is not None else self.max_seq_len,
+                  max_new_tokens,
                   temperature, top_k, top_p,
                   float(repetition_penalty),
                   cb, None))
@@ -895,8 +925,9 @@ class AtlasModel:
         """Chat template (no Jinja2/transformers dependency).
 
         Matches model-specific format:
-        - Falcon3: <|role|>\ncontent\n
+        - Falcon3: <|role|>\ncontent\n  (EOS: <|endoftext|>)
         - Qwen3:   <|im_start|>role\ncontent<|im_end|>\n
+        Bonsai: Qwen3 format + enable_thinking=False (empty <think> block).
         """
         if self._is_qwen3:
             eos = '<|im_end|>'
@@ -907,6 +938,10 @@ class AtlasModel:
                 result += f"<|im_start|>{role}\n{content}{eos}\n"
             if add_generation_prompt:
                 result += '<|im_start|>assistant\n'
+                # Suppress thinking for non-thinking models (Bonsai)
+                enable = getattr(self, '_enable_thinking', True)
+                if not enable:
+                    result += '<think>\n\n</think>\n\n'
             return result
 
         eos = '<|endoftext|>'

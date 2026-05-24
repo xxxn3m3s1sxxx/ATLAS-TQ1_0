@@ -284,6 +284,7 @@ struct AtlasModel {
     int vocab_size;
     float rope_theta;
     float rope_scale = 1.0f; // YaRN NTK scaling (1.0 = off, 4.0 = Bonsai)
+    int base_seq_len = 4096; // v2.5.0: trained context length for NTK extension
     int layer_stride = 9;    // tensors per layer (9 Falcon3, 11 Qwen3 with QK-Norm)
     int eos_id = 11;   // default Falcon3 endoftext
     int pad_id = 0;    // default padding token
@@ -1650,6 +1651,7 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 // v_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for V
 // output: [B, n_heads * head_dim] float32
 // q_norm_w, k_norm_w: [head_dim] uint8 fp16 RMSNorm weights (QK-Norm, Qwen3), NULL = skip
+// v2.5.0: Ring buffer (cache_pos = pos % max_seq_len) + NTK context extension (base_seq_len)
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
     int8_t* k_cache, float* k_scale_cache,
@@ -1657,18 +1659,27 @@ ATLAS_API void atlas_attention_f32(
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
     float rope_theta, float rope_scale, float* output,
-    const uint8_t* q_norm_w, const uint8_t* k_norm_w) {
+    const uint8_t* q_norm_w, const uint8_t* k_norm_w,
+    int base_seq_len) {
 
     int n_rep = n_heads / n_kv_heads;
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
-    // YaRN NTK-aware effective theta (rope_scale=4.0 for Bonsai-4B)
+    // v2.5.0: NTK context extension — compound rope_scale with ctx_scale
+    float ctx_scale = base_seq_len > 0 ? (float)max_seq_len / (float)base_seq_len : 1.0f;
+    if (ctx_scale < 1.0f) ctx_scale = 1.0f;
+    float total_scale = rope_scale;
+    if (ctx_scale > 1.001f) total_scale *= ctx_scale;
     float eff_theta = rope_theta;
-    if (rope_scale > 1.001f) {
-        eff_theta *= powf(rope_scale, (float)head_dim / (float)(head_dim - 2));
+    if (total_scale > 1.001f) {
+        eff_theta *= powf(total_scale, (float)head_dim / (float)(head_dim - 2));
     }
 
+    // v2.5.0: Ring buffer — first valid position in cache
+    int ring_start = seq_now > max_seq_len ? seq_now - max_seq_len : 0;
+    int ring_len = seq_now > max_seq_len ? max_seq_len : seq_now;
+
     // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
-    int max_seq = seq_now > max_seq_len ? max_seq_len : seq_now;
+    int max_seq = ring_len;
     static thread_local float* scores_buf = nullptr;
     static thread_local size_t scores_cap = 0;
     size_t needed = (size_t)n_heads * max_seq;
@@ -1750,8 +1761,9 @@ ATLAS_API void atlas_attention_f32(
             float v_scale = v_max / 127.0f;
             float k_inv = 127.0f / k_max;
             float v_inv = 127.0f / v_max;
-            int8_t* kc = k_cache + (size_t)h * max_seq_len * head_dim + (size_t)pos * head_dim;
-            int8_t* vc = v_cache + (size_t)h * max_seq_len * head_dim + (size_t)pos * head_dim;
+            int cache_pos = pos % max_seq_len;
+            int8_t* kc = k_cache + (size_t)h * max_seq_len * head_dim + (size_t)cache_pos * head_dim;
+            int8_t* vc = v_cache + (size_t)h * max_seq_len * head_dim + (size_t)cache_pos * head_dim;
             for (int d = 0; d < head_dim; d++) {
                 int kq = (int)(k_row[d] * k_inv);
                 int vq = (int)(v_row[d] * v_inv);
@@ -1760,15 +1772,16 @@ ATLAS_API void atlas_attention_f32(
                 kc[d] = (int8_t)kq;
                 vc[d] = (int8_t)vq;
             }
-            k_scale_cache[(size_t)h * max_seq_len + pos] = k_scale;
-            v_scale_cache[(size_t)h * max_seq_len + pos] = v_scale;
+            k_scale_cache[(size_t)h * max_seq_len + cache_pos] = k_scale;
+            v_scale_cache[(size_t)h * max_seq_len + cache_pos] = v_scale;
         }
 
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
-            for (int s = 0; s < max_seq; s++) {
-                const int8_t* k_row = k_cache + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
-                float k_scale = k_scale_cache[(size_t)kh * max_seq_len + s];
+            for (int s = 0; s < ring_len; s++) {
+                int cache_idx = (ring_start + s) % max_seq_len;
+                const int8_t* k_row = k_cache + (size_t)kh * max_seq_len * head_dim + (size_t)cache_idx * head_dim;
+                float k_scale = k_scale_cache[(size_t)kh * max_seq_len + cache_idx];
                 const float* qh = qb + h * head_dim;
                 int d = 0;
                 __m256 sum_v = _mm256_setzero_ps();
@@ -1789,12 +1802,13 @@ ATLAS_API void atlas_attention_f32(
             }
         }
 
-        // Causal mask + softmax per head
+        // Causal mask + softmax per head (ring_start + s = actual position)
         for (int h = 0; h < n_heads; h++) {
             float* sh = scores + h * max_seq;
             float max_val = -1e9f;
             for (int s = 0; s < max_seq; s++) {
-                float val = (s > pos) ? -1e9f : sh[s];
+                int attn_pos = ring_start + s;
+                float val = (attn_pos > pos) ? -1e9f : sh[s];
                 sh[s] = val;
                 if (val > max_val) max_val = val;
             }
@@ -1815,9 +1829,10 @@ ATLAS_API void atlas_attention_f32(
             float* out_h = output + b * n_heads * head_dim + h * head_dim;
             for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
             for (int s = 0; s < max_seq; s++) {
+                int cache_idx = (ring_start + s) % max_seq_len;
                 const int8_t* v_row = v_cache
-                    + (size_t)kh * max_seq_len * head_dim + (size_t)s * head_dim;
-                float v_scale = v_scale_cache[(size_t)kh * max_seq_len + s];
+                    + (size_t)kh * max_seq_len * head_dim + (size_t)cache_idx * head_dim;
+                float v_scale = v_scale_cache[(size_t)kh * max_seq_len + cache_idx];
                 float score = sh[s];
                 __m256 sv = _mm256_set1_ps(score * v_scale);
                 int d = 0;
@@ -1899,6 +1914,11 @@ ATLAS_API void atlas_set_rope_scale(AtlasModel* m, float scale) {
 // ─── v2.4.0: Set layer stride (9 Falcon3, 11 Qwen3 with QK-Norm) ────
 ATLAS_API void atlas_set_layer_stride(AtlasModel* m, int stride) {
     if (m) m->layer_stride = stride;
+}
+
+// ─── v2.5.0: Set base sequence length (trained context for NTK extension) ──
+ATLAS_API void atlas_set_base_seq_len(AtlasModel* m, int seq_len) {
+    if (m && seq_len > 0) m->base_seq_len = seq_len;
 }
 
 // ─── Helper: horizontal sum of __m256 float ──────────────────────────
@@ -2426,7 +2446,8 @@ static void forward_layer_internal(
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
         k_cache_layer, k_scale_layer, v_cache_layer, v_scale_layer,
         max_seq_len, seq_now, B,
-        nH, nKV, hd, theta, m->rope_scale, attn_out, qn_w, kn_w);
+        nH, nKV, hd, theta, m->rope_scale, attn_out, qn_w, kn_w,
+        m->base_seq_len);
 
     // ─── 4. O projection (int8) ───
     {
@@ -3223,15 +3244,8 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         return n_gen;
     }
 
-    // ─── Decode loop ───
+    // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
     atlas_vfree((uint8_t*)positions);
-    // Veto: clamp max_new_tokens to prevent KV cache overflow
-    int max_possible = max_seq_len - n_input;
-    if (max_possible <= 0) {
-        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context); return 0;
-    }
-    if (max_new_tokens > max_possible) max_new_tokens = max_possible;
     for (int step = 1; step < max_new_tokens; step++) {
         // Embed last generated token
         int tid = next_token;
@@ -3351,14 +3365,8 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         return n_gen;
     }
 
-    // ─── Decode loop ───
+    // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
     atlas_vfree((uint8_t*)positions);
-    int max_possible = max_seq_len - n_input;
-    if (max_possible <= 0) {
-        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context); return 0;
-    }
-    if (max_new_tokens > max_possible) max_new_tokens = max_possible;
     for (int step = 1; step < max_new_tokens; step++) {
         int tid = next_token;
         if (tid < 0 || tid >= V) tid = 0;

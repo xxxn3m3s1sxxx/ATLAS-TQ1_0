@@ -46,7 +46,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 
 | Model | Hybrid tok/s (total) | Hybrid tok/s (pure gen) | Sustained gen tokens |
 |-------|:--------------------:|:-----------------------:|:--------------------:|
-| **3B** | **4.1** | **4.5** | 200 (no EOS) |
+| **3B** | **7.1** | — | 200 (no EOS) |
 | **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
 | **7B** | **1.9** | — | 61 (sampling-dependent) |
 | **10B** | **1.3** | — | 29 (sampling-dependent) |
@@ -60,12 +60,13 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 
 🚀 **Default recommendation**: Always use `T=0.7, top_k=40` for any model below 7B. T=0 is only reliable for 7B+.
 
-### Bonsai Benchmarks (v2.4.1+)
+### Bonsai Benchmarks (v2.5.0+)
 
-| Model | Default Mode | tok/s | Quality (T=0) |
-|-------|-------------|:-----:|---------------|
-| **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is Paris." |
-| **Bonsai-4B** | hybrid+int8 | **15.2** | "The capital of France is Paris." |
+| Model | Default Mode | tok/s | Context Window | Quality (T=0) |
+|-------|-------------|:-----:|:--------------:|---------------|
+| **Bonsai-1.7B** | f32 bypass | **13.0** | 4K (f32) / 8K (NTK) | "The capital of France is Paris." |
+| **Bonsai-4B** | hybrid+int8 | **17.4** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
+| **Bonsai-8B** | hybrid+int8 | **2.59** | 8K (YaRN) / 16K (NTK) | Reasoning trace (CoT) |
 
 Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Quantized hybrid mode yields 19.2 tok/s.
 
@@ -114,15 +115,21 @@ See `atlas_ffi.h` for full API.
 - **SwiGLU-Hotpath**: `gate`/`up` parallel berechnet, SiLU fusioniert — identisch zu Falcon3, kein Umbau nötig.
 - **Target**: Bonsai-4B TQ1.0 ~1.5 GB. Kompatibilität mit Qwen3 Familie.
 
-### v2.5.0 — Context Window Extension
-- **RoPE NTK-scaling**: Interpolation factor im C++-Core (`rope_theta` adjust + freq scaling)
-- **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten Positionen, dynamisches `max_seq_len` pro `atlas_generate`-Aufruf
-- **Target**: 8K Kontext für 10B bei ~346 MB Cache (2× heutige Reichweite bei ~gleichem RAM)
-- Abhängigkeit: int8 KV-Cache (v2.3.0) — liefert die RAM-Reserve für die Verdopplung
+### v2.5.0 ✅ — Context Window Extension (AKTIV)
+- **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten `max_seq_len` Positionen. `seq_now` kann `max_seq_len` überschreiten — der Cache wickelt modulo `max_seq_len` und überschreibt die ältesten Einträge.
+- **NTK Context Extension**: `ctx_scale = max_seq_len / base_seq_len` kompoundiert mit `rope_scale` für NTK-aware Frequenzanpassung. Erlaubt sanfte Skalierung über die trainierte Kontextlänge hinaus (z.B. 4K→8K für Falcon3, 8K→16K für Bonsai-4B).
+- **`set_base_seq_len()` API**: Neue C-API + Python-Methode. `base_seq_len` = trainierte Kontextlänge (z.B. 4096 Falcon3, 2048 Bonsai-1.7B, 8192 Bonsai-4B). NTK-Scaling wird automatisch angewandt wenn `max_seq_len > base_seq_len`.
+- **Dynamisches `max_seq_len`**: Pro `atlas_generate`-Aufruf konfigurierbar (Python: `generate_c(..., max_seq_len=8192)`).
+- **Kein RAM-Wachstum**: Cache bleibt `n_layers × n_kv_heads × max_seq_len × head_dim` — keine lineare Skalierung mit `seq_now`.
+- **Target erreicht**: 8K Kontext auf Falcon3-3B getestet, 16K auf Bonsai-4B getestet. Ring Buffer für 128→200+ Token Wrapping validiert.
+
+### v2.6.0 — Pipeline: SSE Web-Server + Prompt-Caching
+- **SSE Web-Server**: ~50 Zeilen FastAPI/SSE-Wrapper für HTTP-Streaming. Prompt-Caching per Session (KV-Cache persistiert über Generate-Aufrufe hinweg).
+- **Prompt-Caching**: KV-Cache nicht zwischen `atlas_generate`-Aufrufen löschen, sondern für wiederholte Prompts (System Prompt, Chat History) recyceln.
+- **Target**: 10B Chat-Client mit sub-second Prefill für kurze Folgefragen.
 
 ### Deferred
 - **F16C-Rester**: Diminishing returns (heiße Pfade bereits erledigt)
-- **SSE Web-Server**: ~50 Zeilen FastAPI/SSE-Wrapper, jederzeit nachrüstbar
 
 ## Version History
 
