@@ -58,31 +58,10 @@ jobs:
           # Build
           clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
           if ($LASTEXITCODE -ne 0) { throw "Build failed" }
-          # Diagnose DLL dependencies
-          Get-Command dumpbin -ErrorAction SilentlyContinue | Out-Null
-          if ($?) { dumpbin /dependents atlas.dll } else { Write-Output "dumpbin not available" }
-          Write-Output "=== LLVM bin DLLs ==="
-          Get-ChildItem "$llvmDir\bin\*.dll" -Name -ErrorAction SilentlyContinue
-          Write-Output "=== Looking for libomp.dll ==="
-          $found = $false
-          Get-ChildItem "$llvmDir" -Filter "libomp*" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Output "  Found: $($_.FullName)"
-            Copy-Item $_.FullName -Destination . -Force
-            $found = $true
-          }
-          if (-not $found) {
-            # Try vcpkg
-            $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { $env:VCPKG_ROOT }
-            if ($vcpkgRoot) {
-              Get-ChildItem "$vcpkgRoot" -Filter "libomp*" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                Write-Output "  vcpkg: $($_.FullName)"
-                Copy-Item $_.FullName -Destination . -Force
-                $found = $true
-              }
-            }
-          }
-          if (-not $found) { Write-Output "::warning::libomp.dll not found anywhere" }
-          # Add LLVM bin to PATH for good measure
+          # Copy ALL DLLs from LLVM bin — covers libomp, libc++, libc++abi, libunwind, etc.
+          Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Write-Output "=== Copied $(@(Get-ChildItem *.dll).Count) DLLs ==="
+          # Add to PATH for runtime loading
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Smoke test (Linux)
