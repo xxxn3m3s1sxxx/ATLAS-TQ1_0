@@ -46,35 +46,38 @@ def main():
         create_atlas(model_dir, output)
     else:
         # TriLM/Bonsai detection via packer modules
-        from atlas_packer_bonsai import create_atlas_bonsai, auto_output_name as bonsai_name
         from atlas_packer_trilm import create_atlas_trilm, auto_output_name as trilm_name
 
-        bn = bonsai_name(model_dir)
         tn = trilm_name(model_dir)
 
-        if bn and not tn:
-            print("[ATLAS] Detected: BONSAI/QWEN3 family")
-            if not output:
-                output = bn
-            print(f"[ATLAS] Auto output: {output}")
-            create_atlas_bonsai(model_dir, output)
-        elif tn and not bn:
-            print("[ATLAS] Detected: TRILM family, ~{0}B params".format(
-                {1792: "1", 2048: "1.5", 2304: "2.4", 3072: "4", 512: "0.1", 768: "0.2",
-                 1024: "0.4", 1280: "0.6", 1536: "0.8"}.get(hidden, "?")))
+        if tn:
+            print(f"[ATLAS] Detected: TRILM/QWEN2 family")
             if not output:
                 output = tn
             print(f"[ATLAS] Auto output: {output}")
             create_atlas_trilm(model_dir, output)
-        elif bn or tn:
-            print(f"[ATLAS] Ambiguous detection — trying BONSAI first")
-            if bn and not output:
-                output = bn
-            create_atlas_bonsai(model_dir, output)
         else:
-            print(f"[ATLAS] Unknown model type {model_type}")
-            print("  Try one of: atlas_packer.py, atlas_packer_bonsai.py, atlas_packer_trilm.py, atlas_packer_phi3.py")
-            sys.exit(1)
+            # Fallback: try Bonsai packer
+            from atlas_packer_bonsai import create_atlas_qwen
+            from atlas_packer_trilm import auto_output_name as _tn  # noqa
+
+            # Check if it matches Qwen3/Bonsai pattern
+            if 'qwen' in model_type or 'bonsai' in model_type.lower():
+                print("[ATLAS] Detected: BONSAI/QWEN3 family")
+                if not output:
+                    output = auto_output_name_fallback(model_dir)
+                create_atlas_qwen(model_dir, output)
+            else:
+                print(f"[ATLAS] Unknown model type {model_type}")
+                print("  Try one of: atlas_packer.py, atlas_packer_bonsai.py, atlas_packer_trilm.py, atlas_packer_phi3.py")
+                sys.exit(1)
+
+def auto_output_name_fallback(model_dir):
+    import json, os
+    with open(os.path.join(model_dir, 'config.json')) as f:
+        cfg = json.load(f)
+    h = cfg.get('hidden_size', 0)
+    return f"model-{h}d-tq1-g128.atlas"
 
 if __name__ == '__main__':
     main()

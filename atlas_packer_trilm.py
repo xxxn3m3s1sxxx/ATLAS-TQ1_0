@@ -74,16 +74,54 @@ def create_atlas_trilm(model_dir, output_path):
     print(f"  Tie embeddings:{tie_emb}")
 
     idx_path = os.path.join(model_dir, 'model.safetensors.index.json')
+    weight_map = {}
+    has_bf16 = False
     if os.path.exists(idx_path):
         with open(idx_path) as f:
             idx = json.load(f)
         weight_map = idx['weight_map']
+        # Check dtype from first tensor
+        shard0 = os.path.join(model_dir, list(weight_map.values())[0])
+        if os.path.exists(shard0):
+            with open(shard0, 'rb') as sf:
+                hl = struct.unpack('<Q', sf.read(8))[0]
+                h0 = json.loads(sf.read(hl))
+                # Skip __metadata__ key
+                first_k = next(k for k in h0 if k != '__metadata__')
+                has_bf16 = h0[first_k]['dtype'] == 'BF16'
     else:
-        weight_map = {}
         sf_path = os.path.join(model_dir, 'model.safetensors')
-        with safe_open(sf_path, framework='np') as sf:
-            for k in sf.keys():
-                weight_map[k] = 'model.safetensors'
+        if os.path.exists(sf_path):
+            with open(sf_path, 'rb') as sf:
+                hl = struct.unpack('<Q', sf.read(8))[0]
+                h0 = json.loads(sf.read(hl))
+                for k in h0:
+                    if k != '__metadata__':
+                        weight_map[k] = 'model.safetensors'
+                first_k = next(k for k in h0 if k != '__metadata__')
+                has_bf16 = h0[first_k]['dtype'] == 'BF16'
+
+    # BF16 reader using raw safetensors format
+    def read_tensor(tname):
+        sp = weight_map.get(tname)
+        if not sp:
+            raise KeyError(f'Tensor {tname} not found')
+        spath = os.path.join(model_dir, sp) if os.sep not in sp else sp
+        with open(spath, 'rb') as f:
+            hl = struct.unpack('<Q', f.read(8))[0]
+            hdr = json.loads(f.read(hl))
+            info = hdr[tname]
+            start, end = info['data_offsets']
+            f.seek(start)
+            data = f.read(end - start)
+        if info['dtype'] == 'BF16':
+            arr = np.frombuffer(data, dtype=np.uint16).astype(np.uint32) << 16
+            return arr.view(np.float32).reshape(info['shape']).astype(np.float16)
+        elif info['dtype'] == 'F16':
+            return np.frombuffer(data, dtype=np.float16).reshape(info['shape'])
+        elif info['dtype'] == 'F32':
+            return np.frombuffer(data, dtype=np.float32).reshape(info['shape'])
+        raise TypeError(f'Unsupported dtype: {info["dtype"]} for {tname}')
 
     # Ordered tensor list: stride=9 (no QK-Norm), LLaMA naming
     tensor_names = []
@@ -126,10 +164,13 @@ def create_atlas_trilm(model_dir, output_path):
 
     shard_handles = {}
     def get_tensor(tname):
-        sp = get_shard_path(weight_map, tname, model_dir)
-        if sp not in shard_handles:
-            shard_handles[sp] = safe_open(sp, framework='np')
-        return shard_handles[sp].get_tensor(tname)
+        if has_bf16:
+            return read_tensor(tname)
+        sp = weight_map.get(tname)
+        spath = os.path.join(model_dir, sp) if os.sep not in sp else sp
+        if spath not in shard_handles:
+            shard_handles[spath] = safe_open(spath, framework='np')
+        return shard_handles[spath].get_tensor(tname)
 
     with open(output_path, 'wb') as out:
         header = bytearray(64)
@@ -234,11 +275,13 @@ def auto_output_name(model_dir):
         return None
     with open(cfg_path) as f:
         cfg = json.load(f)
-    if cfg.get('model_type') != 'llama':
+    mt = cfg.get('model_type', '')
+    if mt not in ('llama', 'qwen2'):
         return None
     hidden = cfg.get('hidden_size', 0)
     size_label = TRILM_SIZES.get(hidden, f"{hidden}d")
-    return f"trilm-{size_label}-tq1-g128.atlas"
+    prefix = 'trilm' if mt == 'llama' else 'qwen25'
+    return f"{prefix}-{size_label}-tq1-g128.atlas"
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
