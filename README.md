@@ -18,7 +18,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
 | Ternary-Bonsai-1.7B-unpacked | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
 | Ternary-Bonsai-4B-unpacked | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
-| Ternary-Bonsai-8B-unpacked | ~3 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 |
+| Ternary-Bonsai-8B-unpacked | 3.71 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 Ternary-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B/8B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
