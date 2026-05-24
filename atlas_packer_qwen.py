@@ -5,14 +5,33 @@ from safetensors import safe_open
 
 TQ1_MUL = np.array([1, 3, 9, 27, 81], dtype=np.uint32)
 
+def pre_shuffle_rows(tensor):
+    """Pre-shuffle weight rows to cancel C++ matmul SIMD reorder.
+
+    C++ reorder: output[(r%4)*rows_packed + r//4] = W[r] · act
+    We want:     output[r] = W_natural[r] · act
+
+    Store W_shuffled[target] = W_natural[r] where:
+      target = (r % rows_packed) * 4 + r // rows_packed
+    """
+    out_dim = tensor.shape[0]
+    assert out_dim % 4 == 0
+    rows_packed = out_dim // 4
+    out = np.empty_like(tensor)
+    for r in range(out_dim):
+        target = (r % rows_packed) * 4 + r // rows_packed
+        out[target] = tensor[r]
+    return out
+
 def ternarize(weights_fp16):
     """Extract scale and quantize FP16 weights to ternary {-1,0,1}.
+    Uses 95th percentile for scale (avoids outlier domination).
     Returns (scale_fp16, packed_bytes, packed_per_row)."""
     w = weights_fp16.astype(np.float32)
-    scale = float(np.max(np.abs(w)))
+    scale = float(np.percentile(np.abs(w), 95))
     if scale < 1e-10:
         scale = 1.0
-    ternary = np.round(w / scale).astype(np.int8)  # -1, 0, 1
+    ternary = np.clip(np.round(w / scale).astype(np.int32), -1, 1).astype(np.int8)  # -1, 0, 1
     in_cols = w.shape[1]
     packed_per_row = (in_cols + 4) // 5
     out_rows = w.shape[0]
@@ -27,6 +46,50 @@ def ternarize(weights_fp16):
             (t5 * TQ1_MUL).sum(axis=1).astype(np.uint8)
         )
     return scale, out.tobytes(), packed_per_row
+
+def ternarize_block_scaled(weights_fp16, block_size=128):
+    """Per-block ternary quantization (Bonsai g128 format).
+
+    Per-row block scales: each output row has its own FP16 scales,
+    one per group of `block_size` columns. Vectorized numpy.
+    Returns (block_scales_bytes, packed_bytes, packed_per_row, n_blocks, block_size).
+    """
+    w = weights_fp16.astype(np.float32)
+    nrows, ncols = w.shape
+    n_blocks = (ncols + block_size - 1) // block_size
+
+    # Pad cols to n_blocks * block_size for uniform reshape
+    pad_len = n_blocks * block_size - ncols
+    w_pad = np.pad(w, ((0, 0), (0, pad_len)), constant_values=0) if pad_len else w
+
+    # Reshape to (nrows, n_blocks, block_size) and compute per-row per-block scales
+    w_3d = w_pad.reshape(nrows, n_blocks, block_size)
+    block_scales32 = np.max(np.abs(w_3d), axis=2)
+    block_scales32 = np.where(block_scales32 < 1e-10, 1.0, block_scales32)
+
+    # Expand scales to full padded shape and quantize
+    scales_expanded = np.repeat(block_scales32[:, :, np.newaxis], block_size, axis=2)
+    ternary_3d = np.clip(np.round(w_3d / scales_expanded).astype(np.int32), -1, 1)
+    # Trim padding and reshape to (nrows, ncols)
+    ternary_flat = ternary_3d.reshape(nrows, n_blocks * block_size)[:, :ncols].astype(np.int8)
+
+    # Pack ternary to TQ1 (5 trits/byte)
+    packed_per_row = (ncols + 4) // 5
+    full_len = packed_per_row * 5
+    out = np.empty(nrows * packed_per_row, dtype=np.uint8)
+    for r in range(nrows):
+        row = ternary_flat[r, :].astype(np.int32) + 1
+        if ncols < full_len:
+            row = np.pad(row, (0, full_len - ncols), constant_values=1)
+        t5 = row[:full_len].reshape(packed_per_row, 5)
+        out[r * packed_per_row : (r + 1) * packed_per_row] = (
+            (t5 * TQ1_MUL).sum(axis=1).astype(np.uint8)
+        )
+
+    # Wire format: [block_size:1][n_blocks:2][scales: nrows*n_blocks*2 fp16][packed_TQ1]
+    block_scales = block_scales32.astype(np.float16)
+    header = struct.pack('<BH', block_size, n_blocks) + block_scales.tobytes()
+    return header + out.tobytes(), packed_per_row, n_blocks, block_size
 
 def get_shard_path(weight_map, tensor_name, model_dir):
     """Resolve which shard file contains a tensor."""
@@ -53,9 +116,18 @@ def create_atlas_qwen(model_dir, output_path):
     print(f"  Intermediate:{inter} Vocab:{vocab} Head_dim:{head_dim}")
     print(f"  RoPE theta:{rope_theta} Tie embeddings:{tie_emb}")
 
-    with open(os.path.join(model_dir, 'model.safetensors.index.json')) as f:
-        idx = json.load(f)
-    weight_map = idx['weight_map']
+    idx_path = os.path.join(model_dir, 'model.safetensors.index.json')
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            idx = json.load(f)
+        weight_map = idx['weight_map']
+    else:
+        from safetensors import safe_open
+        weight_map = {}
+        sf_path = os.path.join(model_dir, 'model.safetensors')
+        with safe_open(sf_path, framework='np') as sf:
+            for k in sf.keys():
+                weight_map[k] = 'model.safetensors'
 
     # Build ordered tensor list (Qwen3 -> ATLAS naming)
     # Order: per-layer tensors, then global tensors
@@ -154,11 +226,14 @@ def create_atlas_qwen(model_dir, output_path):
             is_ternary = 'proj' in name and 'weight' in name
 
             if is_ternary:
-                scale_val, data_bytes, packed_per_row = ternarize(tensor)
-                scale_prefix = struct.pack('<e', float(scale_val))
-                data_bytes = scale_prefix + data_bytes
+                tensor = pre_shuffle_rows(tensor)
+                data_bytes, packed_per_row, n_blocks, block_size = ternarize_block_scaled(tensor)
+                # No scale prefix — scales are embedded in ternarize_block_scaled output
+                # data_bytes already contains [block_size:1][n_blocks:2][scales][packed_TQ1]
             else:
                 packed_per_row = 0
+                n_blocks = 0
+                block_size = 0
                 data_bytes = tensor.astype(np.float16).tobytes()
 
             if current_offset % 32 != 0:
@@ -167,7 +242,7 @@ def create_atlas_qwen(model_dir, output_path):
                 out.write(b'\x00' * pad)
 
             if is_ternary:
-                ttype = 0  # TQ1 packed
+                ttype = 5  # TQ1 packed with per-block scales (g128)
                 row_dim = tensor.shape[0]
             elif 'norm' in name or 'embed' in name:
                 ttype = 1  # FP16 vector

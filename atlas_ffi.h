@@ -32,6 +32,10 @@
 //   1 = float16 vector (norm) or matrix (embed)— 2 bytes per element
 //   2 = float16 matrix (lm_head) or vector (GQA scales)
 //   3 = int8-decoded (after decompress or mmap cache load). [2:scale_fp16][rows×dim:i8][rows:row_sums_i32]
+//   5 = TQ1 packed with per-block fp16 scales (Bonsai g128 format).
+//       Layout: [block_size:1][n_blocks:2][scales:n_blocks*2 bytes fp16][packed_TQ1].
+//       Block size is always 128 (g128). Scales apply per 128-column group.
+//       Uses matmul_tq1_block_reorder (never decompressed to int8).
 //
 // All float16 values use IEEE 754 binary16.
 

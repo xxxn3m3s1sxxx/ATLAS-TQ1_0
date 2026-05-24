@@ -410,6 +410,7 @@ class AtlasModel:
             for n in per_layer:
                 arrs.append(idx[f'model.layers.{L}.{n}'])
         self._layer_idx_arr = np.array(arrs, dtype=np.int32)
+        self._stride = stride
 
     def _get_rope_theta(self):
         with open(self._atlas_path, 'rb') as f:
@@ -615,7 +616,8 @@ class AtlasModel:
         seq_now = int(positions_arr.max()) + 1 if use_kvcache else B
 
         out = x.copy()
-        idx_slice = self._layer_idx_arr[layer_idx * 9 : (layer_idx + 1) * 9].copy()
+        stride = self._stride if hasattr(self, '_stride') else 9
+        idx_slice = self._layer_idx_arr[layer_idx * stride : (layer_idx + 1) * stride].copy()
         dll.atlas_forward(
             self.model_ptr,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
@@ -679,22 +681,15 @@ class AtlasModel:
     def generate(self, prompt, max_new_tokens=50, temperature=1.0,
                  top_k=40, top_p=0.9):
         try:
+            if isinstance(prompt, str):
+                prompt = [{"role": "user", "content": prompt}]
+            text = self._apply_chat_template(prompt)
             if self._use_cpp_tokenizer:
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                input_ids = self._cpp_encode(self._apply_chat_template(prompt))
+                input_ids = self._cpp_encode(text)
                 eos_id = self._eos_id
             elif self._tok is not None:
-                from transformers import PreTrainedTokenizerFast
-                tok = PreTrainedTokenizerFast(
-                    tokenizer_object=self._tok,
-                    chat_template=self._chat_template)
-                tok.add_special_tokens({"pad_token": "<|pad|>"})
-                if isinstance(prompt, str):
-                    prompt = [{"role": "user", "content": prompt}]
-                text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
-                input_ids = tok.encode(text)
-                eos_id = tok.eos_token_id
+                input_ids = self._tok.encode(text).ids
+                eos_id = self._eos_id
             else:
                 return "[TOKENIZER ERROR: No tokenizer available]"
         except Exception as e:
@@ -730,14 +725,14 @@ class AtlasModel:
             if self._use_cpp_tokenizer:
                 decoded = self._cpp_decode(output, skip_special=False)
             else:
-                decoded = tok.decode(output, skip_special_tokens=False)
+                decoded = self._tok.decode(output, skip_special_tokens=False)
             if any(stop in decoded for stop in stop_tokens):
                 break
 
         if self._use_cpp_tokenizer:
             text = self._cpp_decode(output)
         else:
-            text = tok.decode(output, skip_special_tokens=True)
+            text = self._tok.decode(output, skip_special_tokens=True)
         for stop in stop_tokens:
             idx = text.find(stop)
             if idx >= 0:
