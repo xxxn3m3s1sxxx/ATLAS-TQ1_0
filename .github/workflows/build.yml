@@ -47,6 +47,14 @@ jobs:
         shell: pwsh
         run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "C:\Program Files\LLVM\lib\libomp.lib"
 
+      - name: Smoke test (Python)
+        if: runner.os != 'Windows'
+        run: python tests/ci_smoke.py
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: python tests/ci_smoke.py
+
       - name: Upload artifact (release only)
         if: github.event_name == 'release'
         uses: actions/upload-artifact@v4
