@@ -64,13 +64,19 @@ jobs:
           # Add to PATH for runtime loading
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Smoke test (Linux)
+      - name: Smoke test + pytest (Linux)
         if: runner.os == 'Linux'
-        run: python tests/ci_smoke.py
+        run: |
+          python tests/ci_smoke.py
+          pip install --quiet pytest
+          python -m pytest tests/test_dll.py -v
 
-      - name: Smoke test (macOS)
+      - name: Smoke test + pytest (macOS)
         if: runner.os == 'macOS'
-        run: python tests/ci_smoke.py
+        run: |
+          python tests/ci_smoke.py
+          pip install --quiet pytest
+          python -m pytest tests/test_dll.py -v
 
       - name: Smoke test + pytest (Windows)
         if: runner.os == 'Windows'
