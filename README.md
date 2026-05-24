@@ -16,12 +16,24 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
-| Bonsai-1.7B-Chat | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
-| Bonsai-4B-Chat | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
+| Ternary-Bonsai-1.7B-unpacked | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
+| Ternary-Bonsai-4B-unpacked | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
+| Ternary-Bonsai-8B-unpacked | ~3 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
+Ternary-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B/8B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
 All v5/v6 `.atlas` format — embeds tokenizer (v6: binary pool-lookup decode, no external deps).
+
+### Model Sources
+
+| Model (source) | HF Repo |
+|----------------|---------|
+| Ternary-Bonsai | `prism-ml/Ternary-Bonsai-*-unpacked` (FP16 safetensors, needs repacking) |
+| Ternary-Bonsai | `prism-ml/Ternary-Bonsai-*-gguf` (GGUF, for llama.cpp) |
+| Ternary-Bonsai | `prism-ml/Ternary-Bonsai-*-mlx-2bit` (MLX, for Apple Silicon) |
+| Falcon3 | `tiiuae/Falcon3-*-Instruct` (must be ternarized via ATLAS packer) |
+
+All are Apache 2.0 licensed.
 
 ## Quick Start
 
