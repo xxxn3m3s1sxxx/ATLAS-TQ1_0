@@ -42,6 +42,8 @@ All are Apache 2.0 licensed.
 pip install numpy
 # For repacking models from safetensors:
 pip install numpy safetensors transformers
+# SSE web server (optional):
+pip install fastapi uvicorn
 ```
 
 ### Generate (C++ core)
