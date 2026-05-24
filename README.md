@@ -253,4 +253,4 @@ All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass cohe
 
 ## License
 
-Code: Apache 2.0. BitNet b1.58: Microsoft Research. Falcon3: TII (subject to [TII Falcon License 1.0](https://falconllm.tii.ae/)).
+Code: Apache 2.0. BitNet b1.58: Microsoft Research. Falcon3: TII ([TII Falcon License 1.0](https://falconllm.tii.ae/)). Ternary-Bonsai: PrismML (Apache 2.0).
