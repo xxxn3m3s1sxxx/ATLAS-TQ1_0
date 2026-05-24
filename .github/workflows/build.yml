@@ -78,6 +78,7 @@ jobs:
         run: |
           $env:KMP_DUPLICATE_LIB_OK="TRUE"
           python tests/ci_smoke.py
+          pip install pytest
           python -m pytest tests/ -v
 
       - name: Upload artifact (release only)
