@@ -6,7 +6,7 @@
 
 CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **v2.4.1**: Full Bonsai/Qwen3 support — YaRN RoPE, QK-Norm, Tie Embeddings, per-row block-scaled TQ1 (g128), 5 critical C++ bugs fixed, 10× Bonsai speedup via int8 cache.
+> ⚡ **v2.6.0**: SSE Web-Server (`atlas_server.py`), prompt caching with `reset_cache()`, CI Pipeline (Ubuntu/Windows/macOS), v2.5.0 ring buffer + NTK context extension (8K Falcon3, 16K Bonsai).
 
 ## Supported Models
 
@@ -150,18 +150,19 @@ model.set_num_threads(4)
 | `set_use_hybrid_matmul(bool)` | Toggle hybrid FFN-int8 + QKV-packed mode (default). |
 | `set_use_packed_matmul(bool)` | Toggle full TQ1-packed mode (all matmuls, no decompress). |
 | `set_base_seq_len(int)` | Set trained context length for NTK scaling (v2.5.0). |
+| `set_max_seq_len(int)` | Set ring buffer window size per session (v2.5.0). |
 | `reset_cache()` | Zero KV cache — start fresh conversation (v2.6.0). |
 
 ## Performance
 
-### v2.4.1 — Current (Bonsai + Bugfix Release)
+### v2.6.0 — Current (SSE Web-Server + Prompt-Caching + CI Pipeline)
 
 Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). `generate_c()` at T=0, 30 tokens, warm. All models produce correct output at T=0.
 
 | Model | Mode | tok/s | Quality (T=0) |
 |-------|------|:-----:|---------------|
 | **Falcon3-3B** | hybrid+int8 | 4.3 | "Paris. Paris is a city in France." |
-| **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is **Paris**." |
+| **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is Paris." |
 | **Bonsai-1.7B** | hybrid+int8 | 19.2 | "The capital of France is Paris." |
 | **Bonsai-4B** | hybrid+int8 | **15.2** | "The capital of France is Paris." |
 
@@ -227,20 +228,23 @@ All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass cohe
 
 | File | Purpose |
 |------|---------|
+| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer, int8 KV-cache) — single source for Windows + Linux |
+| `atlas_ffi.h` | C API contract |
+| `atlas_infer.py` | Python `AtlasModel` class — `generate_c()`, `generate_stream()`, chat, caching |
+| `atlas_server.py` | FastAPI SSE Web-Server — `/v1/chat/completions`, `/health`, `/reset` (v2.6.0) |
 | `atlas_packer.py` | Falcon3 safetensors → TQ1 v5/v6 (embedded + optional binary tokenizer) |
 | `atlas_packer_bonsai.py` | Bonsai/Qwen3 safetensors → g128 block-scaled TQ1 (ttype=5, per-row per-block fp16 scales) |
-| `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
-| `atlas_infer.py` | Python inference engine |
-| `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer, int8 KV-cache) |
-| `atlas_ffi.h` | C API contract |
-| `falcon3-{1,3,7,10}b-tq1.atlas` | Packed Falcon3 models |
-| `bonsai-{1.7,4}b-tq1-g128.atlas` | Packed Bonsai/Qwen3 models (g128 block-scaled) |
 | `atlas_pack.py` | Unified CLI — autodetects model family, dispatches to correct packer |
+| `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
+| `tests/` | pytest suite, CI smoke test, regression tests |
+| `.github/workflows/build.yml` | CI Pipeline — GitHub Actions build on Ubuntu/Windows/macOS |
 
 ## Version History
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.6.0** | **SSE Web-Server + Prompt-Caching + CI Pipeline**: `atlas_server.py` — FastAPI `/v1/chat/completions` (SSE streaming), `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialized cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). Ring buffer + NTK context extension validated (8K Falcon3, 16K Bonsai-4B). |
+| **v2.5.0** | **Context Window Extension**: Ring buffer KV cache (modulo `max_seq_len`), NTK-aware frequency scaling (`ctx_scale = max_seq_len / base_seq_len`), `set_base_seq_len()` API, dynamic `max_seq_len` per generate call. |
 | **v2.4.1** | Static analysis bughunt (5 C++ bugs), ttype=5 int8 decompress for Bonsai (10× speedup), unified packer CLI, `generate()` chat template fix, repo cleanup |
 | **v2.4.0** | Qwen3/Bonsai-4B TQ1.0 support — head_dim=128, QK-Norm, YaRN RoPE, Tie Embeddings, dynamic vocab |
 | **v2.3.1** | Windows packer hotfix (`out.flush()` before `seek`), 7B v6 repair |

@@ -2,12 +2,12 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "atlas_api.cpp"
       - "atlas_ffi.h"
   pull_request:
-    branches: [main]
+    branches: [master]
     paths:
       - "atlas_api.cpp"
       - "atlas_ffi.h"
@@ -47,13 +47,21 @@ jobs:
         shell: pwsh
         run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "C:\Program Files\LLVM\lib\libomp.lib"
 
-      - name: Smoke test (Python)
-        if: runner.os != 'Windows'
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
         run: python tests/ci_smoke.py
 
-      - name: Smoke test (Windows)
-        if: runner.os == 'Windows'
+      - name: Smoke test (macOS)
+        if: runner.os == 'macOS'
         run: python tests/ci_smoke.py
+
+      - name: Smoke test + pytest (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:KMP_DUPLICATE_LIB_OK="TRUE"
+          python tests/ci_smoke.py
+          python -m pytest tests/ -v
 
       - name: Upload artifact (release only)
         if: github.event_name == 'release'
