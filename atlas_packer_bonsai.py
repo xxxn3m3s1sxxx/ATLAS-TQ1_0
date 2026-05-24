@@ -289,6 +289,6 @@ def create_atlas_qwen(model_dir, output_path):
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: python atlas_packer_qwen.py <model_dir> <output.atlas>")
+        print("Usage: python atlas_packer_bonsai.py <model_dir> <output.atlas>")
         sys.exit(1)
     create_atlas_qwen(sys.argv[1], sys.argv[2])

@@ -478,8 +478,8 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     // EOS/PAD IDs from header (bytes 45-52), fallback to defaults
     uint32_t eos_val; memcpy(&eos_val, hdr+45, 4);
     uint32_t pad_val; memcpy(&pad_val, hdr+49, 4);
-    if (eos_val != 0 || hdr[45]|hdr[46]|hdr[47]|hdr[48]) m->eos_id = (int)eos_val;
-    if (pad_val != 0 || hdr[49]|hdr[50]|hdr[51]|hdr[52]) m->pad_id = (int)pad_val;
+    if (eos_val != 0) m->eos_id = (int)eos_val;
+    if (pad_val != 0) m->pad_id = (int)pad_val;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,

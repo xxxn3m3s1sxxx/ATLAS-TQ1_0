@@ -232,13 +232,14 @@ Twelve additional bugs found and fixed during the v2.0.x cycle:
 
 ### Verification
 
-All four Falcon3 models (1B, 3B, 7B, 10B) pass coherence: "The capital of France is Paris." at T=0 across all 3 matmul modes (12/12 test passes). The 1B model requires sampling (T ≥ 0.7) — greedy decoding degenerates due to model-inherent distribution (`"` with p=0.43), not engine.
+All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass coherence: "The capital of France is Paris." at T=0. The 1B model requires sampling (T ≥ 0.7) — greedy decoding degenerates due to model-inherent distribution.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `atlas_packer.py` | safetensors → TQ1 v5/v6 (embedded tokenizer + optional binary tokenizer block) |
+| `atlas_packer.py` | Falcon3 safetensors → TQ1 v5/v6 (embedded + optional binary tokenizer) |
+| `atlas_packer_bonsai.py` | Bonsai/Qwen3 safetensors → g128 block-scaled TQ1 (ttype=5, per-row per-block fp16 scales) |
 | `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
 | `atlas_infer.py` | Python inference engine |
 | `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer, int8 KV-cache) |
