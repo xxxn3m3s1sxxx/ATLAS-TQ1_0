@@ -87,66 +87,13 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). `generate_c()`
 
 Bonsai-1.7B defaults to f32 bypass (hidden=2048). Quantized hybrid yields higher throughput with minor quantization noise.
 
-### Earlier Benchmarks (v2.2.2, Falcon3 only)
-
-Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3, 16 GB DDR4). All benchmarks via `m.generate_c()` at 30 tokens, warm.
-
-### v2.2.2 — Three Matmul Modes (+ F16C in attention score + weighted sum)
-
-| Mode | 1B | 3B | 7B | 10B |
-|------|:--:|:--:|:--:|:---:|
-| **Hybrid** (FFN int8 + QKV packed) | 17.6 tok/s | 5.3 tok/s | 9.2 tok/s | **11.0 tok/s** |
-| **Int8** (full cache) | 17.4 tok/s | **5.5 tok/s** | **14.5 tok/s** | 8.8 tok/s |
-| **Packed** (decode on-the-fly) | 15.8 tok/s | 3.3 tok/s | 10.2 tok/s | 6.4 tok/s |
-
-#### Architectural Analysis
-
-These numbers reflect the interplay of SIMD throughput, cache pressure, and memory bandwidth for each model size:
-
-- **1B (f32 bypass class):** Mode is irrelevant (15.8–17.6 tok/s). The f32 bypass (`hidden ≤ 2048`) eliminates activation quantization entirely. Matmuls are small enough that the CPU processes them in register — neither memory bandwidth nor cache eviction is a bottleneck.
-
-- **7B (int8 dominance):** Int8 reaches **14.5 tok/s**, outperforming hybrid (9.2) by 58%. The intermediate dimension (23040 = 7.5× hidden) creates enormous FFN matmuls that benefit from full `vpmaddubs_epi16` SIMD throughput on already-paged-in data. Hybrid's packed QKV save memory but add decode overhead that doesn't offset the FFN compute gain.
-
-- **10B (hybrid dominance):** Hybrid leads at **11.0 tok/s** vs int8 (8.8). On the i7-7700T's 8 MB L3 cache, the full int8 path causes constant cache evictions across 40 layers. Hybrid's packed QKV slashes memory traffic by 5×, keeping the FFN-heavy pipeline fed and avoiding L3 thrashing.
-
-### v2.2.x Optimization Gains
-
-| Optimization | TQ1-LUT + F16C RMSNorm (v2.2.0) | BPE-PQ Tokenizer (v2.2.1) | F16C Attention (v2.2.2) |
-|---|---|---|---|
-| **3B** | ~30% throughput | 1401 tokens in 24ms | +5.7% |
-| **10B** | ~30% throughput | — | **+47%** |
-
-The F16C half-precision conversion intrinsics (`_mm256_cvtph_ps`) accelerated fp16→fp32 in RMSNorm (v2.2.0) and attention score/weighted sum (v2.2.2), providing the largest single-token speedups since hybrid mode.
-
 ### Hybrid Mode (default, v1.3.2+)
 
-Best speed/RAM balance. FFN projections (gate/up/down) run as decompressed int8 — they dominate compute. QKV/O projections stay in TQ1-packed format — they're memory-bound and benefit from 5× fewer bytes read. KV-cache uses int8 quantization with per-position scaling (v2.3.0).
+FFN projections (gate/up/down) run as decompressed int8 — they dominate compute. QKV/O projections stay in TQ1-packed format (5× fewer bytes read). Int8 KV-cache with per-position scaling (v2.3.0). For small models (hidden≤2048), f32 bypass auto-activates to eliminate activation quantization noise.
 
-For 1B (hidden=2048), the f32 bypass activates automatically to eliminate activation quantization noise.
+### Int8 Weight Cache
 
-### Int8 Weight Cache (Disk)
-
-On first load, a `.i8` companion file is created (decompressed int8 tensors). Subsequent loads mmap it directly — sub-second startup:
-
-| Model | Cold Load (decompress + save) | Warm Load (mmap) |
-|-------|:--------:|:---------:|
-| 1B | 4.5s | 0.8s |
-| 3B | 10.1s | 1.4s |
-
-### Packed Mode (v1.3.1, `use_packed_matmul=True`)
-
-Decodes TQ1→int8 on-the-fly per matmul. No cache file needed. Loads in **1.2s** (1B) to **11.9s** (10B). ~2-3× slower than hybrid but uses less RAM and requires no disk cache.
-
-### Load Times (First Load, including lm_head quantization + cache creation)
-
-| Model | Hybrid | Int8 (fresh) | Packed |
-|-------|:------:|:------------:|:------:|
-| 1B | 7.2s | 4.5s | 1.2s |
-| 3B | 13.6s | 10.1s | 2.3s |
-| 7B | 83.6s | 26.3s | 20.8s |
-| 10B | 119.2s | 25.0s | 11.9s |
-
-First load is dominated by decompression (TQ1→int8), lm_head quantization, and disk write. Subsequent loads with `.i8` cache mmap in under 2s.
+On first load, a `.i8` companion file is created (decompressed int8). Subsequent loads mmap it directly for sub-second startup. Bonsai models cache 196–252 tensors (~1.4–3.6 GB).
 
 ### Int8 KV-Cache (v2.3.0, Internal)
 

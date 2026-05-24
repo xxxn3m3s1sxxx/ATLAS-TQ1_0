@@ -50,3 +50,10 @@ test_layer0.py
 .opencode/
 hashline.py
 opencode.json
+_check_cos*.py
+_cos_*.py
+_debug_names.py
+check_cos.py
+debug_*.py
+tmp_*.py
+tmp_*.pdf
