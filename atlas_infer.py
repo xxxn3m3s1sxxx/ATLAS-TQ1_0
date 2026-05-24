@@ -303,7 +303,10 @@ class AtlasModel:
         self._use_cpp_tokenizer = False
         self._eos_id = 0
         self._chat_template = None
-        self._is_qwen3 = (self.head_dim <= 128 or self.vocab_size > 131072)
+        # TriLM: base LLaMA with no chat format
+        self._is_trilm = (self.vocab_size <= 60000 and self.head_dim <= 128)
+        # Qwen3/Bonsai detection: not TriLM, and head_dim<=128 or large vocab (>131k)
+        self._is_qwen3 = (not self._is_trilm and (self.head_dim <= 128 or self.vocab_size > 131072))
         self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
@@ -935,8 +938,14 @@ class AtlasModel:
         Matches model-specific format:
         - Falcon3: <|role|>\ncontent\n  (EOS: <|endoftext|>)
         - Qwen3:   <|im_start|>role\ncontent<|im_end|>\n
+        - TriLM:   plain text (base model, no chat format)
         Bonsai: Qwen3 format + enable_thinking=False (empty <think> block).
         """
+        # TriLM: base LLaMA model — no chat formatting, just concatenate content
+        if self._is_trilm:
+            result = '\n'.join(m.get('content', '') for m in messages)
+            return result + '\n' if add_generation_prompt else result
+
         if self._is_qwen3:
             eos = '<|im_end|>'
             result = ""

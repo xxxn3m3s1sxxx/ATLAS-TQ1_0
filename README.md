@@ -18,7 +18,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
 | Ternary-Bonsai-1.7B-unpacked | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
 | Ternary-Bonsai-4B-unpacked | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
-| Ternary-Bonsai-8B-unpacked | 3.71 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 |
+| TriLM-3.9B | 3.28 GB | 30 | 3072 | 9216 | 24 | 24 | 50688 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 Ternary-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B/8B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
@@ -32,6 +32,7 @@ All v5/v6 `.atlas` format — embeds tokenizer (v6: binary pool-lookup decode, n
 | Ternary-Bonsai | `prism-ml/Ternary-Bonsai-*-gguf` (GGUF, for llama.cpp) |
 | Ternary-Bonsai | `prism-ml/Ternary-Bonsai-*-mlx-2bit` (MLX, for Apple Silicon) |
 | Falcon3 | `tiiuae/Falcon3-*-Instruct` (must be ternarized via ATLAS packer) |
+| TriLM | `SpectraSuite/TriLM_*_Unpacked` (FP16, natively ternary, needs repacking) |
 
 All are Apache 2.0 licensed.
 
@@ -98,6 +99,9 @@ python atlas_pack.py path/to/falcon3-model-dir
 
 # Bonsai: download from prism-ml/Ternary-Bonsai-*-unpacked
 python atlas_pack.py path/to/bonsai-model-dir
+
+# TriLM: download from SpectraSuite/TriLM_*_Unpacked (HF)
+python atlas_pack.py path/to/trilm-model-dir
 ```
 
 The CLI autodetects model family from `config.json` and generates the output filename automatically (e.g. `falcon3-10b-tq1.atlas` or `bonsai-4b-tq1-g128.atlas`). Requires `transformers` + `torch` for tokenizer config (install via `pip install -r requirements-dev.txt`).

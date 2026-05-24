@@ -21,9 +21,12 @@ def detect_model(model_dir):
     head_dim = cfg.get('head_dim', hidden // n_heads if n_heads else 128)
     vocab = cfg.get('vocab_size', 0)
 
+    # TriLM detection: LLaMA architecture (natively ternary FP16 weights)
+    is_trilm = (cfg.get('model_type') == 'llama')
+
     # Bonsai/Qwen3 detection: head_dim=128, vocab>131k, or qwen2 model_type
-    is_bonsai = (head_dim == 128 or vocab > 131072 or
-                 cfg.get('model_type', '').startswith('qwen'))
+    is_bonsai = (not is_trilm and (head_dim == 128 or vocab > 131072 or
+                 cfg.get('model_type', '').startswith('qwen')))
 
     # Estimate model size from params
     # Rough: ~2 * hidden * inter * n_layers (FFN) + 4 * hidden^2 * n_layers (attn)
@@ -42,7 +45,7 @@ def detect_model(model_dir):
         if best < 1:
             size_label = f"{best}B".replace('0.', '').replace('5B', '0.5B')
 
-    family = "bonsai" if is_bonsai else "falcon3"
+    family = "trilm" if is_trilm else ("bonsai" if is_bonsai else "falcon3")
 
     print(f"[ATLAS] Detected: {family.upper()} family, ~{size_label} params")
     print(f"         {n_layers}L {hidden}H {inter}I {n_heads}h hd={head_dim} vocab={vocab}")
@@ -54,8 +57,9 @@ def auto_output_name(model_dir, family, size_label):
     """Generate standard output filename."""
     name = os.path.basename(model_dir.rstrip('/\\')).lower()
     if family == "bonsai":
-        # Normalize: e.g. "bonsai-8b-tq1-g128.atlas"
         out = f"bonsai-{size_label.lower()}-tq1-g128.atlas"
+    elif family == "trilm":
+        out = f"trilm-{size_label.lower()}-tq1-g128.atlas"
     else:
         out = f"falcon3-{size_label.lower()}-tq1.atlas"
     return os.path.join(os.path.dirname(model_dir), out)
@@ -96,7 +100,10 @@ def main():
     print(f"[ATLAS] Packing {family.upper()} model...")
     print(f"[ATLAS] This may take several minutes.\n")
 
-    if family == "bonsai":
+    if family == "trilm":
+        from atlas_packer_trilm import create_atlas_trilm
+        create_atlas_trilm(model_dir, output_path)
+    elif family == "bonsai":
         from atlas_packer_bonsai import create_atlas_qwen
         create_atlas_qwen(model_dir, output_path)
     else:
@@ -113,7 +120,7 @@ def main():
             safetensors_path = single
         create_atlas_from_config(safetensors_path, output_path)
 
-    print(f"\n[ATLAS] Done → {output_path}")
+    print(f"\n[ATLAS] Done -> {output_path}")
 
     # Friendly next step
     print(f"\n  Try it:")
