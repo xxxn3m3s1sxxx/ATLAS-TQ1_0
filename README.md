@@ -46,30 +46,34 @@ pip install numpy safetensors transformers
 pip install fastapi uvicorn
 ```
 
-### Generate (C++ core)
+### C API
 
-```python
-from atlas_infer import AtlasModel
+```c
+#include "atlas_ffi.h"
+#include <stdio.h>
 
-model = AtlasModel('falcon3-10b-tq1.atlas')
+int main() {
+    void* model = atlas_load("falcon3-10b-tq1.atlas");
+    if (!model) { fprintf(stderr, "load failed\n"); return 1; }
 
-# Deterministic generation
-print(model.generate_c("What is the capital of France?", temperature=0.0))
+    // Tokenized prompt (use atlas_tokenizer_preencode + atlas_tokenizer_merge)
+    int input_ids[] = { 193, 6764, 13, 426, 16874, 30, 399, 16874, 8221 };
+    int n_input = sizeof(input_ids) / sizeof(input_ids[0]);
 
-# Sampling with repetition penalty
-model.set_seed(42)
-print(model.generate_c("Tell me about Paris", temperature=0.7, top_k=40, top_p=0.9, repetition_penalty=1.1))
+    int output_ids[256];
+    int n_out = atlas_generate(model, input_ids, n_input,
+                               4096, 200,          // max_seq_len, max_new_tokens
+                               0.7f, 40, 0.9f,     // temp, top_k, top_p
+                               1.1f,               // repetition_penalty
+                               output_ids);
+    if (n_out > 0) {
+        printf("Generated %d tokens\n", n_out);
+        // Decode via atlas_tokenizer_decode(...)
+    }
 
-# Streaming — yields token IDs, decode via _cpp_decode
-for token_id in model.generate_stream("Write a short poem", max_new_tokens=100):
-    print(model._cpp_decode([token_id]), end="", flush=True)
-
-# Chat with system prompt
-model.set_system_prompt("You are a helpful assistant.")
-messages = [
-    {"role": "user", "content": "What is the capital of France?"}
-]
-print(model.generate_c(messages, temperature=0.7))
+    atlas_free(model);
+    return 0;
+}
 ```
 
 ### Build from source
@@ -99,46 +103,6 @@ python atlas_pack.py path/to/bonsai-model-dir
 The CLI autodetects model family from `config.json` and generates the output filename automatically (e.g. `falcon3-10b-tq1.atlas` or `bonsai-4b-tq1-g128.atlas`). Requires `transformers` + `torch` for tokenizer config (install via `pip install -r requirements-dev.txt`).
 
 ## Python API
-
-```python
-from atlas_infer import AtlasModel
-
-model = AtlasModel("path/to/model.atlas")
-
-# Deterministic generation
-output = model.generate_c("Your prompt", temperature=0.0)
-
-# Sampling
-output = model.generate_c("Your prompt", temperature=0.7, top_k=40, top_p=0.9,
-                          max_new_tokens=200, repetition_penalty=1.1)
-
-# Streaming — yields token IDs (caller decodes)
-for token_id in model.generate_stream("Tell me a story", max_new_tokens=100):
-    print(model._cpp_decode([token_id]), end="", flush=True)
-
-# Chat with system prompt
-model.set_system_prompt("You are a helpful assistant.")
-messages = [{"role": "user", "content": "What is the capital of France?"}]
-print(model.generate_c(messages, temperature=0.7))
-
-# Prompt caching — cache persists across generate calls
-model.reset_cache()  # v2.6.0: Zero KV cache, start fresh
-
-# SSE Web-Server (v2.6.0)
-# $ python atlas_server.py --model path/to/model.atlas --port 8080
-# $ curl -N http://localhost:8080/v1/chat/completions \
-#     -H "Content-Type: application/json" \
-#     -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
-# $ curl -X POST http://localhost:8080/reset  # flush cache
-
-# Matmul mode control
-model.set_use_f32_matmul(True)    # pure float32 (reference, no quantization)
-model.set_use_hybrid_matmul(True) # FFN int8 + QKV packed (default)
-model.set_use_packed_matmul(True) # all TQ1-packed (slowest, for testing)
-
-# Thread control
-model.set_num_threads(4)
-```
 
 | Method | Description |
 |--------|-------------|
