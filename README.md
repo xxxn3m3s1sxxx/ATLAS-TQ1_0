@@ -18,10 +18,11 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
 | Ternary-Bonsai-1.7B-unpacked | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
 | Ternary-Bonsai-4B-unpacked | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
-| TriLM-3.9B | 3.28 GB | 30 | 3072 | 9216 | 24 | 24 | 50688 |
+| TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 Ternary-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B/8B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
+TriLM: LLaMA architecture, MHA, SwiGLU, RoPE, natively ternary (QAT).  
 All v5/v6 `.atlas` format — embeds tokenizer (v6: binary pool-lookup decode, no external deps).
 
 ### Model Sources
@@ -132,6 +133,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). `generate_c()`
 | Model | Mode | tok/s | Quality (T=0) |
 |-------|------|:-----:|---------------|
 | **Falcon3-3B** | hybrid+int8 | 4.3 | "Paris. Paris is a city in France." |
+| **TriLM-1.1B** | f32 bypass | **13.0** | "The capital of France is Paris." |
 | **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is Paris." |
 | **Bonsai-1.7B** | hybrid+int8 | 19.2 | "The capital of France is Paris." |
 | **Bonsai-4B** | hybrid+int8 | **15.2** | "The capital of France is Paris." |
@@ -192,7 +194,7 @@ safetensors → atlas_packer.py → .atlas file → atlas_infer.py → atlas.dll
 
 20+ bugs were discovered and fixed during development. See [BUGS.md](BUGS.md) for the full chronology — `fseek` 32-bit overflow, Base-3 vs 2-bit packing, K/V cache swap, RMSNorm truncation, stack overflow, and 15+ more.
 
-All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass coherence at T=0.
+All four Falcon3 models (1B, 3B, 7B, 10B), Bonsai models (1.7B, 4B), and TriLM-1.1B pass coherence at T=0.
 
 ## Files
 
