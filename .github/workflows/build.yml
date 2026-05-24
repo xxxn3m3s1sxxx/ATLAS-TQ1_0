@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "atlas_api.cpp"
+      - "atlas_ffi.h"
+  pull_request:
+    branches: [main]
+    paths:
+      - "atlas_api.cpp"
+      - "atlas_ffi.h"
+  release:
+    types: [published]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
+
+      - name: Install LLVM/Clang (macOS)
+        if: runner.os == 'macOS'
+        run: brew install llvm libomp
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: $(brew --prefix llvm)/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "C:\Program Files\LLVM\lib\libomp.lib"
+
+      - name: Upload artifact (release only)
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-${{ runner.os }}
+          path: |
+            atlas.dll
+            libatlas.so

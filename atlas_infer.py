@@ -74,6 +74,9 @@ dll.atlas_set_rope_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
 dll.atlas_set_base_seq_len.restype = None
 dll.atlas_set_base_seq_len.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
+dll.atlas_reset_cache.restype = None
+dll.atlas_reset_cache.argtypes = [ctypes.c_void_p]
+
 dll.atlas_set_layer_stride.restype = None
 dll.atlas_set_layer_stride.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
@@ -381,6 +384,11 @@ class AtlasModel:
         When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied."""
         dll.atlas_set_base_seq_len(self.model_ptr, seq_len)
         self._base_seq_len = seq_len
+
+    def reset_cache(self):
+        """v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
+        Call between conversations to prevent context leakage across sessions."""
+        dll.atlas_reset_cache(self.model_ptr)
 
     def set_max_seq_len(self, seq_len):
         """v2.5.0: Set max sequence length (ring buffer window size).

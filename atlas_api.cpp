@@ -1921,6 +1921,19 @@ ATLAS_API void atlas_set_base_seq_len(AtlasModel* m, int seq_len) {
     if (m && seq_len > 0) m->base_seq_len = seq_len;
 }
 
+// v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
+// Call between conversations to prevent context leakage across sessions.
+ATLAS_API void atlas_reset_cache(void* model) {
+    AtlasModel* m = (AtlasModel*)model;
+    if (!m || !m->k_cache) return;
+    size_t cache_bytes = (size_t)m->n_kv_heads * m->cache_max_seq_len * m->head_dim * m->n_layers;
+    size_t scale_bytes = (size_t)m->n_kv_heads * m->cache_max_seq_len * m->n_layers;
+    memset(m->k_cache, 0, cache_bytes);
+    memset(m->v_cache, 0, cache_bytes);
+    memset(m->k_scale_cache, 0, scale_bytes * sizeof(float));
+    memset(m->v_scale_cache, 0, scale_bytes * sizeof(float));
+}
+
 // ─── Helper: horizontal sum of __m256 float ──────────────────────────
 static inline float hsum_ps(__m256 v) {
     __m128 l = _mm256_castps256_ps128(v);

@@ -186,6 +186,10 @@ ATLAS_API void atlas_set_rope_scale(void* model, float scale);
 // When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied.
 ATLAS_API void atlas_set_base_seq_len(void* model, int seq_len);
 
+// v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
+// Call between conversations to prevent context leakage across sessions.
+ATLAS_API void atlas_reset_cache(void* model);
+
 // v2.4.0: Set layer stride — tensors per transformer layer.
 // 9 for Falcon3, 11 for Qwen3 (adds q_norm + k_norm).
 ATLAS_API void atlas_set_layer_stride(void* model, int stride);

@@ -119,6 +119,16 @@ model.set_system_prompt("You are a helpful assistant.")
 messages = [{"role": "user", "content": "What is the capital of France?"}]
 print(model.generate_c(messages, temperature=0.7))
 
+# Prompt caching — cache persists across generate calls
+model.reset_cache()  # v2.6.0: Zero KV cache, start fresh
+
+# SSE Web-Server (v2.6.0)
+# $ python atlas_server.py --model path/to/model.atlas --port 8080
+# $ curl -N http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+# $ curl -X POST http://localhost:8080/reset  # flush cache
+
 # Matmul mode control
 model.set_use_f32_matmul(True)    # pure float32 (reference, no quantization)
 model.set_use_hybrid_matmul(True) # FFN int8 + QKV packed (default)
@@ -139,6 +149,8 @@ model.set_num_threads(4)
 | `set_use_f32_matmul(bool)` | Toggle f32 bypass mode (auto-enabled for hidden≤2048). |
 | `set_use_hybrid_matmul(bool)` | Toggle hybrid FFN-int8 + QKV-packed mode (default). |
 | `set_use_packed_matmul(bool)` | Toggle full TQ1-packed mode (all matmuls, no decompress). |
+| `set_base_seq_len(int)` | Set trained context length for NTK scaling (v2.5.0). |
+| `reset_cache()` | Zero KV cache — start fresh conversation (v2.6.0). |
 
 ## Performance
 

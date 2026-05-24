@@ -98,6 +98,8 @@ void atlas_set_num_threads(int n);
 void atlas_set_use_hybrid_matmul(void* model, int enable);
 void atlas_set_use_packed_matmul(void* model, int enable);
 void atlas_set_use_f32_matmul(void* model, int enable);
+void atlas_set_base_seq_len(void* model, int seq_len);  // v2.5.0: NTK context base
+void atlas_reset_cache(void* model);                     // v2.6.0: Zero KV cache
 const char* atlas_get_tokenizer(void* model, int* size);
 ```
 
@@ -115,7 +117,7 @@ See `atlas_ffi.h` for full API.
 - **SwiGLU-Hotpath**: `gate`/`up` parallel berechnet, SiLU fusioniert — identisch zu Falcon3, kein Umbau nötig.
 - **Target**: Bonsai-4B TQ1.0 ~1.5 GB. Kompatibilität mit Qwen3 Familie.
 
-### v2.5.0 ✅ — Context Window Extension (AKTIV)
+### v2.5.0 ✅ — Context Window Extension (ABGESCHLOSSEN)
 - **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten `max_seq_len` Positionen. `seq_now` kann `max_seq_len` überschreiten — der Cache wickelt modulo `max_seq_len` und überschreibt die ältesten Einträge.
 - **NTK Context Extension**: `ctx_scale = max_seq_len / base_seq_len` kompoundiert mit `rope_scale` für NTK-aware Frequenzanpassung. Erlaubt sanfte Skalierung über die trainierte Kontextlänge hinaus (z.B. 4K→8K für Falcon3, 8K→16K für Bonsai-4B).
 - **`set_base_seq_len()` API**: Neue C-API + Python-Methode. `base_seq_len` = trainierte Kontextlänge (z.B. 4096 Falcon3, 2048 Bonsai-1.7B, 8192 Bonsai-4B). NTK-Scaling wird automatisch angewandt wenn `max_seq_len > base_seq_len`.
@@ -124,8 +126,10 @@ See `atlas_ffi.h` for full API.
 - **Target erreicht**: 8K Kontext auf Falcon3-3B getestet, 16K auf Bonsai-4B getestet. Ring Buffer für 128→200+ Token Wrapping validiert.
 
 ### v2.6.0 — Pipeline: SSE Web-Server + Prompt-Caching
-- **SSE Web-Server**: ~50 Zeilen FastAPI/SSE-Wrapper für HTTP-Streaming. Prompt-Caching per Session (KV-Cache persistiert über Generate-Aufrufe hinweg).
-- **Prompt-Caching**: KV-Cache nicht zwischen `atlas_generate`-Aufrufen löschen, sondern für wiederholte Prompts (System Prompt, Chat History) recyceln.
+- **SSE Web-Server**: `atlas_server.py` — FastAPI/SSE-Wrapper für HTTP-Streaming. `/v1/chat/completions` Endpoint, `StreamingResponse` für token-by-token SSE.
+- **Prompt-Caching**: KV-Cache persistiert über `generate_c`-Aufrufe hinweg. `asyncio.Lock()` serialisiert Zugriff. `POST /reset` zum manuellen Cache-Leeren.
+- **`atlas_reset_cache()` C-API**: Neue C-Funktion + Python `AtlasModel.reset_cache()`. Zeros KV-Cache-Daten, Allokation bleibt erhalten.
+- **CI Pipeline**: `.github/workflows/build.yml` — GitHub Actions Build-Test auf Ubuntu/Windows/macOS mit Clang/LLVM. Automatischer Build bei Push auf main.
 - **Target**: 10B Chat-Client mit sub-second Prefill für kurze Folgefragen.
 
 ### Deferred
@@ -135,6 +139,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.6.0** | **SSE Web-Server + Prompt-Caching**: `atlas_server.py` — FastAPI/SSE `/v1/chat/completions`, `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialisierter Cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). |
 | **v2.4.1** | **Static Analysis Bug Hunt**: 5 C++ bugs fixed (strict aliasing `*(uint16_t*)(odd_addr)`→memcpy, negative memset, unaligned AVX2 cast→pre-decoded float scales, thread-unsafe `static` buffers→`thread_local`). `atlas_decompress_all` now handles ttype=5 (g128 block-scaled) tensors — enables int8 cache for Bonsai models (10× speedup: 0.58→5.78 tok/s). Python `generate()` uses `_apply_chat_template()` for all paths (fixes Bonsai v5 template error). |
 | **v2.4.0** | **Qwen3/Bonsai-4B**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab (151669), EOS/PAD aus Header, Bonsai-4B Packer (`atlas_packer_qwen.py`). C++: `rope_scale`/`layer_stride`-Setters, `ensure_layer_idx` mit stride-11-Detektion, QK-Norm in `atlas_attention_f32`, NTK-YaRN in RoPE-Schleife. ✅ Falcon3-1B Regression, ✅ Bonsai-4B 100 Tokens (kein Crash). |
 | **v2.3.1** | **Windows MSVCRT File-Buffer Hotfix**: `out.flush()` vor `out.seek(64)` im `atlas_packer.py` hinzugefügt. Verhindert Directory-Korruption bei Modellen >2 GB (7B v6). 7B v6 lädt nun fehlerfrei und generiert korrekt. |
@@ -163,7 +168,9 @@ See `atlas_ffi.h` for full API.
 - `atlas_ffi.h` — C API declarations (v6 header layout)
 - `atlas_packer.py` — v5/v6 format writer for Falcon3 models
 - `atlas_packer_bonsai.py` — Block-scaled g128 packer for Bonsai/Qwen3 models
+- `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
+- `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
 
 ## Technical Details
 
