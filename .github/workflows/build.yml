@@ -44,7 +44,10 @@ jobs:
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
-        run: $(brew --prefix llvm)/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -L$LLVM_PREFIX/lib -lomp
+          echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
