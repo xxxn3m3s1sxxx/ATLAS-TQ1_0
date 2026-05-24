@@ -4,20 +4,24 @@
 
 # ATLAS — TQ1.0 Ternary Inference Engine
 
-CPU inference engine for Falcon3 BitNet b1.58 ternary-quantized models. Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
+CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **Architecture Scope:** ATLAS v2.3.1 is a hyper-optimized, dependency-free inference engine specifically tailored for **Falcon3 Ternary (1.58-bit) architectures** using an interleaved RoPE pattern and a fused SwiGLU loop.
+> ⚡ **v2.4.1**: Full Bonsai/Qwen3 support — YaRN RoPE, QK-Norm, Tie Embeddings, per-row block-scaled TQ1 (g128), 5 critical C++ bugs fixed, 10× Bonsai speedup via int8 cache.
 
 ## Supported Models
 
-| Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads |
-|-------|-----------|--------|--------|-------------|-------|----------|
-| Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 |
-| Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 |
-| Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 |
-| Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 |
+| Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab |
+|-------|-----------|--------|--------|-------------|-------|----------|-------|
+| Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 |
+| Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
+| Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
+| Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
+| Bonsai-1.7B-Chat | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
+| Bonsai-4B-Chat | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
 
-All use `head_dim=256`, `rope_theta=1000042`, GQA. v5/v6 `.atlas` format embeds tokenizer (v6: binary pool-lookup decode, no external deps) — no external files needed.
+Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
+Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
+All v5/v6 `.atlas` format — embeds tokenizer (v6: binary pool-lookup decode, no external deps).
 
 ## Quick Start
 
@@ -70,7 +74,22 @@ Requires Clang (Windows) or GCC (Linux) with OpenMP, AVX2+FMA.
 
 ## Performance
 
-Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3, 16 GB DDR4). All benchmarks via `m.generate_c()` at 30 tokens, warm (after 1+ runs). **All modes produce "Paris" at T=0** across all 4 models (coherence verified). Performance benchmarks shown below are from v2.2.2 — see version history for subsequent F16C/attention optimizations.
+### v2.4.1 — Current (Bonsai + Bugfix Release)
+
+Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). `generate_c()` at T=0, 30 tokens, warm. All models produce correct output at T=0.
+
+| Model | Mode | tok/s | Quality (T=0) |
+|-------|------|:-----:|---------------|
+| **Falcon3-3B** | hybrid+int8 | 4.3 | "Paris. Paris is a city in France." |
+| **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is **Paris**." |
+| **Bonsai-1.7B** | hybrid+int8 | 19.2 | "The capital of France is Paris." |
+| **Bonsai-4B** | hybrid+int8 | **15.2** | "The capital of France is Paris." |
+
+Bonsai-1.7B defaults to f32 bypass (hidden=2048). Quantized hybrid yields higher throughput with minor quantization noise.
+
+### Earlier Benchmarks (v2.2.2, Falcon3 only)
+
+Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3, 16 GB DDR4). All benchmarks via `m.generate_c()` at 30 tokens, warm.
 
 ### v2.2.2 — Three Matmul Modes (+ F16C in attention score + weighted sum)
 
