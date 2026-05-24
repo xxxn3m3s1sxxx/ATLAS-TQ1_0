@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Atlas Inference Engine v2.1.0 — End-to-end Falcon3 TQ1.0 generation."""
 import ctypes, struct, os, sys, time, json, queue, threading, numpy as np
-from safetensors import safe_open
 # v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
 # ─── Load C++ DLL ────────────────────────────────────────────────────────
@@ -227,6 +226,7 @@ class AtlasModel:
                 self.tensor_names.append(buf.value.decode())
         elif safetensors_path:
             # v3 fallback: read from safetensors
+            from safetensors import safe_open
             with safe_open(safetensors_path, framework='np', device='cpu') as f:
                 self.tensor_names = list(f.keys())
         else:
