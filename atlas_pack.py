@@ -30,15 +30,17 @@ def detect_model(model_dir):
     ffn_params = 3 * hidden * inter * n_layers
     attn_params = 4 * hidden * (n_heads * head_dim) * n_layers
     embed_params = hidden * vocab
-    total_params = (ffn_params + attn_params + embed_params) / 1e9
+    tie_embeddings = cfg.get('tie_word_embeddings', True)
+    lm_head_params = 0 if tie_embeddings else hidden * vocab
+    total_params = (ffn_params + attn_params + embed_params + lm_head_params) / 1e9
+    # Round to nearest standard size (tight tolerance to avoid overlap)
+    sizes = [0.5, 1, 1.7, 3, 4, 7, 8, 10, 14, 32, 70]
+    best = min(sizes, key=lambda s: abs(total_params - s))
     size_label = f"{total_params:.1f}B"
-    # Round to clean numbers
-    for size in [0.5, 1, 1.7, 3, 4, 7, 8, 10, 14, 32, 70]:
-        if abs(total_params - size) < size * 0.3:
-            size_label = f"{size:.0f}B".replace('.0', '')
-            if size < 1:
-                size_label = f"{size}B".replace('0.', '').replace('5B', '0.5B')
-            break
+    if abs(total_params - best) < best * 0.2:
+        size_label = f"{best:.0f}B".replace('.0', '')
+        if best < 1:
+            size_label = f"{best}B".replace('0.', '').replace('5B', '0.5B')
 
     family = "bonsai" if is_bonsai else "falcon3"
 
