@@ -50,9 +50,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "C:\Program Files\LLVM\lib\libomp.lib"
-          Copy-Item "C:\Program Files\LLVM\bin\libomp.dll" -Destination . -ErrorAction SilentlyContinue
-          Copy-Item "C:\Program Files\LLVM\bin\libc++.dll" -Destination . -ErrorAction SilentlyContinue
+          $llvmDir = if (Test-Path "C:\Program Files\LLVM") { "C:\Program Files\LLVM" } else { throw "LLVM not found" }
+          Write-Output "LLVM: $llvmDir"
+          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
+          # Add LLVM bin to PATH so libomp.dll is found at runtime
+          echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Get-ChildItem "$llvmDir\bin\libomp*" | Select-Object Name
 
       - name: Smoke test (Linux)
         if: runner.os == 'Linux'
