@@ -84,6 +84,18 @@ chmod +x compile-linux.sh && ./compile-linux.sh
 
 Requires Clang (Windows) or GCC (Linux) with OpenMP, AVX2+FMA.
 
+### Repacking from Safetensors
+
+```bash
+# Falcon3: download from tiiuae/Falcon3-*-Instruct
+python atlas_pack.py path/to/falcon3-model-dir
+
+# Bonsai: download from prism-ml/Ternary-Bonsai-*-unpacked
+python atlas_pack.py path/to/bonsai-model-dir
+```
+
+The CLI autodetects model family from `config.json` and generates the output filename automatically (e.g. `falcon3-10b-tq1.atlas` or `bonsai-4b-tq1-g128.atlas`). Requires `transformers` + `torch` for tokenizer config (install via `pip install -r requirements-dev.txt`).
+
 ## Performance
 
 ### v2.4.1 — Current (Bonsai + Bugfix Release)
@@ -256,12 +268,16 @@ All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass cohe
 | `atlas_infer.py` | Python inference engine |
 | `atlas_api.cpp` | C++ library (load, forward, matmul, attention, norms, binary tokenizer, int8 KV-cache) |
 | `atlas_ffi.h` | C API contract |
-| `falcon3-{1,3,7,10}b-tq1.atlas` | Packed models |
+| `falcon3-{1,3,7,10}b-tq1.atlas` | Packed Falcon3 models |
+| `bonsai-{1.7,4}b-tq1-g128.atlas` | Packed Bonsai/Qwen3 models (g128 block-scaled) |
+| `atlas_pack.py` | Unified CLI — autodetects model family, dispatches to correct packer |
 
 ## Version History
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.4.1** | Static analysis bughunt (5 C++ bugs), ttype=5 int8 decompress for Bonsai (10× speedup), unified packer CLI, `generate()` chat template fix, repo cleanup |
+| **v2.4.0** | Qwen3/Bonsai-4B TQ1.0 support — head_dim=128, QK-Norm, YaRN RoPE, Tie Embeddings, dynamic vocab |
 | **v2.3.1** | Windows packer hotfix (`out.flush()` before `seek`), 7B v6 repair |
 | **v2.3.0** | Int8 KV-Cache (fp16→int8, dynamic scaling, internal `ensure_cache()`), 10B@4K: 320→173 MB |
 | **v2.2.2** | F16C in attention score + weighted sum (batch `_mm256_cvtph_ps` + FMA), 10B +47%, 3B +5.7% |
