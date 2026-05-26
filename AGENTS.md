@@ -8,7 +8,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 - **TQ1.0 g128** (ttype=5): Per-row per-block fp16 scales (block_size=128), 16/128 = 0.125 b/w overhead. Used by Bonsai/Qwen3 models. Packed via `matmul_tq1_block_reorder`.
 - **4 matmul modes**: int8 (default, `vpmaddubs` SIMD), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
-- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B). Eliminates activation quantization noise.
+- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B) or `rope_theta >= 3M` (Bonsai-8B). Eliminates activation quantization noise.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
 - **128*row_sum correction**: Required for all uint8×int8 matmuls (activation quantization adds +128 bias).
 
@@ -30,7 +30,7 @@ Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B), YaRN factor=4
 
 **Windows (clang):**
 ```bash
-clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "C:\Program Files\LLVM\lib\libomp.lib"
+clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp
 ```
 
 **Linux (GCC/Clang):**
@@ -66,9 +66,9 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 |-------|-------------|:-----:|:--------------:|---------------|
 | **Bonsai-1.7B** | f32 bypass | **13.0** | 4K (f32) / 8K (NTK) | "The capital of France is Paris." |
 | **Bonsai-4B** | hybrid+int8 | **17.4** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
-| **Bonsai-8B** | hybrid+int8 | **2.59** | 8K (YaRN) / 16K (NTK) | Reasoning trace (CoT) |
+| **Bonsai-8B** | f32 bypass | **1.8** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent reasoning |
 
-Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Quantized hybrid mode yields 19.2 tok/s.
+Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B f32 bypass forced (rope_theta≥3M detection). Quantized hybrid mode yields 19.2 tok/s.
 
 ### Architecture Notes
 
@@ -139,6 +139,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: Reverted fused-kernel-only approach. All ttype=5 tensors decompressed to int8 at load. `f32_bypass` forced for block-scaled models (rope_theta≥3M or hidden≤2048) — no uint8+128 activation quant, no signal collapse. Bonsai-8B: 0.2→1.6-2.2 tok/s with perfect T=0.7 coherence. |
 | **v2.6.0** | **SSE Web-Server + Prompt-Caching**: `atlas_server.py` — FastAPI/SSE `/v1/chat/completions`, `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialisierter Cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). |
 | **v2.4.1** | **Static Analysis Bug Hunt**: 5 C++ bugs fixed (strict aliasing `*(uint16_t*)(odd_addr)`→memcpy, negative memset, unaligned AVX2 cast→pre-decoded float scales, thread-unsafe `static` buffers→`thread_local`). `atlas_decompress_all` now handles ttype=5 (g128 block-scaled) tensors — enables int8 cache for Bonsai models (10× speedup: 0.58→5.78 tok/s). Python `generate()` uses `_apply_chat_template()` for all paths (fixes Bonsai v5 template error). |
 | **v2.4.0** | **Qwen3/Bonsai-4B**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab (151669), EOS/PAD aus Header, Bonsai-4B Packer (`atlas_packer_qwen.py`). C++: `rope_scale`/`layer_stride`-Setters, `ensure_layer_idx` mit stride-11-Detektion, QK-Norm in `atlas_attention_f32`, NTK-YaRN in RoPE-Schleife. ✅ Falcon3-1B Regression, ✅ Bonsai-4B 100 Tokens (kein Crash). |

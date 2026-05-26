@@ -40,6 +40,13 @@ dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
 dll.atlas_decompress_all.restype = None
 dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
 
+try:
+    dll.atlas_decompress_ttype5.restype = None
+    dll.atlas_decompress_ttype5.argtypes = [ctypes.c_void_p]
+    _HAS_TTYPE5_DECOMPRESS = True
+except AttributeError:
+    _HAS_TTYPE5_DECOMPRESS = False
+
 dll.atlas_decompress_ffn.restype = None
 dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
 
@@ -254,12 +261,15 @@ class AtlasModel:
             print("[Atlas] Using direct TQ1-packed matmul (no int8 decompression)")
         elif use_hybrid_matmul:
             # v1.3.2: FFN int8 cache, QKV packed — best speed/RAM balance
-            # For small models (1B, hidden<=2048), decompress all tensors for f32 bypass
-            # (packed matmul + f32 bypass dispatch is non-deterministic)
+            # For small models (1B, hidden<=2048) and block-scaled models (Bonsai),
+            # decompress ALL tensors for f32_bypass (avoids uint8+128 signal collapse)
             dll.atlas_set_use_hybrid_matmul(self.model_ptr, 1)
-            if self.hidden <= 2048:
+            needs_f32 = self.hidden <= 2048 or self.rope_theta >= 3000000.0
+            if needs_f32:
                 dll.atlas_decompress_all(self.model_ptr)
-                print("[Atlas] 1B full int8 (QKV/O also decompressed for f32 bypass)")
+                if _HAS_TTYPE5_DECOMPRESS:
+                    dll.atlas_decompress_ttype5(self.model_ptr)
+                print("[Atlas] Full int8 (ttype=5 decompressed for f32 bypass)")
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
             else:
                 dll.atlas_decompress_ffn(self.model_ptr)
@@ -267,17 +277,21 @@ class AtlasModel:
             dll.atlas_prefetch_int8(self.model_ptr)
         else:
             # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
+            # Always decompress ttype=5 to int8 (no-op if none exist). Enables fast int8
+            # matmul + f32_bypass to avoid uint8+128 signal collapse on block-scaled models.
             cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
             if cache_loaded:
                 print("[Atlas] Loaded int8 weights from cache (mmap)")
             else:
                 dll.atlas_decompress_all(self.model_ptr)
+                if _HAS_TTYPE5_DECOMPRESS:
+                    dll.atlas_decompress_ttype5(self.model_ptr)
                 print("[Atlas] TQ1 tensors decoded to int8")
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)
-            # Enable full-precision matmul for small models (1B)
-            if self.hidden <= 2048:
+            # f32_bypass: always for small OR block-scaled models (no uint8+128 drift)
+            if self.hidden <= 2048 or self.rope_theta >= 3000000.0:
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
         # Max sequence length for KV cache ring buffer (v2.5.0: configurable)

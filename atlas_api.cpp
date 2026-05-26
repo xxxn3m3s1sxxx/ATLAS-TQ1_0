@@ -1074,7 +1074,9 @@ ATLAS_API void atlas_save_cache(AtlasModel* m, const char* atlas_path) {
         fprintf(stderr, "[CACHE] Write failed, deleting partial cache\n");
         remove(path);
     } else {
-        printf("[CACHE] Saved %d int8 tensors (%.1f MB)\n", n, cache_size / 1e6);
+        int n_saved = 0;
+        for (int i = 0; i < n; i++) if (offsets[i] >= 0) n_saved++;
+        printf("[CACHE] Saved %d/%d int8 tensors (%.1f MB)\n", n_saved, n, cache_size / 1e6);
     }
 }
 
@@ -1215,115 +1217,129 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
 }
 
 // ─── Decompress all TQ1 tensors to int8 in-place ──────────────────────
-// Frees packed data after decompression. Call after Python closes safetensors.
+// Handles ttype=0 (raw ternary) only.
+// ttype=5 (block-scaled) stays packed — fused kernel preserves per-block scales.
+// Call after Python closes safetensors.
 ATLAS_API void atlas_decompress_all(AtlasModel* m) {
     int total = 0;
     init_tq1_decode_lut();
     for (auto& t : m->tensors) {
-        if (t.ttype != 0 && t.ttype != 5) continue;
+        if (t.ttype != 0) continue;
         total++;
 
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
 
-        if (t.ttype == 5) {
-            // ─── ttype=5: dequantize per-block scales → re-quantize to int8 ───
-            int bs = t.block_size;
-            int nbk = t.n_blocks;
+        // ─── ttype=0: raw ternary {-1,0,1} decompression ───
+        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        new_data[0] = t.data[0];
+        new_data[1] = t.data[1];
 
-            const uint8_t* raw_scales = t.data + 3;
-            const uint8_t* packed = t.data + 3 + t.row_dim * nbk * 2;
+        int8_t* i8 = (int8_t*)(new_data + 2);
+        int32_t* rs = (int32_t*)(i8 + n_vals);
+        const uint8_t* packed = t.data + 2;
 
-            float* decoded_scales = (float*)malloc(t.row_dim * nbk * sizeof(float));
-            for (int i = 0; i < t.row_dim * nbk; i++) {
-                uint16_t sr; memcpy(&sr, raw_scales + i * 2, 2);
-                decoded_scales[i] = fp16_to_fp32(sr);
+        for (int r = 0; r < t.row_dim; r++) {
+            int sum = 0;
+            int pos = 0;
+            for (int c = 0; c < t.packed_cols; c++) {
+                const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                i8[r * input_dim + pos++] = l[0]; sum += l[0];
+                i8[r * input_dim + pos++] = l[1]; sum += l[1];
+                i8[r * input_dim + pos++] = l[2]; sum += l[2];
+                i8[r * input_dim + pos++] = l[3]; sum += l[3];
+                i8[r * input_dim + pos++] = l[4]; sum += l[4];
             }
-
-            float global_max = 1e-10f;
-            float* f32_row = (float*)alloca(input_dim * sizeof(float));
-
-            for (int r = 0; r < t.row_dim; r++) {
-                for (int c = 0; c < t.packed_cols; c++) {
-                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
-                    for (int t2 = 0; t2 < 5; t2++) {
-                        int col = c * 5 + t2;
-                        if (col >= input_dim) break;
-                        int blk = col / bs;
-                        float scale = decoded_scales[r * nbk + blk];
-                        f32_row[col] = (float)l[t2] * scale;
-                        float av = fabsf(f32_row[col]);
-                        if (av > global_max) global_max = av;
-                    }
-                }
-            }
-
-            float quant_scale = global_max / 127.0f;
-            float stored_scale = 127.0f / global_max;
-
-            uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
-            uint16_t scale_u16 = fp32_to_fp16(stored_scale);
-            memcpy(new_data, &scale_u16, 2);
-            int8_t* i8 = (int8_t*)(new_data + 2);
-            int32_t* rs = (int32_t*)(i8 + n_vals);
-
-            for (int r = 0; r < t.row_dim; r++) {
-                int pos = 0;
-                int sum = 0;
-                for (int c = 0; c < t.packed_cols; c++) {
-                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
-                    for (int t2 = 0; t2 < 5; t2++) {
-                        int col = c * 5 + t2;
-                        if (col >= input_dim) break;
-                        int blk = col / bs;
-                        float val = (float)l[t2] * decoded_scales[r * nbk + blk];
-                        int q = (int)(val / quant_scale + 0.5f);
-                        if (q < -127) q = -127;
-                        if (q > 127) q = 127;
-                        i8[r * input_dim + pos] = (int8_t)q;
-                        sum += q;
-                        pos++;
-                    }
-                }
-                rs[r] = sum;
-            }
-
-            free(decoded_scales);
-            if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
-            t.data = new_data;
-            t.data_size = 2 + n_vals + t.row_dim * 4;
-            t.ttype = 3;
-        } else {
-            // ─── ttype=0: raw ternary {-1,0,1} decompression ───
-            uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
-            new_data[0] = t.data[0];
-            new_data[1] = t.data[1];
-
-            int8_t* i8 = (int8_t*)(new_data + 2);
-            int32_t* rs = (int32_t*)(i8 + n_vals);
-            const uint8_t* packed = t.data + 2;
-
-            for (int r = 0; r < t.row_dim; r++) {
-                int sum = 0;
-                int pos = 0;
-                for (int c = 0; c < t.packed_cols; c++) {
-                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
-                    i8[r * input_dim + pos++] = l[0]; sum += l[0];
-                    i8[r * input_dim + pos++] = l[1]; sum += l[1];
-                    i8[r * input_dim + pos++] = l[2]; sum += l[2];
-                    i8[r * input_dim + pos++] = l[3]; sum += l[3];
-                    i8[r * input_dim + pos++] = l[4]; sum += l[4];
-                }
-                rs[r] = sum;
-            }
-
-            if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
-            t.data = new_data;
-            t.data_size = 2 + n_vals + t.row_dim * 4;
-            t.ttype = 3;
+            rs[r] = sum;
         }
+
+        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+        t.data = new_data;
+        t.data_size = 2 + n_vals + t.row_dim * 4;
+        t.ttype = 3;
     }
     printf("[ATLAS] Decompressed %d TQ1 tensors to int8\n", total);
+}
+
+// ─── Decompress ttype=5 (block-scaled) tensors to int8 ──────────────
+// Converts per-block fp16 scales → uniform int8 for f32_bypass path.
+// Only called for small models (hidden <= 2048) where f32_bypass avoids
+// the uint8+128 signal collapse amplification.
+ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
+    int total = 0;
+    init_tq1_decode_lut();
+    for (auto& t : m->tensors) {
+        if (t.ttype != 5) continue;
+        total++;
+
+        int input_dim = t.packed_cols * 5;
+        int n_vals = t.row_dim * input_dim;
+        int bs = t.block_size;
+        int nbk = t.n_blocks;
+
+        const uint8_t* raw_scales = t.data + 3;
+        const uint8_t* packed = t.data + 3 + t.row_dim * nbk * 2;
+
+        float* decoded_scales = (float*)malloc(t.row_dim * nbk * sizeof(float));
+        for (int i = 0; i < t.row_dim * nbk; i++) {
+            uint16_t sr; memcpy(&sr, raw_scales + i * 2, 2);
+            decoded_scales[i] = fp16_to_fp32(sr);
+        }
+
+        float global_max = 1e-10f;
+        float* f32_row = (float*)alloca(input_dim * sizeof(float));
+        for (int r = 0; r < t.row_dim; r++) {
+            for (int c = 0; c < t.packed_cols; c++) {
+                const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                for (int t2 = 0; t2 < 5; t2++) {
+                    int col = c * 5 + t2;
+                    if (col >= input_dim) break;
+                    int blk = col / bs;
+                    float scale = decoded_scales[r * nbk + blk];
+                    f32_row[col] = (float)l[t2] * scale;
+                    float av = fabsf(f32_row[col]);
+                    if (av > global_max) global_max = av;
+                }
+            }
+        }
+
+        float quant_scale = global_max / 127.0f;
+        float stored_scale = 127.0f / global_max;
+
+        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        uint16_t scale_u16 = fp32_to_fp16(stored_scale);
+        memcpy(new_data, &scale_u16, 2);
+        int8_t* i8 = (int8_t*)(new_data + 2);
+        int32_t* rs = (int32_t*)(i8 + n_vals);
+
+        for (int r = 0; r < t.row_dim; r++) {
+            int pos = 0;
+            int sum = 0;
+            for (int c = 0; c < t.packed_cols; c++) {
+                const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                for (int t2 = 0; t2 < 5; t2++) {
+                    int col = c * 5 + t2;
+                    if (col >= input_dim) break;
+                    int blk = col / bs;
+                    float val = (float)l[t2] * decoded_scales[r * nbk + blk];
+                    int q = (int)(val / quant_scale + 0.5f);
+                    if (q < -127) q = -127;
+                    if (q > 127) q = 127;
+                    i8[r * input_dim + pos] = (int8_t)q;
+                    sum += q;
+                    pos++;
+                }
+            }
+            rs[r] = sum;
+        }
+
+        free(decoded_scales);
+        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+        t.data = new_data;
+        t.data_size = 2 + n_vals + t.row_dim * 4;
+        t.ttype = 3;
+    }
+    printf("[ATLAS] Decompressed %d ttype=5 tensors to int8\n", total);
 }
 
 // ─── v1.3.2: Decompress only FFN tensors to int8 (gate/up/down) ────
@@ -1334,8 +1350,9 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
     init_tq1_decode_lut();
     for (size_t i = 0; i < m->tensors.size(); i++) {
         auto& t = m->tensors[i];
-        if (t.ttype != 0 && t.ttype != 5) continue;
+        if (t.ttype != 0) continue;
         // Check name: only decompress MLP tensors
+        // ttype=5 (block-scaled) handled directly by fused kernel — skip
         if (m->tensor_names.size() > i) {
             const std::string& name = m->tensor_names[i];
             if (name.find("mlp") == std::string::npos &&
@@ -1346,87 +1363,6 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
         total++;
-
-        // ─── ttype=5: dequantize per-block scales → re-quantize to int8 ───
-        if (t.ttype == 5) {
-            int bs = t.block_size;
-            int nbk = t.n_blocks;
-
-            // Read per-row fp16 block scales from packed header
-            // t.data: [block_size:1][n_blocks:2][scales: rows*nbk*2][packed_TQ1]
-            const uint8_t* raw_scales = t.data + 3;
-            const uint8_t* packed = t.data + 3 + t.row_dim * nbk * 2;
-
-            // Pre-decode all per-row per-block scales to float (avoids repeated unaligned fp16 reads)
-            float* decoded_scales = (float*)malloc(t.row_dim * nbk * sizeof(float));
-            for (int i = 0; i < t.row_dim * nbk; i++) {
-                uint16_t sr; memcpy(&sr, raw_scales + i * 2, 2);
-                decoded_scales[i] = fp16_to_fp32(sr);
-            }
-
-            // First pass: decode, dequantize, find global max_abs
-            float global_max = 1e-10f;
-            // Per-row float buffer (stack-small or reentrant; largest row dim = 9728)
-            float* f32_row = (float*)alloca(input_dim * sizeof(float));
-
-            for (int r = 0; r < t.row_dim; r++) {
-                // Decode TQ1 row r, dequantize with per-block scales
-                for (int c = 0; c < t.packed_cols; c++) {
-                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
-                    for (int t2 = 0; t2 < 5; t2++) {
-                        int col = c * 5 + t2;
-                        if (col >= input_dim) break;
-                        int blk = col / bs;
-                        float scale = decoded_scales[r * nbk + blk];
-                        f32_row[col] = (float)l[t2] * scale;
-                        float av = fabsf(f32_row[col]);
-                        if (av > global_max) global_max = av;
-                    }
-                }
-            }
-
-            float quant_scale = global_max / 127.0f;        // int8 quant step
-            float stored_scale = 127.0f / global_max;      // dequant: output / stored_scale = sum(act * f32)
-
-            // Allocate int8 buffer: [scale_fp16:2][int8: n_vals][row_sums: row_dim*4]
-            uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
-            // Store dequant scale: output = corrected * max_abs / (127 * stored_scale) = sum(act*f32)
-            uint16_t scale_u16 = fp32_to_fp16(stored_scale);
-            memcpy(new_data, &scale_u16, 2);
-            int8_t* i8 = (int8_t*)(new_data + 2);
-            int32_t* rs = (int32_t*)(i8 + n_vals);
-
-            // Second pass: re-quantize to int8
-            for (int r = 0; r < t.row_dim; r++) {
-                // Re-decode row r (repeat from first pass; trade memory for simplicity)
-                int pos = 0;
-                int sum = 0;
-                for (int c = 0; c < t.packed_cols; c++) {
-                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
-                    for (int t2 = 0; t2 < 5; t2++) {
-                        int col = c * 5 + t2;
-                        if (col >= input_dim) break;
-                        int blk = col / bs;
-                        float val = (float)l[t2] * decoded_scales[r * nbk + blk];
-                        int q = (int)(val / quant_scale + 0.5f);
-                        if (q < -127) q = -127;
-                        if (q > 127) q = 127;
-                        i8[r * input_dim + pos] = (int8_t)q;
-                        sum += q;
-                        pos++;
-                    }
-                }
-                rs[r] = sum;
-            }
-
-            // Replace packed data with int8 data
-            free(decoded_scales);
-            if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
-            t.data = new_data;
-            t.data_size = 2 + n_vals + t.row_dim * 4;
-            t.ttype = 3;
-            continue;
-        }
 
         // ─── ttype=0: raw ternary {-1,0,1} decompression ───
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
@@ -2083,7 +2019,8 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
 static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const uint8_t* act_u8, const float* max_abs,
-    float* output, int B) {
+    float* output, int B,
+    const float* act_f32_debug = nullptr) {
     init_tq1_decode_lut();
     int rows_packed = rows / 4;
 
@@ -2101,8 +2038,8 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
     #pragma omp parallel
     #endif
     {
-        int8_t* decode_buf = (int8_t*)malloc(4 * input_dim * sizeof(int8_t));
-        int32_t* blk_sums = (int32_t*)malloc(n_blocks * 4 * sizeof(int32_t));
+        int8_t* decode_buf = (int8_t*)calloc(4 * input_dim, sizeof(int8_t));
+        int32_t* blk_sums = (int32_t*)calloc(n_blocks * 4, sizeof(int32_t));
 
         #ifdef _OPENMP
         #pragma omp for
@@ -2173,7 +2110,212 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
         free(decode_buf);
         free(blk_sums);
     }
+
+#ifdef ATLAS_DEBUG_TTYPE5
+    if (act_f32_debug != nullptr) {
+        float* ref = (float*)malloc(rows * sizeof(float));
+        double total_sq_err = 0, max_rel = 0;
+        int count = 0;
+        for (int b = 0; b < B; b++) {
+            for (int r = 0; r < rows; r++) {
+                const uint8_t* w = packed + r * packed_cols;
+                const float* act = act_f32_debug + b * input_dim;
+                const float* rs = block_scales + r * n_blocks;
+                double dot = 0.0;
+                for (int c = 0; c < packed_cols; c++) {
+                    const int8_t* l = tq1_decode[w[c]];
+                    for (int t = 0; t < 5; t++) {
+                        int col = c * 5 + t;
+                        if (col >= input_dim) break;
+                        dot += (double)act[col] * (double)l[t] * (double)rs[col / block_size];
+                    }
+                }
+                ref[r] = (float)dot;
+            }
+            const float* out_b = output + b * rows;
+            for (int r = 0; r < rows; r++) {
+                int ur = r / 4, sub = r % 4;
+                float actual = out_b[sub * rows_packed + ur];
+                float diff = actual - ref[r];
+                double rel = fabsf(diff) / (fabsf(ref[r]) + 1e-10f);
+                total_sq_err += (double)diff * diff;
+                count++;
+                if (rel > max_rel) max_rel = rel;
+            }
+        }
+        if (count > 0) {
+            printf("[TQ5-DEBUG] mse=%.8f max_rel_err=%.6f rows=%d B=%d dim=%d\n",
+                   (float)(total_sq_err / count), (float)max_rel, rows, B, input_dim);
+        }
+        free(ref);
+    }
+#endif
+
     free(block_scales);
+}
+
+// ─── v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant ───
+// act_f32: [B, input_dim] raw float activations (no pre-quantization needed)
+// tensor_data: ttype=5 TQ1-packed weights + per-row per-block fp16 scales
+// output: [B, rows] reordered float output
+// Fuses: per-token max_abs → symmetric int8 → _mm256_sign_epi8 ternary matmul
+//        → per-block fp16 scale → per-token dequant (scale_x)
+// No uint8+128 offset, no row_sum correction. Eliminates the 14912× signal collapse.
+static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32,
+    float* output, int B) {
+    init_tq1_decode_lut();
+    int rows_packed = rows / 4;
+
+    const uint8_t* scale_data = tensor_data + 3;
+    const uint8_t* packed = tensor_data + 3 + rows * n_blocks * 2;
+
+    // thread_local persistent buffers (v2.7.5: eliminate per-call malloc)
+    static thread_local float* tl_block_scales = nullptr;
+    static thread_local size_t tl_block_scales_cap = 0;
+    static thread_local int8_t* tl_act_s8 = nullptr;
+    static thread_local size_t tl_act_s8_cap = 0;
+    static thread_local float* tl_scale_x = nullptr;
+    static thread_local size_t tl_scale_x_cap = 0;
+
+    // Pre-decode per-row per-block scales to float
+    size_t need_bs = (size_t)rows * n_blocks;
+    if (need_bs > tl_block_scales_cap) {
+        free(tl_block_scales);
+        tl_block_scales = (float*)malloc(need_bs * sizeof(float));
+        tl_block_scales_cap = need_bs;
+    }
+    float* block_scales = tl_block_scales;
+    for (int i = 0; i < rows * n_blocks; i++) {
+        uint16_t sr; memcpy(&sr, scale_data + i * 2, 2);
+        block_scales[i] = fp16_to_fp32(sr);
+    }
+
+    // Step 1: Quantize activations to symmetric int8 (per-token, no +128 offset)
+    size_t need_as = (size_t)B * input_dim;
+    if (need_as > tl_act_s8_cap) {
+        free(tl_act_s8);
+        tl_act_s8 = (int8_t*)malloc(need_as * sizeof(int8_t));
+        tl_act_s8_cap = need_as;
+    }
+    int8_t* act_s8 = tl_act_s8;
+    if ((size_t)B > tl_scale_x_cap) {
+        free(tl_scale_x);
+        tl_scale_x = (float*)malloc((size_t)B * sizeof(float));
+        tl_scale_x_cap = B;
+    }
+    float* scale_x = tl_scale_x;
+    for (int b = 0; b < B; b++) {
+        const float* act = act_f32 + b * input_dim;
+        float max_val = 1e-5f;
+        for (int i = 0; i < input_dim; i++) {
+            float av = fabsf(act[i]);
+            if (av > max_val) max_val = av;
+        }
+        scale_x[b] = max_val / 127.0f;
+        float inv = 127.0f / max_val;
+        int8_t* aq = act_s8 + b * input_dim;
+        for (int i = 0; i < input_dim; i++) {
+            int q = (int)(act[i] * inv + 0.5f);
+            if (q < -127) q = -127;
+            if (q > 127) q = 127;
+            aq[i] = (int8_t)q;
+        }
+    }
+
+    // Step 2: TQ1 decode + ternary matmul via _mm256_sign_epi8
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+        static thread_local int8_t* tl_decode_buf = nullptr;
+        static thread_local size_t tl_decode_buf_cap = 0;
+        size_t need_db = (size_t)4 * input_dim;
+        if (need_db > tl_decode_buf_cap) {
+            free(tl_decode_buf);
+            tl_decode_buf = (int8_t*)malloc(need_db * sizeof(int8_t));
+            tl_decode_buf_cap = need_db;
+            memset(tl_decode_buf, 0, need_db * sizeof(int8_t));
+        }
+        int8_t* decode_buf = tl_decode_buf;
+
+        #ifdef _OPENMP
+        #pragma omp for
+        #endif
+        for (int ur = 0; ur < rows_packed; ur++) {
+            // Decode TQ1 weights for 4 rows (same block_size/n_blocks as old kernel)
+            for (int sub = 0; sub < 4; sub++) {
+                const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
+                int8_t* row = decode_buf + sub * input_dim;
+                for (int c = 0; c < packed_cols; c++) {
+                    const int8_t* l = tq1_decode[w[c]];
+                    int col = c * 5;
+                    if (col < input_dim) row[col] = l[0];
+                    if (col + 1 < input_dim) row[col + 1] = l[1];
+                    if (col + 2 < input_dim) row[col + 2] = l[2];
+                    if (col + 3 < input_dim) row[col + 3] = l[3];
+                    if (col + 4 < input_dim) row[col + 4] = l[4];
+                }
+            }
+
+            for (int b = 0; b < B; b++) {
+                const int8_t* act = act_s8 + b * input_dim;
+                float out4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+                for (int sub = 0; sub < 4; sub++) {
+                    int shuffled_r = ur * 4 + sub;
+                    const float* rscales = block_scales + shuffled_r * n_blocks;
+                    const int8_t* row = decode_buf + sub * input_dim;
+
+                    for (int blk = 0; blk < n_blocks; blk++) {
+                        int blk_start = blk * block_size;
+                        int blk_end = blk_start + block_size;
+                        if (blk_end > input_dim) blk_end = input_dim;
+
+                        __m256i acc = _mm256_setzero_si256();
+                        int j = blk_start;
+                        for (; j + 32 <= blk_end; j += 32) {
+                            __m256i av = _mm256_loadu_si256((const __m256i*)(act + j));
+                            __m256i wv = _mm256_loadu_si256((const __m256i*)(row + j));
+                            __m256i prod = _mm256_sign_epi8(av, wv);
+
+                            __m128i lo = _mm256_castsi256_si128(prod);
+                            __m128i hi = _mm256_extracti128_si256(prod, 1);
+                            __m256i lo16 = _mm256_cvtepi8_epi16(lo);
+                            __m256i hi16 = _mm256_cvtepi8_epi16(hi);
+                            __m256i sum32 = _mm256_add_epi32(
+                                _mm256_madd_epi16(lo16, _mm256_set1_epi16(1)),
+                                _mm256_madd_epi16(hi16, _mm256_set1_epi16(1)));
+                            acc = _mm256_add_epi32(acc, sum32);
+                        }
+
+                        int32_t dot;
+                        {
+                            __m128i l = _mm256_castsi256_si128(acc);
+                            __m128i h = _mm256_extracti128_si256(acc, 1);
+                            l = _mm_add_epi32(l, h);
+                            l = _mm_hadd_epi32(l, l);
+                            l = _mm_hadd_epi32(l, l);
+                            dot = _mm_cvtsi128_si32(l);
+                        }
+                        for (; j < blk_end; j++) {
+                            dot += (int32_t)act[j] * (int32_t)row[j];
+                        }
+
+                        out4[sub] += (float)dot * rscales[blk];
+                    }
+                }
+
+                float deq = scale_x[b];
+                float* dst = output + b * rows;
+                dst[0 * rows_packed + ur] = out4[0] * deq;
+                dst[1 * rows_packed + ur] = out4[1] * deq;
+                dst[2 * rows_packed + ur] = out4[2] * deq;
+                dst[3 * rows_packed + ur] = out4[3] * deq;
+            }
+        }
+    }
 }
 
 // ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
@@ -2325,25 +2467,24 @@ static void forward_layer_internal(
 
     auto& tv = m->tensors[idx_v];
     if (tq.ttype == 5) {
-        // v2.4.1: Block-scaled TQ1 (Bonsai g128 format)
-        quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
+        // v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant
         {
             auto& t = m->tensors[idx_q];
-            matmul_tq1_block_reorder(t.row_dim, max_qkv_dim, t.packed_cols,
+            matmul_tq1_block_fused_s8(t.row_dim, max_qkv_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
-                m->buf_i8, max_abs, m->buf_gate, B);
+                m->buf_act, m->buf_gate, B);
         }
         {
             auto& t = m->tensors[idx_k];
-            matmul_tq1_block_reorder(t.row_dim, max_qkv_dim, t.packed_cols,
+            matmul_tq1_block_fused_s8(t.row_dim, max_qkv_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
-                m->buf_i8, max_abs, m->buf_hidden, B);
+                m->buf_act, m->buf_hidden, B);
         }
         {
             auto& t = m->tensors[idx_v];
-            matmul_tq1_block_reorder(t.row_dim, max_qkv_dim, t.packed_cols,
+            matmul_tq1_block_fused_s8(t.row_dim, max_qkv_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
-                m->buf_i8, max_abs, m->buf_up, B);
+                m->buf_act, m->buf_up, B);
         }
     } else if (tq.ttype == 0) {
         // v1.3.1+1.3.2: Direct TQ1-packed matmul (QKV stay packed in hybrid mode)
@@ -2471,10 +2612,9 @@ static void forward_layer_internal(
                 memset(m->buf_act + b * to.packed_cols * 5 + qd, 0,
                        (to.packed_cols * 5 - qd) * sizeof(float));
             }
-            quantize_f32_to_u8(m->buf_act, B, to.packed_cols * 5, max_abs, m->buf_i8);
-            matmul_tq1_block_reorder(to.row_dim, to.packed_cols * 5, to.packed_cols,
+            matmul_tq1_block_fused_s8(to.row_dim, to.packed_cols * 5, to.packed_cols,
                 to.data, to.block_size, to.n_blocks,
-                m->buf_i8, max_abs, m->buf_gate, B);
+                m->buf_act, m->buf_gate, B);
         } else if (to.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(to, wp, rows, dim, pc, scale);
@@ -2543,19 +2683,18 @@ static void forward_layer_internal(
     }
 
     if (tg.ttype == 5) {
-        // v2.4.1: Block-scaled FFN gate+up
-        quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
+        // v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant
         {
             auto& t = m->tensors[idx_gate];
-            matmul_tq1_block_reorder(t.row_dim, ffn_dim, t.packed_cols,
+            matmul_tq1_block_fused_s8(t.row_dim, ffn_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
-                m->buf_i8, max_abs, m->buf_gate, B);
+                m->buf_act, m->buf_gate, B);
         }
         {
             auto& t = m->tensors[idx_up];
-            matmul_tq1_block_reorder(t.row_dim, ffn_dim, t.packed_cols,
+            matmul_tq1_block_fused_s8(t.row_dim, ffn_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
-                m->buf_i8, max_abs, m->buf_up, B);
+                m->buf_act, m->buf_up, B);
         }
     } else if (tg.ttype == 0) {
         // v1.3.1+1.3.2: Direct TQ1-packed gate+up (FFN stay packed in full-packed mode)
@@ -2806,25 +2945,14 @@ static void forward_layer_internal(
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * td.packed_cols * 5;
-                float mb = 1e-5f;
                 for (int i = 0; i < inter; i++) {
-                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
-                    tmp[i] = v;
-                    float av = fabsf(v);
-                    if (av > mb) mb = av;
+                    tmp[i] = (g[i] / (1.0f + expf(-g[i]))) * u[i];
                 }
                 for (int i = inter; i < td.packed_cols * 5; i++) tmp[i] = 0.0f;
-                float inv = 127.0f / mb;
-                max_abs[b] = mb;
-                for (int i = 0; i < td.packed_cols * 5; i++) {
-                    int q = (int)(tmp[i] * inv + 128.5f);
-                    if (q < 0) q = 0; if (q > 255) q = 255;
-                    m->buf_i8[b * td.packed_cols * 5 + i] = (uint8_t)q;
-                }
             }
-            matmul_tq1_block_reorder(td.row_dim, td.packed_cols * 5, td.packed_cols,
+            matmul_tq1_block_fused_s8(td.row_dim, td.packed_cols * 5, td.packed_cols,
                 td.data, td.block_size, td.n_blocks,
-                m->buf_i8, max_abs, m->buf_gate, B);
+                m->buf_act, m->buf_gate, B);
         } else if (td.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(td, wp, rows, dim, pc, scale);
