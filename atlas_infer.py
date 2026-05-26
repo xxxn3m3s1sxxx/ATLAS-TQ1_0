@@ -40,8 +40,12 @@ dll.atlas_matmul_i8_f32.argtypes = [ctypes.c_int, ctypes.c_int,
 dll.atlas_decompress_all.restype = None
 dll.atlas_decompress_all.argtypes = [ctypes.c_void_p]
 
-dll.atlas_decompress_ttype5.restype = None
-dll.atlas_decompress_ttype5.argtypes = [ctypes.c_void_p]
+try:
+    dll.atlas_decompress_ttype5.restype = None
+    dll.atlas_decompress_ttype5.argtypes = [ctypes.c_void_p]
+    _HAS_TTYPE5_DECOMPRESS = True
+except AttributeError:
+    _HAS_TTYPE5_DECOMPRESS = False
 
 dll.atlas_decompress_ffn.restype = None
 dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
@@ -263,7 +267,8 @@ class AtlasModel:
             needs_f32 = self.hidden <= 2048 or self.rope_theta >= 3000000.0
             if needs_f32:
                 dll.atlas_decompress_all(self.model_ptr)
-                dll.atlas_decompress_ttype5(self.model_ptr)
+                if _HAS_TTYPE5_DECOMPRESS:
+                    dll.atlas_decompress_ttype5(self.model_ptr)
                 print("[Atlas] Full int8 (ttype=5 decompressed for f32 bypass)")
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
             else:
@@ -279,7 +284,8 @@ class AtlasModel:
                 print("[Atlas] Loaded int8 weights from cache (mmap)")
             else:
                 dll.atlas_decompress_all(self.model_ptr)
-                dll.atlas_decompress_ttype5(self.model_ptr)
+                if _HAS_TTYPE5_DECOMPRESS:
+                    dll.atlas_decompress_ttype5(self.model_ptr)
                 print("[Atlas] TQ1 tensors decoded to int8")
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
