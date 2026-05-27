@@ -573,8 +573,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     for (int i = 0; i < n_tensors; i++) {
         auto& t = m->tensors[i];
 
-        if (t.ttype == 5) {
-            // TQ1 with per-block scales: [block_size:1][n_blocks:2][scales:n_blocks*2][packed_data]
+        if (t.ttype == 5 || t.ttype == 7) {
+            // Block-scaled format: [block_size:1][n_blocks:2][scales:n_blocks*2][packed_data]
+            // ttype=5: TQ1 Base-3 (5 trits/byte), ttype=7: TurboQuant 2-bit (4 weights/byte)
             // Over-allocate generously; we'll fix data_size after loading.
             t.data_size = 3 + 512 * 2 + t.row_dim * t.packed_cols;
             t.block_size = 0;
@@ -589,7 +590,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
                 t.data_size = t.row_dim * 2;
             }
             t.packed_cols = 0;
-        } else if (t.ttype != 5) {  // lm_head / scales (not block-scaled TQ1)
+        } else if (t.ttype != 5 && t.ttype != 7) {  // lm_head / scales (not block-scaled TQ1)
             int actual_bytes = (i + 1 < n_tensors)
                 ? (int)(file_offsets[i + 1] - file_offsets[i]) - ((int)(file_offsets[i + 1] - file_offsets[i]) % 32)
                 : (int)(file_size - (int64_t)file_offsets[i]);
@@ -612,8 +613,8 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             fread(t.data, 1, t.data_size, f);
         }
 
-        // Post-process ttype=5: parse block_size and n_blocks from loaded data
-        if (t.ttype == 5) {
+        // Post-process block-scaled tensors (ttype=5/7): parse block_size and n_blocks
+        if (t.ttype == 5 || t.ttype == 7) {
             t.block_size = t.data[0];
             uint16_t nb; memcpy(&nb, t.data + 1, 2); t.n_blocks = nb;
             t.data_size = 3 + t.n_blocks * 2 + t.row_dim * t.packed_cols;
@@ -1346,7 +1347,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         t.data_size = 2 + n_vals + t.row_dim * 4;
         t.ttype = 3;
     }
-    printf("[ATLAS] Decompressed %d ttype=5 tensors to int8\n", total);
+    if (total > 0) printf("[ATLAS] Decompressed %d ttype=5 tensors to int8\n", total);
 }
 
 // ─── v1.3.2: Decompress only FFN tensors to int8 (gate/up/down) ────
@@ -1450,7 +1451,7 @@ ATLAS_API void atlas_tensor_info(AtlasModel* m, int idx, int* ttype,
     auto& t = m->tensors[idx];
     if (ttype) *ttype = t.ttype;
     if (row_dim) *row_dim = t.row_dim;
-    if (col_dim) *col_dim = (t.ttype == 0 || t.ttype == 5) ? t.packed_cols * 5 : 0;
+    if (col_dim) *col_dim = (t.ttype == 0 || t.ttype == 5) ? t.packed_cols * 5 : (t.ttype == 7 ? t.packed_cols * 4 : 0);
 }
 
 // ─── Access tensor data ─────────────────────────────────────────────────
@@ -1896,50 +1897,82 @@ static inline float hsum_ps(__m256 v) {
 }
 
 // ─── v2.7.0: TurboQuant fused matmul kernel (2-bit packed, K_tile=32) ───
-// INACTIVE SKELETON — activate when v7 packers arrive.
-// Usage: change `#if 0` to `#if 1`, add `ttype == 7` dispatch branch.
-// Fuses 2-bit unpack (AVX2) + i8×i8 matmul + f32 accumulate.
-// No int8 buffer for unpacked weights — decode on-the-fly in registers.
-// K_tile=32: 8 packed bytes per row → 32 int8 weights → 4× ymm f32 → FMA.
-#if 0
-static void matmul_turboquant_fused(int rows, int input_dim,
-    const uint8_t* packed_2bit, const float* activations,
-    float* output, int B, int stride_out) {
-    // K_tile=32: 8 packed bytes → 32 ternary weights
-    // K_tiles per row: input_dim / 32
-    // g128: scale every 128 weights (4 K_tiles)
-    const int K_tiles = input_dim / 32;
-    const int blocks = input_dim / 128;  // g128 block-scaled
-    const __m256i m3 = _mm256_set1_epi16(3);
-    const __m256i o1 = _mm256_set1_epi16(1);
-    const __m256i z = _mm256_setzero_si256();
+// Fused 2-bit unpack (SSE4.1) + f32×f32 FMA (AVX2) with g128 block-scaling.
+// No intermediate int8 buffer — decode on-the-fly in registers.
+// ttype=7 tensor_data layout: [block_size:1][n_blocks:2][scales:N_blocks*2][packed:rows*packed_cols]
+static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* activations, float* output, int B) {
+    const uint8_t* packed = tensor_data + 3 + rows * n_blocks * 2;
+    const __m128i m3 = _mm_set1_epi16(3);
+    const __m128i o1 = _mm_set1_epi16(1);
+    const __m128i z = _mm_setzero_si128();
 
-    for (int b = 0; b < B; b++) {
-        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-        for (int kt = 0; kt < K_tiles; kt++) {
-            // Load 8 packed bytes (32 ternary weights in 2-bit)
-            __m128i p8 = _mm_loadl_epi64((const __m128i*)(packed_2bit + kt * 8 + 0));
-            // Unpack to 32 int8 via SSE4.1 (same as _bench_turbo_unpack)
-            __m128i pe = _mm_unpacklo_epi8(p8, _mm_setzero_si128());
-            __m128i po = _mm_unpackhi_epi8(p8, _mm_setzero_si128());
-            __m128i s0e = _mm_sub_epi16(_mm_and_si128(pe, _mm_set1_epi16(3)), _mm_set1_epi16(1));
-            __m128i s0o = _mm_sub_epi16(_mm_and_si128(po, _mm_set1_epi16(3)), _mm_set1_epi16(1));
-            __m128i w0 = _mm_packs_epi16(s0e, s0o);
-            // w0 has 16 int8 weights for bytes 0-3 and 4-7
-            // Expand to f32 via int8→i32→f32
-            __m256i w0_i32 = _mm256_cvtepi8_epi32(w0);
-            __m256  w0_f32 = _mm256_cvtepi32_ps(w0_i32);
-            // Load activations (k, k+8, k+16, k+24 → but K_tile=32, split)
-            __m256 act0 = _mm256_loadu_ps(activations + b * input_dim + kt * 32 + 0);
-            // FMA: output += weight * activation
-            acc0 = _mm256_fmadd_ps(w0_f32, _mm256_permute_ps(act0, 0x00), acc0);
-            // (above is placeholder — real impl processes 4× ymm activations)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t* row_scales = tensor_data + 3 + r * n_blocks * 2;
+        const uint8_t* row_packed = packed + r * packed_cols;
+        for (int b = 0; b < B; b++) {
+            const float* act = activations + b * input_dim;
+            __m256 row_acc = _mm256_setzero_ps();
+            for (int blk = 0; blk < n_blocks; blk++) {
+                __m256 vacc = _mm256_setzero_ps();
+                int blk_start = blk * block_size;
+                int blk_bytes = blk_start / 4;
+                for (int off = 0; off < block_size; off += 64) {
+                    const uint8_t* bp = row_packed + blk_bytes + off / 4;
+                    const float* ap = act + blk_start + off;
+                    __m128i p = _mm_loadu_si128((const __m128i*)bp);
+                    __m128i pel = _mm_unpacklo_epi8(p, z);
+                    __m128i peh = _mm_unpackhi_epi8(p, z);
+                    __m128i s0el = _mm_and_si128(pel, m3);
+                    __m128i s0eh = _mm_and_si128(peh, m3);
+                    __m128i s1el = _mm_and_si128(_mm_srli_epi16(pel, 2), m3);
+                    __m128i s1eh = _mm_and_si128(_mm_srli_epi16(peh, 2), m3);
+                    __m128i s2el = _mm_and_si128(_mm_srli_epi16(pel, 4), m3);
+                    __m128i s2eh = _mm_and_si128(_mm_srli_epi16(peh, 4), m3);
+                    __m128i s3el = _mm_and_si128(_mm_srli_epi16(pel, 6), m3);
+                    __m128i s3eh = _mm_and_si128(_mm_srli_epi16(peh, 6), m3);
+                    s0el = _mm_sub_epi16(s0el, o1); s0eh = _mm_sub_epi16(s0eh, o1);
+                    s1el = _mm_sub_epi16(s1el, o1); s1eh = _mm_sub_epi16(s1eh, o1);
+                    s2el = _mm_sub_epi16(s2el, o1); s2eh = _mm_sub_epi16(s2eh, o1);
+                    s3el = _mm_sub_epi16(s3el, o1); s3eh = _mm_sub_epi16(s3eh, o1);
+                    __m128i p0 = _mm_packs_epi16(s0el, s0eh);
+                    __m128i p1 = _mm_packs_epi16(s1el, s1eh);
+                    __m128i p2 = _mm_packs_epi16(s2el, s2eh);
+                    __m128i p3 = _mm_packs_epi16(s3el, s3eh);
+                    __m128i abl = _mm_unpacklo_epi8(p0, p1);
+                    __m128i cdl = _mm_unpacklo_epi8(p2, p3);
+                    __m128i t0 = _mm_unpacklo_epi16(abl, cdl);
+                    __m128i t1 = _mm_unpackhi_epi16(abl, cdl);
+                    __m128i abh = _mm_unpackhi_epi8(p0, p1);
+                    __m128i cdh = _mm_unpackhi_epi8(p2, p3);
+                    __m128i t2 = _mm_unpacklo_epi16(abh, cdh);
+                    __m128i t3 = _mm_unpackhi_epi16(abh, cdh);
+                    // Each tN holds 16 int8 values; use low+high 8 for FMA
+                    #define TQ7_FMA2(t_, ap_, base_, acc_) do { \
+                        __m128i t_hi = _mm_unpackhi_epi64(t_, t_); \
+                        __m256i i32_l = _mm256_cvtepi8_epi32(t_); \
+                        __m256i i32_h = _mm256_cvtepi8_epi32(t_hi); \
+                        __m256 f_l = _mm256_cvtepi32_ps(i32_l); \
+                        __m256 f_h = _mm256_cvtepi32_ps(i32_h); \
+                        __m256 a_l = _mm256_loadu_ps(ap_ + (base_)); \
+                        __m256 a_h = _mm256_loadu_ps(ap_ + (base_) + 8); \
+                        acc_ = _mm256_fmadd_ps(f_l, a_l, acc_); \
+                        acc_ = _mm256_fmadd_ps(f_h, a_h, acc_); \
+                    } while(0)
+                    TQ7_FMA2(t0, ap, 0, vacc);
+                    TQ7_FMA2(t1, ap, 16, vacc);
+                    TQ7_FMA2(t2, ap, 32, vacc);
+                    TQ7_FMA2(t3, ap, 48, vacc);
+                }
+                uint16_t ws16; memcpy(&ws16, row_scales + blk * 2, 2);
+                __m256 v_scale = _mm256_set1_ps(fp16_to_fp32(ws16));
+                row_acc = _mm256_fmadd_ps(vacc, v_scale, row_acc);
+            }
+            output[b * rows + r] = hsum_ps(row_acc);
         }
-        _mm256_storeu_ps(output + b * stride_out + 0, acc0);
     }
 }
-#endif
 
 // ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
 // act_u8: [B, input_dim] uint8 quantized activations [1, 255]
@@ -2534,8 +2567,8 @@ static void forward_layer_internal(
 
     auto& tq = m->tensors[idx_q];
     auto& tk = m->tensors[idx_k];
-    int i8_q_dim = tq.packed_cols * 5;
-    int i8_k_dim = tk.packed_cols * 5;
+    int i8_q_dim = tq.ttype == 7 ? tq.packed_cols * 4 : tq.packed_cols * 5;
+    int i8_k_dim = tk.ttype == 7 ? tk.packed_cols * 4 : tk.packed_cols * 5;
     int max_qkv_dim = i8_q_dim > i8_k_dim ? i8_q_dim : i8_k_dim;
 
     for (int b = 0; b < B; b++) {
@@ -2564,6 +2597,26 @@ static void forward_layer_internal(
         {
             auto& t = m->tensors[idx_v];
             matmul_tq1_block_fused_s8(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_up, B);
+        }
+    } else if (tq.ttype == 7) {
+        // v2.7.0: TurboQuant 2-bit fused matmul (on-the-fly decode in registers)
+        {
+            auto& t = m->tensors[idx_q];
+            matmul_turboquant_fused(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        }
+        {
+            auto& t = m->tensors[idx_k];
+            matmul_turboquant_fused(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_hidden, B);
+        }
+        {
+            auto& t = m->tensors[idx_v];
+            matmul_turboquant_fused(t.row_dim, max_qkv_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
                 m->buf_act, m->buf_up, B);
         }
@@ -2719,6 +2772,15 @@ static void forward_layer_internal(
             matmul_tq1_block_fused_s8(to.row_dim, to.packed_cols * 5, to.packed_cols,
                 to.data, to.block_size, to.n_blocks,
                 m->buf_act, m->buf_gate, B);
+        } else if (to.ttype == 7) {
+            int o_dim = to.packed_cols * 4;
+            for (int b = 0; b < B; b++) {
+                memcpy(m->buf_act + b * o_dim, attn_out + b * qd, qd * sizeof(float));
+                memset(m->buf_act + b * o_dim + qd, 0, (o_dim - qd) * sizeof(float));
+            }
+            matmul_turboquant_fused(to.row_dim, o_dim, to.packed_cols,
+                to.data, to.block_size, to.n_blocks,
+                m->buf_act, m->buf_gate, B);
         } else if (to.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(to, wp, rows, dim, pc, scale);
@@ -2777,8 +2839,8 @@ static void forward_layer_internal(
     // reorder+dequant inline.
     auto& tg = m->tensors[idx_gate];
     auto& tu = m->tensors[idx_up];
-    int g_dim = tg.packed_cols * 5;
-    int u_dim = tu.packed_cols * 5;
+    int g_dim = tg.ttype == 7 ? tg.packed_cols * 4 : tg.packed_cols * 5;
+    int u_dim = tu.ttype == 7 ? tu.packed_cols * 4 : tu.packed_cols * 5;
     int ffn_dim = g_dim > u_dim ? g_dim : u_dim;
 
     for (int b = 0; b < B; b++) {
@@ -2797,6 +2859,20 @@ static void forward_layer_internal(
         {
             auto& t = m->tensors[idx_up];
             matmul_tq1_block_fused_s8(t.row_dim, ffn_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_up, B);
+        }
+    } else if (tg.ttype == 7) {
+        // v2.7.0: TurboQuant 2-bit fused matmul (on-the-fly decode in registers)
+        {
+            auto& t = m->tensors[idx_gate];
+            matmul_turboquant_fused(t.row_dim, ffn_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        }
+        {
+            auto& t = m->tensors[idx_up];
+            matmul_turboquant_fused(t.row_dim, ffn_dim, t.packed_cols,
                 t.data, t.block_size, t.n_blocks,
                 m->buf_act, m->buf_up, B);
         }
@@ -3071,6 +3147,34 @@ static void forward_layer_internal(
                 }
             }
             matmul_tq1_block_fused_s8(td.row_dim, down_dim, td.packed_cols,
+                td.data, td.block_size, td.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        } else if (td.ttype == 7) {
+            int down_dim = td.packed_cols * 4;
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * down_dim;
+                for (int i = 0; i < inter; i++) {
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                for (int i = inter; i < down_dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * down_dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+            matmul_turboquant_fused(td.row_dim, down_dim, td.packed_cols,
                 td.data, td.block_size, td.n_blocks,
                 m->buf_act, m->buf_gate, B);
         } else if (td.ttype == 0) {

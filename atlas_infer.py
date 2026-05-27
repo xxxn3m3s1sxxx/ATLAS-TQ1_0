@@ -298,7 +298,6 @@ class AtlasModel:
                 dll.atlas_decompress_all(self.model_ptr)
                 if _HAS_TTYPE5_DECOMPRESS:
                     dll.atlas_decompress_ttype5(self.model_ptr)
-                print("[Atlas] TQ1 tensors decoded to int8")
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)

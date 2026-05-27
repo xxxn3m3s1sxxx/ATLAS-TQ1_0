@@ -25,3 +25,4 @@ _cos_*.py
 atlas.dll.release
 *.diff
 *.patch
+_*.py

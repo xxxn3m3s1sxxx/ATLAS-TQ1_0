@@ -249,6 +249,47 @@ def ternarize_block_scaled(weights_fp16, block_size=128):
     header = struct.pack('<BH', block_size, n_blocks) + block_scales.tobytes()
     return header + out.tobytes(), packed_per_row, n_blocks, block_size
 
+
+def ternarize_block_scaled_2bit(weights_fp16, block_size=128):
+    """Per-block ternary quantization → 2-bit packed format (ttype=7).
+
+    Same block-scaling as ternarize_block_scaled, but packs 4 ternary
+    weights/byte (2-bit) instead of 5 trits/byte (TQ1 Base-3).
+    2-bit encoding: 00=-1, 01=0, 10=+1 (simpler SIMD decode).
+    Returns (block_scales_bytes, packed_bytes, packed_per_row, n_blocks, block_size).
+    """
+    w = weights_fp16.astype(np.float32)
+    nrows, ncols = w.shape
+    n_blocks = (ncols + block_size - 1) // block_size
+
+    pad_len = n_blocks * block_size - ncols
+    w_pad = np.pad(w, ((0, 0), (0, pad_len)), constant_values=0) if pad_len else w
+
+    w_3d = w_pad.reshape(nrows, n_blocks, block_size)
+    block_scales32 = np.max(np.abs(w_3d), axis=2)
+    block_scales32 = np.where(block_scales32 < 1e-10, 1.0, block_scales32)
+
+    scales_expanded = np.repeat(block_scales32[:, :, np.newaxis], block_size, axis=2)
+    ternary_3d = np.clip(np.round(w_3d / scales_expanded).astype(np.int32), -1, 1)
+    ternary_flat = ternary_3d.reshape(nrows, n_blocks * block_size)[:, :ncols].astype(np.int8)
+
+    # Pack ternary to 2-bit: 4 weights per byte, vectorized
+    # Map {-1,0,1} → {0,1,2}, pack 4 per byte
+    packed_per_row = (ncols + 3) // 4
+    full_len = packed_per_row * 4
+    row_padded = np.ones((nrows, full_len), dtype=np.uint8)  # pad with 1 (ternary 0)
+    row_padded[:, :ncols] = ternary_flat.astype(np.int32) + 1  # -1→0, 0→1, 1→2
+
+    # Reshape to (nrows, packed_per_row, 4) and pack with shifts
+    reshaped = row_padded.reshape(nrows, packed_per_row, 4).astype(np.uint8)
+    out = (reshaped[:, :, 0] << 0) | (reshaped[:, :, 1] << 2) | \
+          (reshaped[:, :, 2] << 4) | (reshaped[:, :, 3] << 6)
+
+    # Same wire format as ttype=5: [block_size:1][n_blocks:2][scales...][packed_data]
+    block_scales = block_scales32.astype(np.float16)
+    header = struct.pack('<BH', block_size, n_blocks) + block_scales.tobytes()
+    return header + out.tobytes(), packed_per_row, n_blocks, block_size
+
 def get_shard_path(weight_map, tensor_name, model_dir):
     """Resolve which shard file contains a tensor."""
     shard = weight_map.get(tensor_name)
@@ -256,7 +297,7 @@ def get_shard_path(weight_map, tensor_name, model_dir):
         return os.path.join(model_dir, shard)
     return None
 
-def create_atlas_qwen(model_dir, output_path):
+def create_atlas_qwen(model_dir, output_path, ttype=5):
     with open(os.path.join(model_dir, 'config.json')) as f:
         cfg = json.load(f)
 
@@ -410,8 +451,11 @@ def create_atlas_qwen(model_dir, output_path):
                 else:
                     tensor = tensor.cpu().to(torch.float32).numpy()
 
-                tensor = pre_shuffle_rows(tensor)
-                data_bytes, packed_per_row, n_blocks, block_size = ternarize_block_scaled(tensor)
+                tensor = pre_shuffle_rows(tensor) if ttype != 7 else tensor
+                if ttype == 7:
+                    data_bytes, packed_per_row, n_blocks, block_size = ternarize_block_scaled_2bit(tensor)
+                else:
+                    data_bytes, packed_per_row, n_blocks, block_size = ternarize_block_scaled(tensor)
             else:
                 packed_per_row = 0
                 n_blocks = 0
@@ -424,16 +468,17 @@ def create_atlas_qwen(model_dir, output_path):
                 out.write(b'\x00' * pad)
 
             if is_ternary:
-                ttype = 5  # TQ1 packed with per-block scales (g128)
+                # packed format: 5=TQ1 Base-3, 7=TurboQuant 2-bit
+                tens_ttype = ttype if ttype == 7 else 5
                 row_dim = tensor.shape[0]
             elif 'norm' in name or 'embed' in name:
-                ttype = 1  # FP16 vector
+                tens_ttype = 1  # FP16 vector
                 row_dim = tensor.shape[0]
             else:
-                ttype = 2  # FP16 matrix
+                tens_ttype = 2  # FP16 matrix
                 row_dim = tensor.shape[0]
 
-            directory[idx*12] = ttype
+            directory[idx*12] = tens_ttype
             struct.pack_into('<I', directory, idx*12 + 1, current_offset)
             struct.pack_into('<I', directory, idx*12 + 5, row_dim)
             ppr = packed_per_row & 0xFFFFFF
@@ -459,7 +504,7 @@ def create_atlas_qwen(model_dir, output_path):
             struct.pack_into('<I', header, 33, tokenizer_offset)
 
         # v6: Append binary tokenizer block
-        binary_tok_block = build_tokenizer_binary(os.path.dirname(input_path))
+        binary_tok_block = build_tokenizer_binary(model_dir)
         if len(binary_tok_block) == 0:
             print("[ATLAS] ERROR: Could not build v6 binary tokenizer block")
             sys.exit(1)
@@ -489,7 +534,11 @@ def create_atlas_qwen(model_dir, output_path):
     print(f"[ATLAS] Done! {total_gb:.2f} GB | {len(tensor_names)} tensors")
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python atlas_packer_g128.py <model_dir> <output.atlas>")
-        sys.exit(1)
-    create_atlas_qwen(sys.argv[1], sys.argv[2])
+    import argparse
+    parser = argparse.ArgumentParser(description='Pack a model to ATLAS format')
+    parser.add_argument('model_dir', help='HF model directory')
+    parser.add_argument('output', help='Output .atlas file')
+    parser.add_argument('--ttype', type=int, default=5, choices=[5, 7],
+                        help='Ternary tensor format: 5=TQ1 Base-3, 7=TurboQuant 2-bit (default: 5)')
+    args = parser.parse_args()
+    create_atlas_qwen(args.model_dir, args.output, ttype=args.ttype)
