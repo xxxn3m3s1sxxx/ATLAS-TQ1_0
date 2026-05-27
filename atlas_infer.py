@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atlas Inference Engine v2.1.0 — End-to-end Falcon3 TQ1.0 generation."""
+"""Atlas Inference Engine v2.6.3 — Falcon3/BitNet/Bonsai TQ1.0 inference."""
 import ctypes, struct, os, sys, time, json, queue, threading, numpy as np
 # v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
