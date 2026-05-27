@@ -8,7 +8,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 - **TQ1.0 g128** (ttype=5): Per-row per-block fp16 scales (block_size=128), 16/128 = 0.125 b/w overhead. Used by Bonsai/Qwen3 models. Packed via `matmul_tq1_block_reorder`.
 - **4 matmul modes**: int8 (default, `vpmaddubs` SIMD), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
-- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B) or `rope_theta >= 3M` (Bonsai-8B). Eliminates activation quantization noise.
+- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN architectures where weights are ~0.01× and u8+128 activation quant destroys signal.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
 - **128*row_sum correction**: Required for all uint8×int8 matmuls (activation quantization adds +128 bias).
 
@@ -16,6 +16,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 | Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab |
 |-------|-----------|--------|--------|-------------|-------|----------|-------|
+| BitNet-2B4T-b1.58 | 0.97 GB | 26 | 2048 | 8192 | 16 | 8 | 151936 |
 | Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 |
 | Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
@@ -140,6 +141,9 @@ See `atlas_ffi.h` for full API.
 | Version | Key Changes |
 |---------|-------------|
 | **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: Reverted fused-kernel-only approach. All ttype=5 tensors decompressed to int8 at load. `f32_bypass` forced for block-scaled models (rope_theta≥3M or hidden≤2048) — no uint8+128 activation quant, no signal collapse. Bonsai-8B: 0.2→1.6-2.2 tok/s with perfect T=0.7 coherence. |
+| **v2.6.3** | **BitNet ARCH_BITNET + Repo Cleanup**: `atlas_ensure_layer_idx()` C API für Python `forward()`-Pfad. f32_bypass forced für SubLN-Architekturen (u8+128 Activation Quant zerstört ~0.01× SubLN-Signal). 91 Scratch-Dateien gelöscht, tote Packer entfernt, `.gitignore` gehärtet. |
+| **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
+| **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |
 | **v2.6.0** | **SSE Web-Server + Prompt-Caching**: `atlas_server.py` — FastAPI/SSE `/v1/chat/completions`, `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialisierter Cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). |
 | **v2.4.1** | **Static Analysis Bug Hunt**: 5 C++ bugs fixed (strict aliasing `*(uint16_t*)(odd_addr)`→memcpy, negative memset, unaligned AVX2 cast→pre-decoded float scales, thread-unsafe `static` buffers→`thread_local`). `atlas_decompress_all` now handles ttype=5 (g128 block-scaled) tensors — enables int8 cache for Bonsai models (10× speedup: 0.58→5.78 tok/s). Python `generate()` uses `_apply_chat_template()` for all paths (fixes Bonsai v5 template error). |
 | **v2.4.0** | **Qwen3/Bonsai-4B**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab (151669), EOS/PAD aus Header, Bonsai-4B Packer (`atlas_packer_qwen.py`). C++: `rope_scale`/`layer_stride`-Setters, `ensure_layer_idx` mit stride-11-Detektion, QK-Norm in `atlas_attention_f32`, NTK-YaRN in RoPE-Schleife. ✅ Falcon3-1B Regression, ✅ Bonsai-4B 100 Tokens (kein Crash). |

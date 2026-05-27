@@ -12,6 +12,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 | Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab |
 |-------|-----------|--------|--------|-------------|-------|----------|-------|
+| BitNet-2B4T-b1.58 | 0.97 GB | 26 | 2048 | 8192 | 16 | 8 | 151936 |
 | Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 |
 | Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
@@ -117,7 +118,7 @@ The CLI autodetects model family from `config.json` and generates the output fil
 | `set_system_prompt(text)` | Set system prompt for chat mode. |
 | `set_seed(seed)` | Seed the RNG (default: random). |
 | `set_num_threads(n)` | Set OpenMP thread count. |
-| `set_use_f32_matmul(bool)` | Toggle f32 bypass mode (auto-enabled for hidden≤2048). |
+| `set_use_f32_matmul(bool)` | Toggle f32 bypass mode (auto-enabled for hidden≤2048, rope_theta≥3M, or SubLN BitNet). |
 | `set_use_hybrid_matmul(bool)` | Toggle hybrid FFN-int8 + QKV-packed mode (default). |
 | `set_use_packed_matmul(bool)` | Toggle full TQ1-packed mode (all matmuls, no decompress). |
 | `set_base_seq_len(int)` | Set trained context length for NTK scaling (v2.5.0). |
@@ -132,6 +133,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). `generate_c()`
 
 | Model | Mode | tok/s | Quality (T=0) |
 |-------|------|:-----:|---------------|
+| **BitNet-2B4T** | f32 bypass | **7.4** | "Paris is the capital of France." |
 | **Falcon3-3B** | hybrid+int8 | 4.3 | "Paris. Paris is a city in France." |
 | **TriLM-1.1B** | f32 bypass | **13.0** | "The capital of France is Paris." |
 | **Bonsai-1.7B** | f32 bypass | **13.0** | "The capital of France is Paris." |
@@ -215,6 +217,9 @@ All four Falcon3 models (1B, 3B, 7B, 10B), Bonsai models (1.7B, 4B), and TriLM-1
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.6.3** | **BitNet ARCH_BITNET + Repo Cleanup**: `atlas_ensure_layer_idx()` C API fixes Python `forward()` path for BitNet models. f32_bypass forced for SubLN architectures (activation quantization destroys ~0.01× SubLN weights). 91 scratch files deleted, dead packers removed, `.gitignore` hardened. |
+| **v2.6.2** | Safe `decompress_ttype5` dispatch (try/except guard) |
+| **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |
 | **v2.6.0** | **SSE Web-Server + Prompt-Caching + CI Pipeline**: `atlas_server.py` — FastAPI `/v1/chat/completions` (SSE streaming), `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialized cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). Ring buffer + NTK context extension validated (8K Falcon3, 16K Bonsai-4B). |
 | **v2.5.0** | **Context Window Extension**: Ring buffer KV cache (modulo `max_seq_len`), NTK-aware frequency scaling (`ctx_scale = max_seq_len / base_seq_len`), `set_base_seq_len()` API, dynamic `max_seq_len` per generate call. |
 | **v2.4.1** | Static analysis bughunt (5 C++ bugs), ttype=5 int8 decompress for Bonsai (10× speedup), unified packer CLI, `generate()` chat template fix, repo cleanup |
