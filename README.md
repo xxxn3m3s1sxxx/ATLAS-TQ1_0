@@ -207,7 +207,7 @@ All four Falcon3 models (1B, 3B, 7B, 10B), Bonsai models (1.7B, 4B), and TriLM-1
 | `atlas_infer.py` | Python `AtlasModel` class — `generate_c()`, `generate_stream()`, chat, caching |
 | `atlas_server.py` | FastAPI SSE Web-Server — `/v1/chat/completions`, `/health`, `/reset` (v2.6.0) |
 | `atlas_packer.py` | Falcon3 safetensors → TQ1 v5/v6 (embedded + optional binary tokenizer) |
-| `atlas_packer_bonsai.py` | Bonsai/Qwen3 safetensors → g128 block-scaled TQ1 (ttype=5, per-row per-block fp16 scales) |
+| `atlas_packer_g128.py` | Bonsai/Qwen3/BitNet safetensors → g128 block-scaled TQ1 (ttype=5, per-row per-block fp16 scales) |
 | `atlas_pack.py` | Unified CLI — autodetects model family, dispatches to correct packer |
 | `add_v6_block.py` | Append v6 binary tokenizer block to existing v5 files (fast migration) |
 | `tests/` | pytest suite, CI smoke test, regression tests |

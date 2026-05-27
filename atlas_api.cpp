@@ -486,7 +486,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     if (eos_val != 0) m->eos_id = (int)eos_val;
     if (pad_val != 0) m->pad_id = (int)pad_val;
 
-    // Byte 53: model_flags — gate_act (bit 3) for ReLU² (BitNet b1.58)
+    // Byte 53: model_flags — use_relu2 (bit 3) for ReLU² (BitNet b1.58)
     m->use_relu2 = (hdr[53] >> 3) & 1;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
@@ -2482,7 +2482,8 @@ static void forward_layer_internal(
     int max_seq_len, int seq_now,
     int idx_ln1, int idx_q, int idx_k, int idx_v, int idx_o,
     int idx_ln2, int idx_gate, int idx_up, int idx_down,
-    int idx_q_norm = -1, int idx_k_norm = -1) {
+    int idx_q_norm = -1, int idx_k_norm = -1,
+    int idx_attn_sub_norm = -1, int idx_ffn_sub_norm = -1) {
 
     int H = m->hidden_dim;
     int nH = m->n_heads, nKV = m->n_kv_heads, hd = m->head_dim;
@@ -2684,16 +2685,31 @@ static void forward_layer_internal(
         m->base_seq_len);
 
     // ─── 3.5. attn_sub_norm: RMSNorm(attn_out) per BitNet reference ───
-    if (m->model_arch == ARCH_BITNET && idx_q_norm >= 0) {
+    if (idx_attn_sub_norm >= 0) {
         for (int b = 0; b < B; b++) {
             float* ap = attn_out + b * qd;
-            apply_sub_norm(ap, qd, m->tensors[idx_q_norm].data);
+            apply_sub_norm(ap, qd, m->tensors[idx_attn_sub_norm].data);
         }
     }
 
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
+        // Apply attn_sub_norm to attention output BEFORE O projection
+        if (idx_attn_sub_norm >= 0) {
+            auto& sn = m->tensors[idx_attn_sub_norm];
+            const uint8_t* snw = sn.data;
+            for (int b = 0; b < B; b++) {
+                float* ob = attn_out + b * qd;
+                float ss = 0.0f;
+                for (int i = 0; i < qd; i++) ss += ob[i] * ob[i];
+                float rms = 1.0f / sqrtf(ss / qd + 1e-6f);
+                for (int i = 0; i < qd; i++) {
+                    uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                    ob[i] *= rms * fp16_to_fp32(w16);
+                }
+            }
+        }
         if (to.ttype == 5) {
             for (int b = 0; b < B; b++) {
                 memcpy(m->buf_act + b * to.packed_cols * 5, attn_out + b * qd, qd * sizeof(float));
@@ -3025,29 +3041,41 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 8. Fused SiLU(gate)*up → down matmul ───
+    // ─── 8. Fused SiLU(gate)*up → down matmul with optional ffn_sub_norm ───
     {
         auto& td = m->tensors[idx_down];
         if (td.ttype == 5) {
+            int down_dim = td.packed_cols * 5;
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * td.packed_cols * 5;
+                float* tmp = m->buf_act + b * down_dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
-                }
-                for (int i = inter; i < td.packed_cols * 5; i++) tmp[i] = 0.0f;
+                for (int i = inter; i < down_dim; i++) tmp[i] = 0.0f;
             }
-            matmul_tq1_block_fused_s8(td.row_dim, td.packed_cols * 5, td.packed_cols,
+            // ffn_sub_norm: normalize intermediate BEFORE down_proj
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * down_dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+            matmul_tq1_block_fused_s8(td.row_dim, down_dim, td.packed_cols,
                 td.data, td.block_size, td.n_blocks,
                 m->buf_act, m->buf_gate, B);
         } else if (td.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(td, wp, rows, dim, pc, scale);
-            // SiLU(gate)*up → quantize to u8 → TQ1-packed matmul
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
@@ -3055,17 +3083,33 @@ static void forward_layer_internal(
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+            }
+            // ffn_sub_norm before down_proj
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
                 }
-                float mb = 1e-5f;
+            }
+            float mb = 1e-5f;
+            for (int b = 0; b < B; b++) {
+                const float* tmp = m->buf_act + b * dim;
+                float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
-                    if (av > mb) mb = av;
+                    if (av > bmax) bmax = av;
                 }
-                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
-                float inv = 127.0f / mb;
-                max_abs[b] = mb;
+                float inv = 127.0f / bmax;
+                max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
                     int q = (int)(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
@@ -3077,7 +3121,6 @@ static void forward_layer_internal(
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(td, w, rs, rows, dim, scale);
             if (m->use_ternary_matmul) {
-            // Ternary-add: SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
@@ -3085,17 +3128,32 @@ static void forward_layer_internal(
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
                 }
-                float mb = 1e-5f;
+            }
+            float mb = 1e-5f;
+            for (int b = 0; b < B; b++) {
+                const float* tmp = m->buf_act + b * dim;
+                float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
-                    if (av > mb) mb = av;
+                    if (av > bmax) bmax = av;
                 }
-                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
-                float inv = 127.0f / mb;
-                max_abs[b] = mb;
+                float inv = 127.0f / bmax;
+                max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
                     int q = (int)(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
@@ -3105,21 +3163,30 @@ static void forward_layer_internal(
             matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs,
                                       scale, m->buf_gate, B);
         } else if (m->use_f32_matmul) {
-            // Full-precision: compute SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
-                }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
             }
             matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
         } else {
-            // Quantized path: SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
@@ -3127,17 +3194,32 @@ static void forward_layer_internal(
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
                 }
-                float mb = 1e-5f;
+            }
+            float mb = 1e-5f;
+            for (int b = 0; b < B; b++) {
+                const float* tmp = m->buf_act + b * dim;
+                float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
-                    if (av > mb) mb = av;
+                    if (av > bmax) bmax = av;
                 }
-                for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
-                float inv = 127.0f / mb;
-                max_abs[b] = mb;
+                float inv = 127.0f / bmax;
+                max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
                     int q = (int)(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
@@ -3186,13 +3268,23 @@ ATLAS_API void atlas_forward(
         float* ksc = m->k_scale_cache + (size_t)L * nKV * max_seq_len;
         int8_t* vc = m->v_cache + (size_t)L * nKV * max_seq_len * hd;
         float* vsc = m->v_scale_cache + (size_t)L * nKV * max_seq_len;
-        int qn_i = (m->layer_stride >= 11) ? idx[9] : -1;
-        int kn_i = (m->layer_stride >= 11) ? idx[10] : -1;
+        int qn_i = -1, kn_i = -1, asn_i = -1, fsn_i = -1;
+        if (m->layer_stride >= 11) {
+            if (m->model_arch == ARCH_BITNET) {
+                asn_i = idx[9];
+                fsn_i = idx[10];
+            } else {
+                qn_i = idx[9];
+                kn_i = idx[10];
+            }
+        }
         forward_layer_internal(m, buf_a, buf_b, B, positions,
             kc, ksc, vc, vsc, max_seq_len, seq_now,
             idx[0], idx[1], idx[2], idx[3], idx[4],
             idx[5], idx[6], idx[7], idx[8],
-            qn_i, kn_i);
+            qn_i, kn_i, asn_i, fsn_i);
+        // DEBUG: per-layer buf_norm (enable for prefill diagnostics)
+        // if (B == 1) { float bn = 0; for (int i = 0; i < H; i++) bn += buf_b[i] * buf_b[i]; fprintf(stderr, "[DEBUG:L%d] buf_norm=%.2f\n", L, sqrtf(bn)); }
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
     }
 
@@ -3495,6 +3587,9 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
     }
+
+    // DEBUG: print top-5 logits from prefill (enable for diagnostics)
+    // { int idx[5]={0}; float vl[5]={-1e10f}; int sc=0; for (int i=0;i<V;i++) { float v=logits[i]; int p=4; while(p>=0&&v>vl[p]) p--; p++; if(p<5) { memmove(idx+p+1,idx+p,(4-p)*sizeof(int)); memmove(vl+p+1,vl+p,(4-p)*sizeof(float)); idx[p]=i; vl[p]=v; if(sc<5) sc++; } } fprintf(stderr,"[DEBUG] Prefill top-5:%d(%.1f)%d(%.1f)%d(%.1f)%d(%.1f)%d(%.1f)\n",idx[0],vl[0],idx[1],vl[1],idx[2],vl[2],idx[3],vl[3],idx[4],vl[4]); }
 
     // Sample first token from prefill logits
     const int eos_id = m->eos_id;

@@ -330,13 +330,25 @@ class AtlasModel:
         self._use_cpp_tokenizer = False
         self._eos_id = 0
         self._chat_template = None
-        # Phi-3: instruct model, head_dim=96, small vocab, <|role|> format with <|end|>
-        self._is_phi3 = (self.head_dim == 96 and self.vocab_size <= 40000)
-        # TriLM: base LLaMA with no chat format
-        self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
-        # Qwen3/Bonsai detection: not TriLM, and head_dim<=128 or large vocab (>131k)
-        self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and (self.head_dim <= 128 or self.vocab_size > 131072))
-        self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
+
+        # Read model_flags from file header byte 53 (v7+), fallback to heuristic
+        self._is_qwen3 = (self.head_dim <= 128 or self.vocab_size > 131072)
+        self._enable_thinking = True
+        self._tie_word_embeddings = False
+        self._gate_act = 0
+        try:
+            with open(self._atlas_path, 'rb') as f:
+                f.seek(5)
+                ver = struct.unpack('<H', f.read(2))[0]
+                if ver >= 7:
+                    f.seek(53)
+                    mfv = f.read(1)[0]
+                    self._is_qwen3 = bool(mfv & 0x01)
+                    self._tie_word_embeddings = bool(mfv & 0x02)
+                    self._enable_thinking = bool(mfv & 0x04)
+                    self._gate_act = bool(mfv & 0x08)
+        except Exception:
+            pass
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
         tok_size = ctypes.c_int()
@@ -388,8 +400,25 @@ class AtlasModel:
                 self._tok = Tokenizer.from_buffer(raw[pos:pos+js_size])
             except Exception as e:
                 print(f"[Atlas] Python tokenizer load failed: {e}")
-        else:
-            if not self._use_cpp_tokenizer:
+        if self._tok is None:
+            # Fallback: load tokenizer.json from disk (next to .atlas file or in model_dir)
+            for try_path in [
+                os.path.join(os.path.dirname(self._atlas_path), 'tokenizer.json'),
+                os.path.join(os.path.dirname(self._atlas_path), '..', 'models',
+                             os.path.splitext(os.path.basename(self._atlas_path))[0].rsplit('-tq1', 1)[0],
+                             'tokenizer.json'),
+                os.path.join(self._model_dir or '', 'tokenizer.json'),
+            ]:
+                try_path = os.path.normpath(try_path)
+                if os.path.exists(try_path):
+                    try:
+                        from tokenizers import Tokenizer
+                        self._tok = Tokenizer.from_file(try_path)
+                        print(f"[Atlas] Loaded tokenizer from {try_path}")
+                        break
+                    except Exception as e:
+                        print(f"[Atlas] Tokenizer file load failed ({try_path}): {e}")
+            if not self._tok and not self._use_cpp_tokenizer:
                 print("[Atlas] No embedded tokenizer found")
 
 
@@ -1016,26 +1045,8 @@ class AtlasModel:
         Matches model-specific format:
         - Falcon3: <|role|>\ncontent\n  (EOS: <|endoftext|>)
         - Qwen3:   <|im_start|>role\ncontent<|im_end|>\n
-        - TriLM:   plain text (base model, no chat format)
         Bonsai: Qwen3 format + enable_thinking=False (empty <think> block).
         """
-        # TriLM: base LLaMA model — no chat formatting, just concatenate content
-        if self._is_trilm:
-            result = '\n'.join(m.get('content', '') for m in messages)
-            return result + '\n' if add_generation_prompt else result
-
-        # Phi-3: <|role|>\ncontent<|end|>\n
-        if self._is_phi3:
-            eos = '<|end|>'
-            result = ''
-            for msg in messages:
-                role = msg['role']
-                content = msg.get('content', '')
-                result += f"<|{role}|>\n{content}{eos}\n"
-            if add_generation_prompt:
-                result += '<|assistant|>\n'
-            return result
-
         if self._is_qwen3:
             eos = '<|im_end|>'
             result = ""

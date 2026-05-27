@@ -13,6 +13,135 @@ TRILM_SIZES = {
     1536: "830M", 1792: "1.1B", 2048: "1.5B", 2304: "2.4B", 3072: "3.9B",
 }
 
+
+def build_tokenizer_binary(model_dir):
+    """Build v6 binary tokenizer block from tokenizer.json."""
+    tok_path = os.path.join(model_dir, 'tokenizer.json')
+    if not os.path.exists(tok_path):
+        print("[ATLAS] ERROR: tokenizer.json not found — cannot build v6 binary tokenizer")
+        return b''
+
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(tok_path)
+    vocab = tok.get_vocab()
+    V = len(vocab)
+    sorted_items = sorted(vocab.items(), key=lambda kv: kv[1])
+
+    offsets = np.empty(V, dtype=np.uint32)
+    lengths = np.empty(V, dtype=np.uint16)
+    pool_parts = []
+    offset_acc = 0
+    for i, (token_str, tid) in enumerate(sorted_items):
+        token_bytes = token_str.encode('utf-8')
+        offsets[i] = offset_acc
+        lengths[i] = len(token_bytes)
+        pool_parts.append(token_bytes)
+        offset_acc += len(token_bytes)
+    pool = b''.join(pool_parts)
+    max_token_length = int(max(lengths))
+
+    merge_left = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_right = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_rank = np.zeros(V, dtype=np.uint32)
+
+    with open(tok_path, 'r', encoding='utf-8') as jf:
+        tok_json_data = json.load(jf)
+    merges_list = tok_json_data.get('model', {}).get('merges', [])
+    for i, merge_pair in enumerate(merges_list):
+        if isinstance(merge_pair, list) and len(merge_pair) == 2:
+            left_str, right_str = merge_pair
+        elif isinstance(merge_pair, str):
+            parts = merge_pair.split()
+            if len(parts) != 2: continue
+            left_str, right_str = parts
+        else:
+            continue
+        left_id = vocab.get(left_str)
+        right_id = vocab.get(right_str)
+        if left_id is not None and right_id is not None:
+            merged_str = left_str + right_str
+            merged_id = vocab.get(merged_str)
+            if merged_id is not None and merged_id < V:
+                merge_left[merged_id] = left_id
+                merge_right[merged_id] = right_id
+                merge_rank[merged_id] = i + 1
+
+    byte_encoder = np.full(256, 0xFFFF, dtype=np.uint16)
+    printable = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    byte_to_token = {}
+    n = 0
+    for b in range(256):
+        if b in printable:
+            byte_to_token[b] = chr(b)
+        else:
+            byte_to_token[b] = chr(256 + n)
+            n += 1
+    for b in range(256):
+        tid = vocab.get(byte_to_token[b])
+        if tid is not None:
+            byte_encoder[b] = tid
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        for b in missing:
+            tid = vocab.get(chr(256 + b))
+            if tid is not None:
+                byte_encoder[b] = tid
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        print(f'  WARNING: {len(missing)} bytes unmapped in byte_encoder (first 8: {missing[:8]})')
+
+    byte_decoder = np.full(256, 0xFFFF, dtype=np.uint16)
+    for b in range(256):
+        if byte_encoder[b] != 0xFFFF:
+            byte_decoder[b] = b
+
+    eos_id = 0
+    cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'r', encoding='utf-8') as cf:
+            tcfg = json.load(cf)
+        eos_cfg = tcfg.get('eos_token')
+        if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
+            eos_id = eos_cfg['id']
+    special_arr = np.array([eos_id, 0xFFFFFFFF, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
+
+    off = 128
+    off_offsets = off; off += V * 4
+    off_lengths = off; off += V * 2
+    off_pool = off; off += len(pool)
+    pool_pad = (4 - len(pool) % 4) % 4; off += pool_pad
+    off_merge_left = off; off += V * 4
+    off_merge_right = off; off += V * 4
+    off_merge_rank = off; off += V * 4
+    off_byte_enc = off; off += 512
+    off_byte_dec = off; off += 512
+    off_special = off; off += 28
+    total_size = off
+
+    buf = bytearray(total_size)
+    struct.pack_into('<I', buf, 0, 0x544F4B42)
+    struct.pack_into('<I', buf, 4, 1)
+    struct.pack_into('<I', buf, 8, V)
+    struct.pack_into('<I', buf, 12, max_token_length)
+    struct.pack_into('<I', buf, 20, 0)
+    offs_list = [off_offsets, off_lengths, off_pool, len(pool),
+                 off_merge_left, off_merge_right, off_merge_rank,
+                 off_byte_enc, off_byte_dec, off_special]
+    for i, val in enumerate(offs_list):
+        struct.pack_into('<Q', buf, 24 + i * 8, val)
+    buf[off_offsets:off_offsets + V * 4] = offsets.tobytes()
+    buf[off_lengths:off_lengths + V * 2] = lengths.tobytes()
+    buf[off_pool:off_pool + len(pool)] = pool
+    buf[off_merge_left:off_merge_left + V * 4] = merge_left.tobytes()
+    buf[off_merge_right:off_merge_right + V * 4] = merge_right.tobytes()
+    buf[off_merge_rank:off_merge_rank + V * 4] = merge_rank.tobytes()
+    buf[off_byte_enc:off_byte_enc + 512] = byte_encoder.tobytes()
+    buf[off_byte_dec:off_byte_dec + 512] = byte_decoder.tobytes()
+    buf[off_special:off_special + 28] = special_arr.tobytes()
+
+    print(f'  Binary tokenizer: {total_size/1024/1024:.2f} MB (pool={len(pool)/1024:.1f} KB, V={V})')
+    return bytes(buf)
+
 def pre_shuffle_rows(tensor):
     out_dim = tensor.shape[0]
     assert out_dim % 4 == 0
@@ -257,6 +386,34 @@ def create_atlas_trilm(model_dir, output_path):
             out.write(tokenizer_block)
             struct.pack_into('<I', header, 29, len(tokenizer_block))
             struct.pack_into('<I', header, 33, tokenizer_offset)
+
+        # v6: Append binary tokenizer block (REQUIRED)
+        binary_tok_block = build_tokenizer_binary(model_dir)
+        if len(binary_tok_block) == 0:
+            print("[ATLAS] ERROR: Could not build v6 binary tokenizer block")
+            sys.exit(1)
+        struct.pack_into('<H', header, 5, 7)
+        if tokenizer_block:
+            binary_offset = tokenizer_offset + len(tokenizer_block)
+        else:
+            binary_offset = current_offset
+        if binary_offset % 32 != 0:
+            pad = 32 - (binary_offset % 32)
+            binary_offset += pad
+            out.write(b'\x00' * pad)
+        out.write(binary_tok_block)
+        current_offset = binary_offset + len(binary_tok_block)
+        struct.pack_into('<I', header, 37, len(binary_tok_block))
+        struct.pack_into('<I', header, 41, binary_offset)
+
+        # model_flags byte 53
+        mt = cfg.get('model_type', '')
+        is_qwen = 1 if mt == 'qwen2' else 0
+        tie_emb = 1 if cfg.get('tie_word_embeddings', False) else 0
+        thinking = 0
+        gate_act = 1 if cfg.get('hidden_act', 'silu') == 'relu2' else 0
+        model_flags = (is_qwen << 0) | (tie_emb << 1) | (thinking << 2) | (gate_act << 3)
+        struct.pack_into('<B', header, 53, model_flags)
 
         out.flush()
         out.seek(64)

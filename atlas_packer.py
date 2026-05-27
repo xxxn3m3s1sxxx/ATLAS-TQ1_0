@@ -46,7 +46,6 @@ def build_tokenizer_binary(model_dir):
     with open(tok_path, 'r', encoding='utf-8') as jf:
         tok_json_data = json.load(jf)
     merges_list = tok_json_data.get('model', {}).get('merges', [])
-    base_vocab_size = V - len(merges_list)
     for i, merge_pair in enumerate(merges_list):
         if isinstance(merge_pair, list) and len(merge_pair) == 2:
             left_str, right_str = merge_pair
@@ -59,8 +58,9 @@ def build_tokenizer_binary(model_dir):
         left_id = vocab.get(left_str)
         right_id = vocab.get(right_str)
         if left_id is not None and right_id is not None:
-            merged_id = base_vocab_size + i
-            if merged_id < V:
+            merged_str = left_str + right_str
+            merged_id = vocab.get(merged_str)
+            if merged_id is not None and merged_id < V:
                 merge_left[merged_id] = left_id
                 merge_right[merged_id] = right_id
                 merge_rank[merged_id] = i + 1
@@ -330,6 +330,22 @@ def create_atlas_from_config(safetensors_path, output_path):
         struct.pack_into('<d', header, 21, rope_theta)
         struct.pack_into('<I', header, 60, n_tensors)
 
+        # EOS/PAD in header bytes 45-52
+        tcfg_path = os.path.join(model_dir, 'tokenizer_config.json')
+        if os.path.exists(tcfg_path):
+            with open(tcfg_path) as tcf:
+                tcfg = json.load(tcf)
+            eos_cfg = tcfg.get('eos_token')
+            if isinstance(eos_cfg, dict) and 'id' in eos_cfg:
+                struct.pack_into('<I', header, 45, eos_cfg['id'])
+            pad_cfg = tcfg.get('pad_token')
+            if isinstance(pad_cfg, dict) and 'id' in pad_cfg:
+                struct.pack_into('<I', header, 49, pad_cfg['id'])
+
+        # model_flags byte 53: bit0=is_qwen3, bit1=tie_emb, bit2=thinking, bit3=gate_act
+        model_flags = 0  # Falcon3
+        struct.pack_into('<B', header, 53, model_flags)
+
         # Build name block: [name_block_size:4] [name_0\0] [name_1\0] ...
         name_bytes = b''.join(n.encode() + b'\0' for n in names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes
@@ -397,20 +413,21 @@ def create_atlas_from_config(safetensors_path, output_path):
             struct.pack_into('<I', header, 29, len(tokenizer_block))
             struct.pack_into('<I', header, 33, tokenizer_offset)
 
-        # v6: Append binary tokenizer block
+        # v6: Append binary tokenizer block (REQUIRED)
         binary_tok_block = build_tokenizer_binary(model_dir)
-        if binary_tok_block:
-            # Set version to 6
-            struct.pack_into('<H', header, 5, 6)
-            binary_offset = current_offset
-            if binary_offset % 32 != 0:
-                pad = 32 - (binary_offset % 32)
-                binary_offset += pad
-                out.write(b'\x00' * pad)
-            out.write(binary_tok_block)
-            current_offset = binary_offset + len(binary_tok_block)
-            struct.pack_into('<I', header, 37, len(binary_tok_block))
-            struct.pack_into('<I', header, 41, binary_offset)
+        if len(binary_tok_block) == 0:
+            print("[ATLAS] ERROR: Could not build v6 binary tokenizer block")
+            sys.exit(1)
+        struct.pack_into('<H', header, 5, 7)
+        binary_offset = current_offset
+        if binary_offset % 32 != 0:
+            pad = 32 - (binary_offset % 32)
+            binary_offset += pad
+            out.write(b'\x00' * pad)
+        out.write(binary_tok_block)
+        current_offset = binary_offset + len(binary_tok_block)
+        struct.pack_into('<I', header, 37, len(binary_tok_block))
+        struct.pack_into('<I', header, 41, binary_offset)
 
         # Flush before seeking back — Windows MSVCRT can't seek past 2GB
         # without an explicit flush (buffer contains unwritten data).

@@ -111,7 +111,7 @@ See `atlas_ffi.h` for full API.
 ## Roadmap
 
 ### v2.4.0 — Qwen3/Bonsai-Okosystem-Upgrade (AKTIV)
-- **Packer (`atlas_packer_bonsai.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
+- **Packer (`atlas_packer_g128.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
 - **head_dim=128**: Alle Attention-Pfade (RoPE, Scores, Weighted Sum, KV-Cache) auf variablen head_dim umstellen.
 - **QK-Norm**: Zwei neue RMSNorm-Tensoren pro Layer (`q_norm`, `k_norm`) im Attention-Hotpath.
 - **Dynamisches Vocab**: `vocab_size` aus Datei-Header statt hardcoded 131072 (Bonsai: 151669). EOS/PAD-IDs aus Header.
@@ -176,7 +176,7 @@ See `atlas_ffi.h` for full API.
 - `atlas_infer.py` — Python `AtlasModel` class with `generate_c()`
 - `atlas_ffi.h` — C API declarations (v6 header layout)
 - `atlas_packer.py` — v5/v6 format writer for Falcon3 models
-- `atlas_packer_bonsai.py` — Block-scaled g128 packer for Bonsai/Qwen3 models
+- `atlas_packer_g128.py` — Block-scaled g128 packer for Bonsai/Qwen3/BitNet models
 - `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS

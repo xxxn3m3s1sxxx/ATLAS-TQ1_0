@@ -1,9 +1,167 @@
 #!/usr/bin/env python3
-"""Atlas Packer for Qwen3/Bonsai Ternary — FP16 → TQ1.0"""
+"""Atlas Packer for Qwen3/Bonsai/BitNet — FP16 → TQ1.0"""
 import struct, numpy as np, json, os, sys
 from safetensors import safe_open
+import torch
 
 TQ1_MUL = np.array([1, 3, 9, 27, 81], dtype=np.uint32)
+
+
+def build_tokenizer_binary(model_dir):
+    """Build v6 binary tokenizer block from tokenizer.json.
+
+    Returns bytes of the binary block, or b'' if tokenizer.json not found.
+    Format: [128-byte header][offsets][lengths][pool][merge_left][merge_right][merge_rank][byte_encoder][byte_decoder][special_tokens]
+    """
+    tok_path = os.path.join(model_dir, 'tokenizer.json')
+    if not os.path.exists(tok_path):
+        print("[ATLAS] ERROR: tokenizer.json not found — cannot build v6 binary tokenizer")
+        return b''
+
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(tok_path)
+
+    vocab = tok.get_vocab()
+    V = len(vocab)
+    sorted_items = sorted(vocab.items(), key=lambda kv: kv[1])
+
+    offsets = np.empty(V, dtype=np.uint32)
+    lengths = np.empty(V, dtype=np.uint16)
+    pool_parts = []
+    offset_acc = 0
+    for i, (token_str, tid) in enumerate(sorted_items):
+        token_bytes = token_str.encode('utf-8')
+        offsets[i] = offset_acc
+        lengths[i] = len(token_bytes)
+        pool_parts.append(token_bytes)
+        offset_acc += len(token_bytes)
+    pool = b''.join(pool_parts)
+    max_token_length = int(max(lengths))
+
+    merge_left = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_right = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
+    merge_rank = np.zeros(V, dtype=np.uint32)
+
+    with open(tok_path, 'r', encoding='utf-8') as jf:
+        tok_json_data = json.load(jf)
+    merges_list = tok_json_data.get('model', {}).get('merges', [])
+    for i, merge_pair in enumerate(merges_list):
+        if isinstance(merge_pair, list) and len(merge_pair) == 2:
+            left_str, right_str = merge_pair
+        elif isinstance(merge_pair, str):
+            parts = merge_pair.split()
+            if len(parts) != 2: continue
+            left_str, right_str = parts
+        else:
+            continue
+        left_id = vocab.get(left_str)
+        right_id = vocab.get(right_str)
+        if left_id is not None and right_id is not None:
+            merged_str = left_str + right_str
+            merged_id = vocab.get(merged_str)
+            if merged_id is not None and merged_id < V:
+                merge_left[merged_id] = left_id
+                merge_right[merged_id] = right_id
+                merge_rank[merged_id] = i + 1
+
+    byte_encoder = np.full(256, 0xFFFF, dtype=np.uint16)
+    printable = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    byte_to_token = {}
+    n = 0
+    for b in range(256):
+        if b in printable:
+            byte_to_token[b] = chr(b)
+        else:
+            byte_to_token[b] = chr(256 + n)
+            n += 1
+    for b in range(256):
+        tid = vocab.get(byte_to_token[b])
+        if tid is not None:
+            byte_encoder[b] = tid
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        for b in missing:
+            tid = vocab.get(chr(256 + b))
+            if tid is not None:
+                byte_encoder[b] = tid
+    missing = [b for b in range(256) if byte_encoder[b] == 0xFFFF]
+    if missing:
+        print(f'  WARNING: {len(missing)} bytes unmapped in byte_encoder (first 8: {missing[:8]})')
+
+    byte_decoder = np.full(256, 0xFFFF, dtype=np.uint16)
+    for b in range(256):
+        if byte_encoder[b] != 0xFFFF:
+            byte_decoder[b] = b
+
+    eos_id = 0
+    cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'r', encoding='utf-8') as cf:
+            cfg = json.load(cf)
+        eos_cfg = cfg.get('eos_token')
+        if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
+            eos_id = eos_cfg['id']
+    special_arr = np.array([eos_id, 0xFFFFFFFF, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
+
+    off = 128
+    off_offsets = off; off += V * 4
+    off_lengths = off; off += V * 2
+    off_pool = off; off += len(pool)
+    pool_pad = (4 - len(pool) % 4) % 4; off += pool_pad
+    off_merge_left = off; off += V * 4
+    off_merge_right = off; off += V * 4
+    off_merge_rank = off; off += V * 4
+    off_byte_enc = off; off += 512
+    off_byte_dec = off; off += 512
+    off_special = off; off += 28
+    total_size = off
+
+    buf = bytearray(total_size)
+    struct.pack_into('<I', buf, 0, 0x544F4B42)
+    struct.pack_into('<I', buf, 4, 1)
+    struct.pack_into('<I', buf, 8, V)
+    struct.pack_into('<I', buf, 12, max_token_length)
+    struct.pack_into('<I', buf, 20, 0)
+    offs_list = [off_offsets, off_lengths, off_pool, len(pool),
+                 off_merge_left, off_merge_right, off_merge_rank,
+                 off_byte_enc, off_byte_dec, off_special]
+    for i, val in enumerate(offs_list):
+        struct.pack_into('<Q', buf, 24 + i * 8, val)
+    buf[off_offsets:off_offsets + V * 4] = offsets.tobytes()
+    buf[off_lengths:off_lengths + V * 2] = lengths.tobytes()
+    buf[off_pool:off_pool + len(pool)] = pool
+    buf[off_merge_left:off_merge_left + V * 4] = merge_left.tobytes()
+    buf[off_merge_right:off_merge_right + V * 4] = merge_right.tobytes()
+    buf[off_merge_rank:off_merge_rank + V * 4] = merge_rank.tobytes()
+    buf[off_byte_enc:off_byte_enc + 512] = byte_encoder.tobytes()
+    buf[off_byte_dec:off_byte_dec + 512] = byte_decoder.tobytes()
+    buf[off_special:off_special + 28] = special_arr.tobytes()
+
+    print(f'  Binary tokenizer: {total_size/1024/1024:.2f} MB (pool={len(pool)/1024:.1f} KB, V={V})')
+    return bytes(buf)
+
+
+def unpack_ternary_weight(packed, scale):
+    """Unpack 2-bit ternary codes from uint8 tensor.
+
+    HF BitNet stores weights as packed 2-bit ternary: 4 values/byte.
+    Mapping: 0b00=-1, 0b01=0, 0b10=+1
+    Shape (packed_rows, cols) -> (packed_rows*4, cols)
+
+    Returns float32 matrix (packed_rows*4 x cols) = ternary * scale.
+    """
+    pr, c = packed.shape  # packed_rows, cols
+    out_rows = pr * 4
+    out = np.zeros((out_rows, c), dtype=np.float32)
+
+    # Bit decode: shift right by 0,2,4,6 then mask 0x03
+    # Mapping: 0->-1, 1->0, 2->+1
+    for j in range(4):
+        bits = (packed >> (j * 2)) & 0x03
+        val = np.where(bits == 1, 0.0, np.where(bits == 2, 1.0, -1.0))
+        out[j::4, :] = val * scale
+
+    return out
 
 def pre_shuffle_rows(tensor):
     """Pre-shuffle weight rows to cancel C++ matmul SIMD reorder.
@@ -157,6 +315,15 @@ def create_atlas_qwen(model_dir, output_path):
     if "lm_head.weight" in weight_map:
         tensor_names.append("lm_head.weight")
 
+    # BitNet SubLN tensors (only in BitNet models, skip for Qwen3/Bonsai)
+    for L in range(n_layers):
+        for bname in [
+            f"model.layers.{L}.self_attn.attn_sub_norm.weight",
+            f"model.layers.{L}.mlp.ffn_sub_norm.weight",
+        ]:
+            if bname in weight_map:
+                tensor_names.append(bname)
+
     print(f"  Tensors: {len(tensor_names)}")
 
     # Load tokenizer
@@ -177,7 +344,7 @@ def create_atlas_qwen(model_dir, output_path):
     def get_tensor(tname):
         sp = get_shard_path(weight_map, tname, model_dir)
         if sp not in shard_handles:
-            shard_handles[sp] = safe_open(sp, framework='np')
+            shard_handles[sp] = safe_open(sp, framework='pt')
         return shard_handles[sp].get_tensor(tname)
 
     with open(output_path, 'wb') as out:
@@ -203,6 +370,15 @@ def create_atlas_qwen(model_dir, output_path):
         if eos_id is not None: struct.pack_into('<I', header, 45, eos_id)
         if pad_id is not None: struct.pack_into('<I', header, 49, pad_id)
 
+        # model_flags byte 53: bit0=is_qwen3, bit1=tie_emb, bit2=thinking, bit3=gate_act
+        mt = cfg.get('model_type', '')
+        is_qwen = 1 if mt in ('qwen2', 'qwen3') else 0
+        tie_emb = 1 if cfg.get('tie_word_embeddings', False) else 0
+        thinking = 1 if cfg.get('enable_thinking', False) else 0
+        gate_act = 1 if cfg.get('hidden_act', 'silu') == 'relu2' else 0
+        model_flags = (is_qwen << 0) | (tie_emb << 1) | (thinking << 2) | (gate_act << 3)
+        struct.pack_into('<B', header, 53, model_flags)
+
         # Name block
         name_bytes = b''.join(n.encode() + b'\0' for n in tensor_names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes
@@ -225,15 +401,22 @@ def create_atlas_qwen(model_dir, output_path):
             is_ternary = 'proj' in name and 'weight' in name
 
             if is_ternary:
+                # Handle HF BitNet packed uint8 weights
+                if tensor.dtype == torch.uint8:
+                    base = name.rsplit('.', 1)[0]
+                    scale_tname = f"{base}.weight_scale"
+                    scale_val = get_tensor(scale_tname).item()
+                    tensor = unpack_ternary_weight(tensor.numpy(), scale_val)
+                else:
+                    tensor = tensor.cpu().to(torch.float32).numpy()
+
                 tensor = pre_shuffle_rows(tensor)
                 data_bytes, packed_per_row, n_blocks, block_size = ternarize_block_scaled(tensor)
-                # No scale prefix — scales are embedded in ternarize_block_scaled output
-                # data_bytes already contains [block_size:1][n_blocks:2][scales][packed_TQ1]
             else:
                 packed_per_row = 0
                 n_blocks = 0
                 block_size = 0
-                data_bytes = tensor.astype(np.float16).tobytes()
+                data_bytes = tensor.cpu().to(torch.float16).numpy().tobytes()
 
             if current_offset % 32 != 0:
                 pad = 32 - (current_offset % 32)
@@ -264,7 +447,7 @@ def create_atlas_qwen(model_dir, output_path):
             if idx % 8 == 0:
                 print(f"  [{idx}/{len(tensor_names)}] {name[:55]:55s} {len(data_bytes)/1024:7.1f}KB")
 
-        # Tokenizer block
+        # Tokenizer block (v5+)
         if tokenizer_block:
             tokenizer_offset = current_offset
             if tokenizer_offset % 32 != 0:
@@ -274,6 +457,25 @@ def create_atlas_qwen(model_dir, output_path):
             out.write(tokenizer_block)
             struct.pack_into('<I', header, 29, len(tokenizer_block))
             struct.pack_into('<I', header, 33, tokenizer_offset)
+
+        # v6: Append binary tokenizer block
+        binary_tok_block = build_tokenizer_binary(os.path.dirname(input_path))
+        if len(binary_tok_block) == 0:
+            print("[ATLAS] ERROR: Could not build v6 binary tokenizer block")
+            sys.exit(1)
+        struct.pack_into('<H', header, 5, 7)
+        if tokenizer_block:
+            binary_offset = tokenizer_offset + len(tokenizer_block)
+        else:
+            binary_offset = current_offset
+        if binary_offset % 32 != 0:
+            pad = 32 - (binary_offset % 32)
+            binary_offset += pad
+            out.write(b'\x00' * pad)
+        out.write(binary_tok_block)
+        current_offset = binary_offset + len(binary_tok_block)
+        struct.pack_into('<I', header, 37, len(binary_tok_block))
+        struct.pack_into('<I', header, 41, binary_offset)
 
         out.flush()
         out.seek(64)
@@ -288,6 +490,6 @@ def create_atlas_qwen(model_dir, output_path):
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: python atlas_packer_bonsai.py <model_dir> <output.atlas>")
+        print("Usage: python atlas_packer_g128.py <model_dir> <output.atlas>")
         sys.exit(1)
     create_atlas_qwen(sys.argv[1], sys.argv[2])

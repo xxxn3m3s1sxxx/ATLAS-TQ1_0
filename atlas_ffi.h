@@ -193,6 +193,7 @@ ATLAS_API void atlas_reset_cache(void* model);
 // v2.4.0: Set layer stride — tensors per transformer layer.
 // 9 for Falcon3, 11 for Qwen3 (adds q_norm + k_norm).
 ATLAS_API void atlas_set_layer_stride(void* model, int stride);
+ATLAS_API void atlas_ensure_layer_idx(void* model);
 
 // v1.3.2: Decompress only FFN tensors (gate/up/down) to int8, leave QKV packed.
 ATLAS_API void atlas_decompress_ffn(void* model);
