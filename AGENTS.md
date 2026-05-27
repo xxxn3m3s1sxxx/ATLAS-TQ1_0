@@ -47,10 +47,12 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 
 | Model | Hybrid tok/s (total) | Hybrid tok/s (pure gen) | Sustained gen tokens |
 |-------|:--------------------:|:-----------------------:|:--------------------:|
-| **3B** | **7.1** | — | 200 (no EOS) |
-| **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
+| **3B** | **5.4–7.1** | — | 200 (no EOS) |
+| **1B** | **7.4–9.5** | **10.1** | 24 (Gumbel-EOS) |
 | **7B** | **1.9** | — | 61 (sampling-dependent) |
-| **10B** | **1.3** | — | 29 (sampling-dependent) |
+| **10B** | **0.7–2.0** | — | 29–50 (OMP-dependent) |
+
+**OMP Tuning (10B on 4C/8T Kaby Lake)**: Best at `OMP=8` (hyperthreading). 10B: 0.28 tok/s (OMP=4, cold) → 2.02 tok/s (OMP=8, warm). Memory-bound workload benefits from HT — while one thread stalls on DRAM, another issues loads. Default: `OMP=8` recommended for 7B/10B, `OMP=4` sufficient for 1B/3B.
 
 **10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
 
@@ -140,6 +142,8 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.6.5** | **TurboQuant 2-bit unpack prototype**: SSE4.1 (6.2×), AVX2 (8.0×), Gather+LUT rejected (1.1×). 10.9G–12.9G weights/s. Fused matmul kernel skeleton (`#if 0`). |
+| **v2.6.4** | **min_new_tokens + persistent KV cache**: EOS logit clamping (-1e9f), `cache_offset` C API + Python prefix-match. 7B Turn 2: 56% faster (15.6→6.8s). |
 | **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: Reverted fused-kernel-only approach. All ttype=5 tensors decompressed to int8 at load. `f32_bypass` forced for block-scaled models (rope_theta≥3M or hidden≤2048) — no uint8+128 activation quant, no signal collapse. Bonsai-8B: 0.2→1.6-2.2 tok/s with perfect T=0.7 coherence. |
 | **v2.6.3** | **BitNet ARCH_BITNET + Repo Cleanup**: `atlas_ensure_layer_idx()` C API für Python `forward()`-Pfad. f32_bypass forced für SubLN-Architekturen (u8+128 Activation Quant zerstört ~0.01× SubLN-Signal). 91 Scratch-Dateien gelöscht, tote Packer entfernt, `.gitignore` gehärtet. |
 | **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
