@@ -62,6 +62,8 @@ def test_generate_argtypes(dll):
         ctypes.c_int,                                    # top_k
         ctypes.c_float,                                  # top_p
         ctypes.c_float,                                  # repetition_penalty
+        ctypes.c_int,                                    # min_new_tokens
+        ctypes.c_int,                                    # cache_offset
         ctypes.POINTER(ctypes.c_int),                    # output_ids
     ]
     sig.restype = ctypes.c_int

@@ -3365,6 +3365,8 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
+    int min_new_tokens,
+    int cache_offset,
     int* output_ids)
 {
     if (!m || !input_ids || !output_ids || n_input < 1 || max_new_tokens < 1)
@@ -3399,8 +3401,13 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     ensure_layer_idx(m);
     const int* layer_idx = m->layer_idx_cache.data();
 
-    // Allocate scratch: embedding buffer, norm scratch, logits
-    float* embed_buf = (float*)atlas_valloc((size_t)n_input * H * sizeof(float));
+    // Clamp cache_offset to valid range
+    if (cache_offset < 0) cache_offset = 0;
+    if (cache_offset >= n_input) cache_offset = n_input - 1;
+    int n_new = n_input - cache_offset;
+
+    // Allocate scratch: embed_buf for NEW tokens only
+    float* embed_buf = (float*)atlas_valloc((size_t)n_new * H * sizeof(float));
     float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
     float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
     int* context = (int*)atlas_valloc((size_t)(n_input + max_new_tokens) * sizeof(int));
@@ -3413,42 +3420,44 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     }
     memcpy(context, input_ids, (size_t)n_input * sizeof(int));
 
-    // ─── Prefill: embed all input tokens ───
+    // ─── Prefill: embed NEW tokens only (cache_offset..n_input-1) ───
     int n_gen = 0;
-    for (int i = 0; i < n_input; i++) {
-        int tid = input_ids[i];
+    for (int i = 0; i < n_new; i++) {
+        int idx = cache_offset + i;
+        int tid = input_ids[idx];
         if (tid < 0 || tid >= V) tid = 0;
         for (int j = 0; j < H; j++)
             embed_buf[i * H + j] = fp16_to_fp32(embed_w[tid * H + j]);
     }
 
-    // Build position array for prefill
-    int* positions = (int*)atlas_valloc((size_t)n_input * sizeof(int));
+    // Build position array starting from cache_offset
+    int* positions = (int*)atlas_valloc((size_t)n_new * sizeof(int));
     if (!positions) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context); return -1;
     }
-    for (int i = 0; i < n_input; i++) positions[i] = i;
+    for (int i = 0; i < n_new; i++) positions[i] = cache_offset + i;
 
-    // Fused forward for all prompt tokens at once
-    atlas_forward(m, embed_buf, n_input, positions,
+    // Fused forward for new tokens only; seq_now = total cached tokens
+    atlas_forward(m, embed_buf, n_new, positions,
                   max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
-    // Final RMSNorm + LM head — only the last prompt token's logits are needed
+    // Final RMSNorm + LM head — only the last new token's logits are needed
     {
-        const float* x = embed_buf + (int64_t)(n_input - 1) * H;
+        const float* x = embed_buf + (int64_t)(n_new - 1) * H;
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
     }
 
     // Sample first token from prefill logits
+    const int eos_id = m->eos_id;
+    if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
     context[n_input] = next_token;
     output_ids[n_gen++] = next_token;
 
-    const int eos_id = m->eos_id;
     if (next_token == eos_id) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
@@ -3475,6 +3484,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
 
+        if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
         context[n_input + n_gen] = next_token;
@@ -3497,6 +3507,8 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
+    int min_new_tokens,
+    int cache_offset,
     atlas_token_callback callback, void* user_data)
 {
     if (!m || !input_ids || !callback || n_input < 1 || max_new_tokens < 1)
@@ -3524,7 +3536,11 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     ensure_layer_idx(m);
     const int* layer_idx = m->layer_idx_cache.data();
 
-    float* embed_buf = (float*)atlas_valloc((size_t)n_input * H * sizeof(float));
+    if (cache_offset < 0) cache_offset = 0;
+    if (cache_offset >= n_input) cache_offset = n_input - 1;
+    int n_new = n_input - cache_offset;
+
+    float* embed_buf = (float*)atlas_valloc((size_t)n_new * H * sizeof(float));
     float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
     float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
     int* context = (int*)atlas_valloc((size_t)(n_input + max_new_tokens) * sizeof(int));
@@ -3537,39 +3553,41 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     }
     memcpy(context, input_ids, (size_t)n_input * sizeof(int));
 
-    // ─── Prefill ───
+    // ─── Prefill: NEW tokens only ───
     int n_gen = 0;
-    for (int i = 0; i < n_input; i++) {
-        int tid = input_ids[i];
+    for (int i = 0; i < n_new; i++) {
+        int idx = cache_offset + i;
+        int tid = input_ids[idx];
         if (tid < 0 || tid >= V) tid = 0;
         for (int j = 0; j < H; j++)
             embed_buf[i * H + j] = fp16_to_fp32(embed_w[tid * H + j]);
     }
 
-    int* positions = (int*)atlas_valloc((size_t)n_input * sizeof(int));
+    int* positions = (int*)atlas_valloc((size_t)n_new * sizeof(int));
     if (!positions) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context); return -1;
     }
-    for (int i = 0; i < n_input; i++) positions[i] = i;
+    for (int i = 0; i < n_new; i++) positions[i] = cache_offset + i;
 
-    atlas_forward(m, embed_buf, n_input, positions,
+    atlas_forward(m, embed_buf, n_new, positions,
                   max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
     {
-        const float* x = embed_buf + (int64_t)(n_input - 1) * H;
+        const float* x = embed_buf + (int64_t)(n_new - 1) * H;
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
     }
 
+    const int eos_id = m->eos_id;
+    if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
     context[n_input] = next_token;
     callback(next_token, user_data);
     n_gen++;
 
-    const int eos_id = m->eos_id;
     if (next_token == eos_id) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
@@ -3595,6 +3613,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
 
+        if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
         context[n_input + n_gen] = next_token;

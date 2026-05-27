@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atlas Inference Engine v2.6.3 — Falcon3/BitNet/Bonsai TQ1.0 inference."""
+"""Atlas Inference Engine v2.6.4 — Falcon3/BitNet/Bonsai TQ1.0 inference."""
 import ctypes, struct, os, sys, time, json, queue, threading, numpy as np
 # v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
@@ -191,6 +191,8 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
     ctypes.c_float,
+    ctypes.c_int,
+    ctypes.c_int,
     ctypes.POINTER(ctypes.c_int)]
 
 # v2.1.0: Streaming callback type + repetition_penalty + BPE-PQ
@@ -200,6 +202,8 @@ dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.c_int, ctypes.c_int,
     ctypes.c_float, ctypes.c_int, ctypes.c_float,
     ctypes.c_float,
+    ctypes.c_int,
+    ctypes.c_int,
     TOKEN_CALLBACK, ctypes.c_void_p]
 dll.atlas_generate_stream.restype = ctypes.c_int
 
@@ -252,6 +256,10 @@ class AtlasModel:
 
         # Cache tensor indices for fast lookup
         self._cache_indices()
+
+        # v2.8.0: Persistent KV cache tracking for multi-turn
+        self._cached_input_ids = []
+        self._cache_valid = False
 
         # v2.4.0: Detect Qwen3 (Bonsai) models by rope_theta — YaRN NTK scaling
         if self.rope_theta >= 3000000.0:
@@ -413,6 +421,8 @@ class AtlasModel:
         """v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
         Call between conversations to prevent context leakage across sessions."""
         dll.atlas_reset_cache(self.model_ptr)
+        self._cached_input_ids = []
+        self._cache_valid = False
 
     def set_max_seq_len(self, seq_len):
         """v2.5.0: Set max sequence length (ring buffer window size).
@@ -807,9 +817,11 @@ class AtlasModel:
 
     def generate_c(self, prompt, max_new_tokens=50, temperature=0.7,
                    top_k=40, top_p=0.9, repetition_penalty=1.0,
-                   max_seq_len=None):
+                   max_seq_len=None, min_new_tokens=20, cache_enabled=True):
         """Generate via atlas_generate (single C call, v1.2.1).
-        max_seq_len: override KV cache window (default: self.max_seq_len)."""
+        max_seq_len: override KV cache window (default: self.max_seq_len).
+        min_new_tokens: suppress EOS for first N generated tokens.
+        cache_enabled: persistent KV cache for multi-turn (default: True)."""
         try:
             if isinstance(prompt, str):
                 prompt = [{"role": "user", "content": prompt}]
@@ -825,12 +837,21 @@ class AtlasModel:
         in_arr = (ctypes.c_int * n_input)(*input_ids)
         out_arr = (ctypes.c_int * max_new_tokens)()
 
+        # Determine cache_offset from persistent KV cache
+        cache_offset = 0
+        if cache_enabled and self._cache_valid:
+            old_len = len(self._cached_input_ids)
+            if n_input > old_len and list(input_ids[:old_len]) == self._cached_input_ids:
+                cache_offset = old_len
+
         n_gen = dll.atlas_generate(
             self.model_ptr, in_arr, n_input,
             max_seq_len if max_seq_len is not None else self.max_seq_len,
             max_new_tokens,
             float(temperature), int(top_k), float(top_p),
             float(repetition_penalty),
+            int(min_new_tokens),
+            int(cache_offset),
             out_arr)
 
         if n_gen < 0:
@@ -843,13 +864,24 @@ class AtlasModel:
             idx = decoded.find(stop)
             if idx >= 0:
                 decoded = decoded[:idx]
+
+        # Update persistent cache state
+        if cache_enabled and n_gen > 0:
+            self._cached_input_ids = list(input_ids) + output
+            self._cache_valid = True
+        elif not cache_enabled:
+            self._cached_input_ids = []
+            self._cache_valid = False
+
         return decoded
 
     def generate_stream(self, prompt, max_new_tokens=200, temperature=0.7,
                         top_k=40, top_p=0.9, repetition_penalty=1.0,
-                        max_seq_len=None):
+                        max_seq_len=None, min_new_tokens=20, cache_enabled=True):
         """Streaming generator — yields token IDs as they are produced.
         max_seq_len: override KV cache window (default: self.max_seq_len).
+        min_new_tokens: suppress EOS for first N generated tokens.
+        cache_enabled: persistent KV cache for multi-turn (default: True).
 
         Usage:
             for token_id in model.generate_stream("Write an article"):
@@ -872,10 +904,19 @@ class AtlasModel:
         n_input = len(input_ids)
         in_arr = (ctypes.c_int * n_input)(*input_ids)
 
+        # Determine cache_offset from persistent KV cache
+        cache_offset = 0
+        if cache_enabled and self._cache_valid:
+            old_len = len(self._cached_input_ids)
+            if n_input > old_len and list(input_ids[:old_len]) == self._cached_input_ids:
+                cache_offset = old_len
+
         # Thread-safe token queue
         q = queue.Queue()
+        collected = []
         def on_token(tid, _):
             q.put(tid)
+            collected.append(tid)
         cb = TOKEN_CALLBACK(on_token)
 
         t = threading.Thread(target=dll.atlas_generate_stream,
@@ -884,6 +925,8 @@ class AtlasModel:
                   max_new_tokens,
                   temperature, top_k, top_p,
                   float(repetition_penalty),
+                  int(min_new_tokens),
+                  int(cache_offset),
                   cb, None))
         t.start()
 
@@ -895,6 +938,14 @@ class AtlasModel:
                 n_gen += 1
             except queue.Empty:
                 continue
+
+        # Update persistent cache state
+        if cache_enabled and collected:
+            self._cached_input_ids = list(input_ids) + collected
+            self._cache_valid = True
+        elif not cache_enabled:
+            self._cached_input_ids = []
+            self._cache_valid = False
 
     def _cpp_encode(self, text):
         """Encode text via Python tokenizers library (no transformers dependency).

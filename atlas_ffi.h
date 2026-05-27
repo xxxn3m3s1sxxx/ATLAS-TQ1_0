@@ -256,6 +256,8 @@ ATLAS_API int atlas_generate(void* model,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
+    int min_new_tokens,
+    int cache_offset,
     int* output_ids);
 
 // ─── v2.3.0: Streaming generation ─────────────────────────────────────
@@ -272,6 +274,8 @@ ATLAS_API int atlas_generate_stream(void* model,
     int max_seq_len, int max_new_tokens,
     float temperature, int top_k, float top_p,
     float repetition_penalty,
+    int min_new_tokens,
+    int cache_offset,
     atlas_token_callback callback, void* user_data);
 
 // ─── Int8 lm_head ─────────────────────────────────────────────────────
