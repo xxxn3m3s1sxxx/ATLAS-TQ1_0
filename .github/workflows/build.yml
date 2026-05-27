@@ -23,31 +23,19 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-13  # Intel (AVX2) — macos-latest is ARM64
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM/Clang (Ubuntu)
+      - name: Install LLVM/Clang
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
-
-      - name: Install LLVM/Clang (macOS)
-        if: runner.os == 'macOS'
-        run: brew install llvm libomp
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
-
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          LLVM_PREFIX=$(brew --prefix llvm)
-          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -L$LLVM_PREFIX/lib -lomp
-          echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -55,35 +43,17 @@ jobs:
         run: |
           $llvmDir = "C:\Program Files\LLVM"
           if (-not (Test-Path $llvmDir)) { throw "LLVM not found at $llvmDir" }
-          # Build
           clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
           if ($LASTEXITCODE -ne 0) { throw "Build failed" }
-          # Copy ALL DLLs from LLVM bin — covers libomp, libc++, libc++abi, libunwind, etc.
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
           Write-Output "=== Copied $(@(Get-ChildItem *.dll).Count) DLLs ==="
-          # Add to PATH for runtime loading
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Install test deps (Linux)
-        if: runner.os == 'Linux'
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
-
-      - name: Install test deps (macOS)
-        if: runner.os == 'macOS'
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
-
-      - name: Install test deps (Windows)
-        if: runner.os == 'Windows'
+      - name: Install test deps
         run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
 
       - name: Test (Linux)
         if: runner.os == 'Linux'
-        run: |
-          python tests/ci_smoke.py
-          python -m pytest tests/test_dll.py -v
-
-      - name: Test (macOS)
-        if: runner.os == 'macOS'
         run: |
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
@@ -96,11 +66,29 @@ jobs:
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
 
+  # macOS only on release + manual dispatch (free tier runner bottleneck)
+  build-macos:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM/Clang
+        run: brew install llvm libomp
+      - name: Build
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -L$LLVM_PREFIX/lib -lomp
+          echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+      - name: Test
+        run: |
+          python tests/ci_smoke.py
+          python -m pytest tests/test_dll.py -v
+
       - name: Upload artifact (release only)
         if: github.event_name == 'release'
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-${{ runner.os }}
-          path: |
-            atlas.dll
-            libatlas.so
+          name: atlas-macOS
+          path: libatlas.so
