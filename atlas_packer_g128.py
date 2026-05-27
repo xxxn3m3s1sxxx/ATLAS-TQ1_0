@@ -93,15 +93,30 @@ def build_tokenizer_binary(model_dir):
         if byte_encoder[b] != 0xFFFF:
             byte_decoder[b] = b
 
-    eos_id = 0
+    special_ids = {'eos': 0xFFFFFFFF, 'bos': 0xFFFFFFFF, 'pad': 0xFFFFFFFF,
+                   'unk': 0xFFFFFFFF, 'mask': 0xFFFFFFFF, 'sep': 0xFFFFFFFF, 'cls': 0xFFFFFFFF}
     cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
     if os.path.exists(cfg_path):
         with open(cfg_path, 'r', encoding='utf-8') as cf:
             cfg = json.load(cf)
-        eos_cfg = cfg.get('eos_token')
-        if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
-            eos_id = eos_cfg['id']
-    special_arr = np.array([eos_id, 0xFFFFFFFF, 0, 0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
+        for key in ['eos_token', 'bos_token', 'pad_token', 'unk_token', 'mask_token', 'sep_token', 'cls_token']:
+            val = cfg.get(key)
+            if val and isinstance(val, dict) and 'id' in val:
+                special_ids[key.split('_')[0]] = val['id']
+    for token_str, tid in vocab.items():
+        if tid == 0:
+            special_ids['eos'] = tid if special_ids['eos'] == 0xFFFFFFFF else special_ids['eos']
+        for pattern, idx_key in [('<|endoftext|>', 'eos'), ('<|im_end|>', 'eos'),
+                                  ('<|pad|>', 'pad'), ('<unk>', 'unk')]:
+            if token_str == pattern and special_ids[idx_key] == 0xFFFFFFFF:
+                special_ids[idx_key] = tid
+    if special_ids['pad'] == 0xFFFFFFFF: special_ids['pad'] = 0
+    if special_ids['unk'] == 0xFFFFFFFF: special_ids['unk'] = 0
+    if special_ids['eos'] == 0xFFFFFFFF: special_ids['eos'] = 0
+    special_arr = np.array([
+        special_ids['eos'], special_ids['bos'], special_ids['pad'],
+        special_ids['unk'], special_ids['mask'], special_ids['sep'], special_ids['cls']
+    ], dtype=np.uint32)
 
     off = 128
     off_offsets = off; off += V * 4

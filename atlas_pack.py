@@ -50,12 +50,12 @@ def detect_model(model_dir):
     return family, size_label
 
 
-def auto_output_name(model_dir, family, size_label):
+def auto_output_name(model_dir, family, size_label, ttype=5):
     """Generate standard output filename."""
     name = os.path.basename(model_dir.rstrip('/\\')).lower()
     if family == "bonsai":
-        # Normalize: e.g. "bonsai-8b-tq1-g128.atlas"
-        out = f"bonsai-{size_label.lower()}-tq1-g128.atlas"
+        suffix = "tq2-v7" if ttype == 7 else "tq1-g128"
+        out = f"bonsai-{size_label.lower()}-{suffix}.atlas"
     else:
         out = f"falcon3-{size_label.lower()}-tq1.atlas"
     return os.path.join(os.path.dirname(model_dir), out)
@@ -68,6 +68,8 @@ def main():
     parser.add_argument('-o', '--output', help='Output .atlas file path (auto-generated if omitted)')
     parser.add_argument('--no-cache', action='store_true',
                         help='Skip .i8 cache (always decompress from packed)')
+    parser.add_argument('--ttype', type=int, choices=[5, 7], default=5,
+                        help='Ternary type: 5 = TQ1.0 g128 (default), 7 = TurboQuant 2-bit')
     args = parser.parse_args()
 
     model_dir = args.model_dir
@@ -82,7 +84,7 @@ def main():
     if args.output:
         output_path = args.output
     else:
-        output_path = auto_output_name(model_dir, family, size_label)
+        output_path = auto_output_name(model_dir, family, size_label, ttype=args.ttype)
         print(f"[ATLAS] Auto output: {output_path}")
 
     # Check if output already exists
@@ -98,7 +100,7 @@ def main():
 
     if family == "bonsai":
         from atlas_packer_g128 import create_atlas_qwen
-        create_atlas_qwen(model_dir, output_path)
+        create_atlas_qwen(model_dir, output_path, ttype=args.ttype)
     else:
         from atlas_packer import create_atlas_from_config
         # Find the safetensors file(s)

@@ -1194,7 +1194,7 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         }
 
         auto& t = m->tensors[i];
-        if ((t.ttype == 0 || t.ttype == 5) && cttype == 3 && ds > 0 && off >= 0) {
+        if ((t.ttype == 0 || t.ttype == 5 || t.ttype == 7) && cttype == 3 && ds > 0 && off >= 0) {
             // Validate tensor shapes match model
             if (t.row_dim != row_dim || t.packed_cols != cpc) {
                 printf("[CACHE] Tensor %d shape mismatch (model: %dx%d, cache: %dx%d), ignoring\n",
