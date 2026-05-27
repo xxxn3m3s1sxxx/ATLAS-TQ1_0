@@ -144,6 +144,14 @@ ATLAS_API int atlas_tokenizer_decode(void* model,
 // Frees packed TQ1 data after decompression. Call once after safetensors loaded.
 ATLAS_API void atlas_decompress_all(void* model);
 
+// Decompress block-scaled TQ1 (ttype==5) to uniform int8 (ttype==3) in-place.
+// Converts per-block fp16 scales → single per-tensor int8 scale. v2.4.0.
+ATLAS_API void atlas_decompress_ttype5(void* model);
+
+// Decompress TurboQuant 2-bit (ttype==7) to uniform int8 (ttype==3) in-place.
+// Converts on-the-fly decode → full int8 vpmaddubs speed. v2.7.0.
+ATLAS_API void atlas_decompress_ttype7(void* model);
+
 // Save decompressed int8 tensors to .i8 companion file. Safe to call
 // multiple times (overwrites). Writes in 64KB chunks for Windows compat.
 ATLAS_API void atlas_save_cache(void* model, const char* atlas_path);

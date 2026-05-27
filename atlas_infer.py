@@ -47,6 +47,13 @@ try:
 except AttributeError:
     _HAS_TTYPE5_DECOMPRESS = False
 
+try:
+    dll.atlas_decompress_ttype7.restype = None
+    dll.atlas_decompress_ttype7.argtypes = [ctypes.c_void_p]
+    _HAS_TTYPE7_DECOMPRESS = True
+except AttributeError:
+    _HAS_TTYPE7_DECOMPRESS = False
+
 dll.atlas_decompress_ffn.restype = None
 dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
 
@@ -298,6 +305,8 @@ class AtlasModel:
                 dll.atlas_decompress_all(self.model_ptr)
                 if _HAS_TTYPE5_DECOMPRESS:
                     dll.atlas_decompress_ttype5(self.model_ptr)
+                if _HAS_TTYPE7_DECOMPRESS:
+                    dll.atlas_decompress_ttype7(self.model_ptr)
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)
