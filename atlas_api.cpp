@@ -1895,6 +1895,52 @@ static inline float hsum_ps(__m256 v) {
     return _mm_cvtss_f32(l);
 }
 
+// ─── v2.7.0: TurboQuant fused matmul kernel (2-bit packed, K_tile=32) ───
+// INACTIVE SKELETON — activate when v7 packers arrive.
+// Usage: change `#if 0` to `#if 1`, add `ttype == 7` dispatch branch.
+// Fuses 2-bit unpack (AVX2) + i8×i8 matmul + f32 accumulate.
+// No int8 buffer for unpacked weights — decode on-the-fly in registers.
+// K_tile=32: 8 packed bytes per row → 32 int8 weights → 4× ymm f32 → FMA.
+#if 0
+static void matmul_turboquant_fused(int rows, int input_dim,
+    const uint8_t* packed_2bit, const float* activations,
+    float* output, int B, int stride_out) {
+    // K_tile=32: 8 packed bytes → 32 ternary weights
+    // K_tiles per row: input_dim / 32
+    // g128: scale every 128 weights (4 K_tiles)
+    const int K_tiles = input_dim / 32;
+    const int blocks = input_dim / 128;  // g128 block-scaled
+    const __m256i m3 = _mm256_set1_epi16(3);
+    const __m256i o1 = _mm256_set1_epi16(1);
+    const __m256i z = _mm256_setzero_si256();
+
+    for (int b = 0; b < B; b++) {
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+        for (int kt = 0; kt < K_tiles; kt++) {
+            // Load 8 packed bytes (32 ternary weights in 2-bit)
+            __m128i p8 = _mm_loadl_epi64((const __m128i*)(packed_2bit + kt * 8 + 0));
+            // Unpack to 32 int8 via SSE4.1 (same as _bench_turbo_unpack)
+            __m128i pe = _mm_unpacklo_epi8(p8, _mm_setzero_si128());
+            __m128i po = _mm_unpackhi_epi8(p8, _mm_setzero_si128());
+            __m128i s0e = _mm_sub_epi16(_mm_and_si128(pe, _mm_set1_epi16(3)), _mm_set1_epi16(1));
+            __m128i s0o = _mm_sub_epi16(_mm_and_si128(po, _mm_set1_epi16(3)), _mm_set1_epi16(1));
+            __m128i w0 = _mm_packs_epi16(s0e, s0o);
+            // w0 has 16 int8 weights for bytes 0-3 and 4-7
+            // Expand to f32 via int8→i32→f32
+            __m256i w0_i32 = _mm256_cvtepi8_epi32(w0);
+            __m256  w0_f32 = _mm256_cvtepi32_ps(w0_i32);
+            // Load activations (k, k+8, k+16, k+24 → but K_tile=32, split)
+            __m256 act0 = _mm256_loadu_ps(activations + b * input_dim + kt * 32 + 0);
+            // FMA: output += weight * activation
+            acc0 = _mm256_fmadd_ps(w0_f32, _mm256_permute_ps(act0, 0x00), acc0);
+            // (above is placeholder — real impl processes 4× ymm activations)
+        }
+        _mm256_storeu_ps(output + b * stride_out + 0, acc0);
+    }
+}
+#endif
+
 // ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
 // act_u8: [B, input_dim] uint8 quantized activations [1, 255]
 // weights: [rows, input_dim] int8 ternary weights {-1, 0, +1}
