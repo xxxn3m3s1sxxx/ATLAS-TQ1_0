@@ -274,6 +274,8 @@ struct TensorInfo {
     int n_blocks;       // number of per-block scale groups (0=unused)
 };
 
+enum { ARCH_LLAMA = 0, ARCH_QWEN3 = 1, ARCH_BITNET = 2 };
+
 struct AtlasModel {
     int n_layers;
     int hidden_dim;
@@ -285,13 +287,15 @@ struct AtlasModel {
     float rope_theta;
     float rope_scale = 1.0f; // YaRN NTK scaling (1.0 = off, 4.0 = Bonsai)
     int base_seq_len = 4096; // v2.5.0: trained context length for NTK extension
-    int layer_stride = 9;    // tensors per layer (9 Falcon3, 11 Qwen3 with QK-Norm)
+    int layer_stride = 9;    // tensors per layer (9 Falcon3, 11 Qwen3/BitNet)
+    int model_arch = 0;      // 0=LLaMA, 1=Qwen3, 2=BitNet
     int eos_id = 11;   // default Falcon3 endoftext
     int pad_id = 0;    // default padding token
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
     bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4× less memory)
     bool use_hybrid_matmul = false; // v1.3.2: FFN int8 cache, QKV packed
+    bool use_relu2 = false;         // v2.8.0: ReLU² activation (BitNet b1.58)
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
     std::vector<std::string> tensor_names;
@@ -481,6 +485,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     uint32_t pad_val; memcpy(&pad_val, hdr+49, 4);
     if (eos_val != 0) m->eos_id = (int)eos_val;
     if (pad_val != 0) m->pad_id = (int)pad_val;
+
+    // Byte 53: model_flags — gate_act (bit 3) for ReLU² (BitNet b1.58)
+    m->use_relu2 = (hdr[53] >> 3) & 1;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
            version,
@@ -1852,6 +1859,14 @@ ATLAS_API void atlas_set_layer_stride(AtlasModel* m, int stride) {
     if (m) m->layer_stride = stride;
 }
 
+// Forward declaration (defined after atlas_generate)
+static void ensure_layer_idx(AtlasModel* m);
+
+// ─── v2.7.6: Ensure layer index cache + model arch detection ───
+ATLAS_API void atlas_ensure_layer_idx(AtlasModel* m) {
+    if (m) ensure_layer_idx(m);
+}
+
 // ─── v2.5.0: Set base sequence length (trained context for NTK extension) ──
 ATLAS_API void atlas_set_base_seq_len(AtlasModel* m, int seq_len) {
     if (m && seq_len > 0) m->base_seq_len = seq_len;
@@ -2009,6 +2024,25 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
             }
         }
         free(decode_buf);
+    }
+}
+
+// ─── Gate activation: SiLU (default) vs ReLU² (BitNet) ────────────
+static inline float gate_activation(float g, bool use_relu2) {
+    if (use_relu2) {
+        float r = g > 0.0f ? g : 0.0f;
+        return r * r;
+    }
+    return g / (1.0f + expf(-g));
+}
+
+static inline void apply_sub_norm(float* buf, int n, const uint8_t* w_data) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += buf[i] * buf[i];
+    float rms = 1.0f / sqrtf(ss / n + 1e-6f);
+    for (int i = 0; i < n; i++) {
+        uint16_t w16; memcpy(&w16, w_data + i * 2, 2);
+        buf[i] *= rms * fp16_to_fp32(w16);
     }
 }
 
@@ -2595,13 +2629,21 @@ static void forward_layer_internal(
         memcpy(k_f32 + b * kvd, m->buf_hidden + b * tk.row_dim, kvd * sizeof(float));
         memcpy(v_f32 + b * kvd, m->buf_up + b * tv.row_dim, kvd * sizeof(float));
     }
-    const uint8_t* qn_w = (idx_q_norm >= 0) ? m->tensors[idx_q_norm].data : nullptr;
-    const uint8_t* kn_w = (idx_k_norm >= 0) ? m->tensors[idx_k_norm].data : nullptr;
+    const uint8_t* qn_w = (idx_q_norm >= 0 && m->model_arch == ARCH_QWEN3) ? m->tensors[idx_q_norm].data : nullptr;
+    const uint8_t* kn_w = (idx_k_norm >= 0 && m->model_arch == ARCH_QWEN3) ? m->tensors[idx_k_norm].data : nullptr;
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
         k_cache_layer, k_scale_layer, v_cache_layer, v_scale_layer,
         max_seq_len, seq_now, B,
         nH, nKV, hd, theta, m->rope_scale, attn_out, qn_w, kn_w,
         m->base_seq_len);
+
+    // ─── 3.5. attn_sub_norm: RMSNorm(attn_out) per BitNet reference ───
+    if (m->model_arch == ARCH_BITNET && idx_q_norm >= 0) {
+        for (int b = 0; b < B; b++) {
+            float* ap = attn_out + b * qd;
+            apply_sub_norm(ap, qd, m->tensors[idx_q_norm].data);
+        }
+    }
 
     // ─── 4. O projection (int8) ───
     {
@@ -2946,7 +2988,10 @@ static void forward_layer_internal(
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * td.packed_cols * 5;
                 for (int i = 0; i < inter; i++) {
-                    tmp[i] = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
                 }
                 for (int i = inter; i < td.packed_cols * 5; i++) tmp[i] = 0.0f;
             }
@@ -2961,11 +3006,15 @@ static void forward_layer_internal(
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
+                for (int i = 0; i < inter; i++) {
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                }
                 float mb = 1e-5f;
                 for (int i = 0; i < inter; i++) {
-                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
-                    tmp[i] = v;
-                    float av = fabsf(v);
+                    float av = fabsf(tmp[i]);
                     if (av > mb) mb = av;
                 }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
@@ -2982,16 +3031,20 @@ static void forward_layer_internal(
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(td, w, rs, rows, dim, scale);
             if (m->use_ternary_matmul) {
-            // Ternary-add: SiLU(gate)*up → quantize to u8 → vpsignb ternary-add → dequant
+            // Ternary-add: SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
+                for (int i = 0; i < inter; i++) {
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                }
                 float mb = 1e-5f;
                 for (int i = 0; i < inter; i++) {
-                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
-                    tmp[i] = v;
-                    float av = fabsf(v);
+                    float av = fabsf(tmp[i]);
                     if (av > mb) mb = av;
                 }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
@@ -3006,27 +3059,34 @@ static void forward_layer_internal(
             matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs,
                                       scale, m->buf_gate, B);
         } else if (m->use_f32_matmul) {
-            // Full-precision: compute SiLU(gate)*up directly into buf_act, then f32×i8 matmul
+            // Full-precision: compute SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++)
-                    tmp[i] = (g[i] / (1.0f + expf(-g[i]))) * u[i];
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
             }
             matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
         } else {
-            // Quantized path: SiLU(gate)*up → quantize to u8 → maddubs × i8 → dequant
+            // Quantized path: SiLU(gate)*up or ReLU²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
+                for (int i = 0; i < inter; i++) {
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                }
                 float mb = 1e-5f;
                 for (int i = 0; i < inter; i++) {
-                    float v = (g[i] / (1.0f + expf(-g[i]))) * u[i];
-                    tmp[i] = v;
-                    float av = fabsf(v);
+                    float av = fabsf(tmp[i]);
                     if (av > mb) mb = av;
                 }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
@@ -3258,12 +3318,18 @@ static void ensure_layer_idx(AtlasModel* m) {
             if (names[i] == n) return i;
         return -1;
     };
-    // Detect QK-Norm (Qwen3): stride = 11 if q_norm exists
+    // Detect architecture: stride = 11 for Qwen3 (q_norm) or BitNet (attn_sub_norm)
     int stride = 9;
+    int model_arch = ARCH_LLAMA;
     char test_name[128];
-    snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.q_norm.weight");
-    if (find(test_name) >= 0) stride = 11;
+    snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.attn_sub_norm.weight");
+    if (find(test_name) >= 0) { stride = 11; model_arch = ARCH_BITNET; }
+    else {
+        snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.q_norm.weight");
+        if (find(test_name) >= 0) { stride = 11; model_arch = ARCH_QWEN3; }
+    }
     m->layer_stride = stride;
+    m->model_arch = model_arch;
     m->layer_idx_cache.clear();
     m->layer_idx_cache.reserve(m->n_layers * stride);
     for (int L = 0; L < m->n_layers; L++) {
@@ -3282,8 +3348,13 @@ static void ensure_layer_idx(AtlasModel* m) {
         push("mlp.up_proj.weight");
         push("mlp.down_proj.weight");
         if (stride >= 11) {
-            push("self_attn.q_norm.weight");
-            push("self_attn.k_norm.weight");
+            if (model_arch == ARCH_BITNET) {
+                push("self_attn.attn_sub_norm.weight");
+                push("mlp.ffn_sub_norm.weight");
+            } else {
+                push("self_attn.q_norm.weight");
+                push("self_attn.k_norm.weight");
+            }
         }
     }
     m->has_layer_idx = true;

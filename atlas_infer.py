@@ -86,6 +86,9 @@ dll.atlas_reset_cache.argtypes = [ctypes.c_void_p]
 dll.atlas_set_layer_stride.restype = None
 dll.atlas_set_layer_stride.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
+dll.atlas_ensure_layer_idx.restype = None
+dll.atlas_ensure_layer_idx.argtypes = [ctypes.c_void_p]
+
 dll.atlas_set_num_threads.restype = None
 dll.atlas_set_num_threads.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
@@ -264,7 +267,8 @@ class AtlasModel:
             # For small models (1B, hidden<=2048) and block-scaled models (Bonsai),
             # decompress ALL tensors for f32_bypass (avoids uint8+128 signal collapse)
             dll.atlas_set_use_hybrid_matmul(self.model_ptr, 1)
-            needs_f32 = self.hidden <= 2048 or self.rope_theta >= 3000000.0
+            is_bitnet = any('attn_sub_norm' in name for name in self.idx)
+            needs_f32 = is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0
             if needs_f32:
                 dll.atlas_decompress_all(self.model_ptr)
                 if _HAS_TTYPE5_DECOMPRESS:
@@ -290,8 +294,9 @@ class AtlasModel:
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)
-            # f32_bypass: always for small OR block-scaled models (no uint8+128 drift)
-            if self.hidden <= 2048 or self.rope_theta >= 3000000.0:
+            # f32_bypass: for small, block-scaled, or BitNet models
+            is_bitnet = any('attn_sub_norm' in name for name in self.idx)
+            if is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
 
         # Max sequence length for KV cache ring buffer (v2.5.0: configurable)
@@ -441,10 +446,12 @@ class AtlasModel:
         self._tq1_cache = {}
         self._f16_cache = {}
         self._i8_cache = {}
-        # Detect QK-Norm (Qwen3): if layer 0 has q_norm, stride = 11
+        # Call C ensure_layer_idx which auto-detects stride + model_arch
+        dll.atlas_ensure_layer_idx(self.model_ptr)
+        # Read back the stride
         has_qk_norm = "model.layers.0.self_attn.q_norm.weight" in self.idx
-        stride = 11 if has_qk_norm else 9
-        dll.atlas_set_layer_stride(self.model_ptr, stride)
+        has_sub_norm = "model.layers.0.self_attn.attn_sub_norm.weight" in self.idx
+        stride = 11 if (has_qk_norm or has_sub_norm) else 9
         # Build flat index array for atlas_forward (fused C++ layer loop)
         idx = self.idx
         per_layer = ['input_layernorm.weight',
@@ -453,7 +460,11 @@ class AtlasModel:
             'post_attention_layernorm.weight',
             'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
             'self_attn.q_norm.weight', 'self_attn.k_norm.weight']
-        if not has_qk_norm:
+        if has_sub_norm:
+            # BitNet: attn_sub_norm + ffn_sub_norm instead of QK-Norm
+            per_layer[9] = 'self_attn.attn_sub_norm.weight'
+            per_layer[10] = 'mlp.ffn_sub_norm.weight'
+        elif not has_qk_norm:
             # Falcon3: remove q_norm/k_norm from per_layer
             per_layer = [n for n in per_layer if 'q_norm' not in n and 'k_norm' not in n]
         arrs = []

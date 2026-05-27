@@ -22,3 +22,6 @@ debug_*.py
 tmp_*.py
 _check_cos*.py
 _cos_*.py
+atlas.dll.release
+*.diff
+*.patch
