@@ -66,9 +66,9 @@ jobs:
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
 
-  # macOS only on release + manual dispatch (free tier runner bottleneck)
+  # macOS only on release (free tier runner bottleneck)
   build-macos:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'release'
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
