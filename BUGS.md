@@ -77,6 +77,22 @@ Corr=0.23 test failure traced to **two bugs in Python test script**, not engine:
 
 **Result with fixes**: corr=0.9967, max_diff=4.0. Engine correct.
 
+### Bug 13 [FIXED v2.6.3]: BitNet SubLN signal collapse (u8×i8 activation quant)
+
+BitNet's SubLN (sub-layer normalization) architecture uses RMSNorm weights of magnitude ~0.01×. The uint8×int8 quantized matmul path (`vpmaddubbs` SIMD) adds +128 to activations, destroying these small signals in quantization rounding. Output was pure noise — correlation near zero, max token probability near uniform.
+
+**Root cause**: `u8+128 activation_quant + vpmaddubbs` is lossy for activation magnitudes < ~0.05. SubLN-produced activations are ~10-50× smaller than standard LayerNorm outputs.
+
+**Fix**: Force `f32_bypass` for `ARCH_BITNET` models — raw fp32 matmul preserves full signal. Added `atlas_ensure_layer_idx()` C API to set `model_arch` on C++ side for Python `forward()` path.
+
+**Symptoms**: BitNet models produce empty/garbled output via default quantized path; T=0.7 yields near-uniform distribution. f32_bypass path produces correct output ("Paris is the capital of France.").
+
+### Bug 14 [FIXED v2.6.3]: `atlas_ensure_layer_idx` missing for Python forward()
+
+Python `forward()` path called `atlas_forward` without setting `model_arch` first. The C++ decoder checked `arch == ARCH_BITNET` to enable SubLN, but the arch field was uninitialized (default 0 = ARCH_FALCON). SubLN was skipped, activations exploded, forward() returned garbage.
+
+**Fix**: New `atlas_ensure_layer_idx()` C API called during `AtlasModel.__init__()`. Sets `model_arch` from header byte 53, enabling proper SubLN routing for all generation paths.
+
 ### v2.0.x Bugfix Summary
 
 Twelve additional bugs found and fixed during the v2.0.x cycle:
@@ -93,4 +109,35 @@ Twelve additional bugs found and fixed during the v2.0.x cycle:
 
 ### Verification
 
-All four Falcon3 models (1B, 3B, 7B, 10B) and Bonsai models (1.7B, 4B) pass coherence: "The capital of France is Paris." at T=0. The 1B model requires sampling (T ≥ 0.7) — greedy decoding degenerates due to model-inherent distribution.
+All model families (Falcon3 1B/3B/7B/10B, Bonsai 1.7B/4B, BitNet-2B4T, TriLM 1.1B/1.5B) pass coherence: "The capital of France is Paris." at T=0 with appropriate matmul path. Small models (hidden ≤ 2048) require f32_bypass or T ≥ 0.7 — greedy decoding degenerates due to model-inherent distribution.
+
+## Version History
+
+| Version | Key Changes |
+|---------|-------------|
+| **v2.6.3** | BitNet ARCH_BITNET + Repo Cleanup: `atlas_ensure_layer_idx()` C API, f32_bypass forced for SubLN models. 91 scratch files deleted, dead packers removed, `.gitignore` hardened. macOS CI split into release-only (free tier runner bottleneck). |
+| **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
+| **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |
+| **v2.6.0** | SSE Web-Server + Prompt-Caching + CI Pipeline |
+| **v2.5.0** | Context Window Extension — ring buffer KV cache, NTK scaling |
+| **v2.4.1** | Static analysis bughunt (5 C++ bugs), ttype=5 int8 decompress for Bonsai (10× speedup) |
+| **v2.4.0** | Qwen3/Bonsai-4B TQ1.0 support — head_dim=128, QK-Norm, YaRN RoPE |
+| **v2.3.1** | Windows packer hotfix, 7B v6 repair |
+| **v2.3.0** | Int8 KV-Cache (fp16→int8), 10B@4K: 320→173 MB |
+| **v2.2.2** | F16C in attention + weighted sum, 10B +47%, 3B +5.7% |
+| **v2.2.1** | BPE-PQ priority queue (O(n²)→O(n log n)) |
+| **v2.2.0** | TQ1-LUT in decompression, F16C for fp16→fp32 |
+| **v2.1.1** | Repetition penalty in C-core |
+| **v2.1.0** | Streaming + chat history |
+| **v2.0.4** | Softmax sampling (replace Gumbel-max), default T=0.7 |
+| **v2.0.3** | n_input ≥ max_seq_len guard, scores_buf OOM guard |
+| **v2.0.2** | Memory leak, KV-cache overflow, stale .i8 cache, thread-local statics |
+| **v2.0.1** | scores alloca → heap (stack fully sterile) |
+| **v2.0.0** | C++ binary tokenizer (v6 format) |
+| **v1.4.0** | Stack overflow fix, survivor-list sampling |
+| **v1.3.2** | Hybrid mode (FFN int8 + QKV packed) |
+| **v1.3.1** | Direct TQ1-packed matmul |
+| **v1.3.0** | Ternary-add kernel (vpsignb) |
+| **v1.2.0** | C++ sampling, atlas_generate |
+| **v1.1.0** | AllocHdr-based valloc/vfree |
+| **v1.0.0** | Initial TQ1.0 inference engine |
