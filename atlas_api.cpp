@@ -1329,7 +1329,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int col = c * 5 + t2;
                     if (col >= input_dim) break;
                     int blk = col / bs;
-                    float val = (float)l[t2] * decoded_scales[r * nbk + blk] / 127.0f;
+                    float val = (float)l[t2] * decoded_scales[r * nbk + blk];
                     int q = (int)(val / quant_scale + 0.5f);
                     if (q < -127) q = -127;
                     if (q > 127) q = 127;
