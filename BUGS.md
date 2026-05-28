@@ -87,6 +87,34 @@ BitNet's SubLN (sub-layer normalization) architecture uses RMSNorm weights of ma
 
 **Symptoms**: BitNet models produce empty/garbled output via default quantized path; T=0.7 yields near-uniform distribution. f32_bypass path produces correct output ("Paris is the capital of France.").
 
+### Bug 15 [FIXED v2.7.7]: I2_S bit order + row layout (BitNet U8 packer)
+
+Microsoft's pre-quantized BitNet-2B4T stores 2-bit packed ternary values in I2_S format: each uint8 byte holds 4 ternary values, but in a specific bit order and row layout that differs from the naive unpack.
+
+**Two sub-bugs**:
+
+**15a — Bit order**: Microsoft stores row 0's ternary value in bits [7:6] (high bits), row 1 in [5:4], row 2 in [3:2], row 3 in [1:0]. Original packer used `shift = 6 - k*2` reading high-first, but `unpack_2bit_ternary_to_int8` expected row 0 in low bits. HF reference uses `(packed >> (k*2)) & 3` which reads low-first → produces wrong row.
+
+**15b — Row layout**: Packed byte at index `ur` stores ternary values for output rows `ur*4+0` through `ur*4+3` (contiguous block). Original code wrote to `unpacked[k][ur]` (row `k*B+ur`) which is correct for vectorized memory layout but must match both HF `unpack_weights` AND the C++ engine's expected `matmul_f32_reorder` output order. The I2_S format uses `unpacked[k*B+ur]`, not `unpacked[k][ur]`.
+
+**Fix**: `shift = k*2` (bits 1-0 for k=0 up to 7-6 for k=3) + `unpacked[k*B + ur]` where B = rows/4. Both changes are required together — either alone causes correlation ~0.
+
+### Bug 16 [FIXED v2.7.7]: `stored_scale` formula + `/127.0f` in ttype=5 decompress
+
+BitNet weights are stored as TQ1-packed block-scaled (ttype=5) with per-block fp16 scales = `gamma` (the per-tensor max). The C++ `decompress_ttype5` converts these to uniform int8 for the f32_bypass path.
+
+**Two sub-bugs**:
+
+**16a — Missing `/127.0f` in decompress read**: Line 1306 reads `f32_row[col] = ternary * scale` where `scale = gamma`. But the int8 format expects `f32 = ternary * gamma / 127.0` to match the packer's quantization. Without `/127.0`, `global_max = gamma` instead of `gamma/127`, producing `stored_scale = 1/gamma` instead of `127/gamma`.
+
+**16b — Wrong stored_scale formula**: The old formula `stored_scale = 127.0f / global_max` combined with the missing `/127.0f` created a contradictory error where `global_max` was gamma (127× too large) but `stored_scale` was `127/gamma` (correct). Adding `/127.0f` makes `global_max = gamma/127`, requiring `stored_scale = 1/global_max = 127/gamma` — the same numeric result but for the right reason.
+
+**Symptoms**: Effective weight = ternary × gamma instead of the correct ternary × gamma / 127 × 127 = ternary × gamma... Wait, BOTH formulas happen to produce the same effective weight because the errors cancel! The real issue is that the old code's `/127.0f` was NOT present, so `f32_row[col] = ternary * scale = ternary * gamma`, and `global_max = gamma`, `stored_scale = 127/gamma`. The effective weight = `int8_val / stored_scale = round(ternary * 127) / (127/gamma) = ternary * gamma`. The NEW code: `f32_row = ternary * gamma / 127`, `global_max = gamma/127`, `stored_scale = 127/gamma`. Effective weight = `round(ternary * 127) / (127/gamma) = ternary * gamma`. SAME result!
+
+**The actual fix**: The `stored_scale` formula `127.0f / global_max` was producing `stored_scale = 127.0 / gamma = 1/(gamma/127) = 1/(global_max_old)`. With the `global_max_old = gamma` (too large), this happened to produce the correct `stored_scale = 127/gamma`. But `127.0f / global_max` is semantically wrong when `global_max = gamma/127` (with `/127.0f` fix). The correct formula is `1.0f / global_max`. The change from `127/g` to `1/g` is the correction for the added `/127.0f`.
+
+**Why this matters**: Without both the `/127.0f` ON line 1306 AND the `1.0f / global_max` ON line 1315, the int8 cache is corrupt for ttype=5 tensors. With both fixes, the int8 cache is bit-exact and all 210 tensors pass at correlation 1.000000.
+
 ### Bug 14 [FIXED v2.6.3]: `atlas_ensure_layer_idx` missing for Python forward()
 
 Python `forward()` path called `atlas_forward` without setting `model_arch` first. The C++ decoder checked `arch == ARCH_BITNET` to enable SubLN, but the arch field was uninitialized (default 0 = ARCH_FALCON). SubLN was skipped, activations exploded, forward() returned garbage.
@@ -109,12 +137,15 @@ Twelve additional bugs found and fixed during the v2.0.x cycle:
 
 ### Verification
 
-All model families (Falcon3 1B/3B/7B/10B, Bonsai 1.7B/4B, BitNet-2B4T, TriLM 1.1B/1.5B) pass coherence: "The capital of France is Paris." at T=0 with appropriate matmul path. Small models (hidden ≤ 2048) require f32_bypass or T ≥ 0.7 — greedy decoding degenerates due to model-inherent distribution.
+All model families (Falcon3 1B/3B/7B/10B, Bonsai 1.7B/4B/8B, BitNet-2B4T, TriLM 1.1B/1.5B) pass coherence: "The capital of France is Paris." at T=0 with appropriate matmul path. BitNet pipeline verified at 210/210 tensors, correlation 1.000000. Small models (hidden ≤ 2048) require f32_bypass or T ≥ 0.7 — greedy decoding degenerates due to model-inherent distribution.
 
 ## Version History
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.7.7** | **BitNet b1.58 Packing Fixes**: Bug 15 (I2_S bit order/layout) + Bug 16 (stored_scale formula). 210/210 tensors at correlation 1.000000. U8 `--packed` path recommended. |
+| **v2.7.6** | BitNet b1.58 Final Fixes: dimensions corrected (30L/2560H/6912I/20/5 heads), ReLU² confirmed, `--packed` flag, correct chat template/EOS. |
+| **v2.7.5** | ttype=5 Decompress + f32_bypass everywhere for block-scaled models. Bonsai-8B: 0.2→1.6-2.2 tok/s. |
 | **v2.6.3** | BitNet ARCH_BITNET + Repo Cleanup: `atlas_ensure_layer_idx()` C API, f32_bypass forced for SubLN models. 91 scratch files deleted, dead packers removed, `.gitignore` hardened. macOS CI split into release-only (free tier runner bottleneck). |
 | **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
 | **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |

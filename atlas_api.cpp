@@ -1329,9 +1329,8 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int col = c * 5 + t2;
                     if (col >= input_dim) break;
                     int blk = col / bs;
-                    float val = (float)l[t2] * decoded_scales[r * nbk + blk];
-                    float vq = val / quant_scale;
-                    int q = (vq >= 0) ? (int)(vq + 0.5f) : (int)(vq - 0.5f);
+                    float val = (float)l[t2] * decoded_scales[r * nbk + blk] / 127.0f;
+                    int q = (int)(val / quant_scale + 0.5f);
                     if (q < -127) q = -127;
                     if (q > 127) q = 127;
                     i8[r * input_dim + pos] = (int8_t)q;
@@ -3388,6 +3387,9 @@ static void forward_layer_internal(
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
+                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
+                }
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
             }
             if (idx_ffn_sub_norm >= 0) {

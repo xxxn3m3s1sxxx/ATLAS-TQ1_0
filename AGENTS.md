@@ -4,10 +4,9 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 ## Architecture
 
-- **TQ1.0 format** (ttype=0): 5 ternary trits per byte (Base-3 encoding), ~1.58 bits/weight
+- **TQ1.0 format**: 5 ternary trits per byte (Base-3 encoding), ~1.58 bits/weight
 - **TQ1.0 g128** (ttype=5): Per-row per-block fp16 scales (block_size=128), 16/128 = 0.125 b/w overhead. Used by Bonsai/Qwen3 models. Packed via `matmul_tq1_block_reorder`.
-- **TQ2.0 TurboQuant** (ttype=7, v2.7.0): On-the-fly 2-bit decode (4 weights/byte, SSE4.1) + f32 FMA (AVX2). Per-block g128 fp16 scales identical to ttype=5. No int8 cache/decompress — all ternary weights decoded in registers during matmul. ~10% file size increase vs ttype=5 (~4.7 bits/weight vs ~4.2). Requires explicit `else if (ttype == 7)` dispatch at all 4 matmul call sites (QKV, O-proj, FFN gate/up, FFN down).
-- **5 matmul modes**: int8 (default, `vpmaddubs` SIMD), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD), TurboQuant (on-the-fly 2-bit decode + FMA)
+- **4 matmul modes**: int8 (default, `vpmaddubs` SIMD), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
 - **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN architectures where weights are ~0.01× and u8+128 activation quant destroys signal.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
@@ -17,7 +16,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 | Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab |
 |-------|-----------|--------|--------|-------------|-------|----------|-------|
-| BitNet-2B4T-b1.58 | 0.97 GB | 26 | 2048 | 8192 | 16 | 8 | 151936 |
+| BitNet-2B4T-b1.58 | 1.03 GB | 30 | 2560 | 6912 | 20 | 5 | 128256 |
 | Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 |
 | Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
@@ -26,6 +25,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Bonsai-4B-Chat | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
+BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
 Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.
 
 ## Build
@@ -48,12 +48,11 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 
 | Model | Hybrid tok/s (total) | Hybrid tok/s (pure gen) | Sustained gen tokens |
 |-------|:--------------------:|:-----------------------:|:--------------------:|
-| **3B** | **5.4–7.1** | — | 200 (no EOS) |
-| **1B** | **7.4–9.5** | **10.1** | 24 (Gumbel-EOS) |
+| **3B** | **7.1** | — | 200 (no EOS) |
+| **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
+| **2B (BitNet)** | **2.8** (f32 bypass) | — | T=0: Correct short answers ("The capital of France is Paris."), degenerates into repetition after 10-15 tokens. T=0.7: Coherent first sentence, then degrades. f32_bypass required (SubLN signal destroyed by u8+128 activation quant). U8-packed path (Microsoft pre-quantized) strongly preferred over BF16 ternarization. Two bugs fixed: I2_S bit order/layout (k*B+ur) + stored_scale formula (127/g→1/g). |
 | **7B** | **1.9** | — | 61 (sampling-dependent) |
-| **10B** | **0.7–2.0** | — | 29–50 (OMP-dependent) |
-
-**OMP Tuning (10B on 4C/8T Kaby Lake)**: Best at `OMP=8` (hyperthreading). 10B: 0.28 tok/s (OMP=4, cold) → 2.02 tok/s (OMP=8, warm). Memory-bound workload benefits from HT — while one thread stalls on DRAM, another issues loads. Default: `OMP=8` recommended for 7B/10B, `OMP=4` sufficient for 1B/3B.
+| **10B** | **1.3** | — | 29 (sampling-dependent) |
 
 **10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
 
@@ -61,6 +60,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 - **10B/7B**: Clean output ("The capital of France is Paris."), EOS after answer.  
 - **3B**: Correct answer + newline collapse after completion (model-inherent, 22L insufficient calibration).  
 - **1B**: Pure newline collapse (18L/2048H too small for stable argmax path).  
+- **2B (BitNet)**: Real English words (U8 path) but degenerates into repetition after 3-5 tokens (30L/2560H ternary-quantized, model-inherent). T=0.7 yields diverse token salad.  
 
 🚀 **Default recommendation**: Always use `T=0.7, top_k=40` for any model below 7B. T=0 is only reliable for 7B+.
 
@@ -112,7 +112,7 @@ See `atlas_ffi.h` for full API.
 ## Roadmap
 
 ### v2.4.0 — Qwen3/Bonsai-Okosystem-Upgrade (AKTIV)
-- **Packer (`atlas_packer_g128.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
+- **Packer (`atlas_packer_bonsai.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
 - **head_dim=128**: Alle Attention-Pfade (RoPE, Scores, Weighted Sum, KV-Cache) auf variablen head_dim umstellen.
 - **QK-Norm**: Zwei neue RMSNorm-Tensoren pro Layer (`q_norm`, `k_norm`) im Attention-Hotpath.
 - **Dynamisches Vocab**: `vocab_size` aus Datei-Header statt hardcoded 131072 (Bonsai: 151669). EOS/PAD-IDs aus Header.
@@ -143,8 +143,9 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
-| **v2.7.0** | **TurboQuant 2-bit packer + kernel**: `ternarize_block_scaled_2bit` (vectorized numpy, 4 weights/byte). SSE4.1 on-the-fly decode + AVX2 FMA fused kernel. `--ttype 7` CLI. Bonsai-1.7B verified correct (bit-identical output to ttype=5). ~10% larger files, no int8 cache needed. |
-| **v2.6.4** | **min_new_tokens + persistent KV cache**: EOS logit clamping (-1e9f), `cache_offset` C API + Python prefix-match. 7B Turn 2: 56% faster (15.6→6.8s). |
+| **v2.7.7** | **BitNet Packing Fixes**: Fixed U8 bit ordering (Microsoft I2_S stores row 0 in high bits, was reading from low). Switched BF16 to per-tensor absmean + `weight_scale` loading. Fixed `data_size` header calc for ttype=5. U8 `--packed` path recommended. |
+| **v2.7.6** | **BitNet b1.58 Final Fixes**: AGENTS.md dimensions corrected to 30L/2560H/6912I/20/5 heads. ReLU² confirmed correct (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized Microsoft weights. Python BitNet detection (`_is_bitnet` via attn_sub_norm), correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). Misidentification as Qwen3 fixed. |
+|---------|-------------|
 | **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: Reverted fused-kernel-only approach. All ttype=5 tensors decompressed to int8 at load. `f32_bypass` forced for block-scaled models (rope_theta≥3M or hidden≤2048) — no uint8+128 activation quant, no signal collapse. Bonsai-8B: 0.2→1.6-2.2 tok/s with perfect T=0.7 coherence. |
 | **v2.6.3** | **BitNet ARCH_BITNET + Repo Cleanup**: `atlas_ensure_layer_idx()` C API für Python `forward()`-Pfad. f32_bypass forced für SubLN-Architekturen (u8+128 Activation Quant zerstört ~0.01× SubLN-Signal). 91 Scratch-Dateien gelöscht, tote Packer entfernt, `.gitignore` gehärtet. |
 | **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
@@ -177,7 +178,8 @@ See `atlas_ffi.h` for full API.
 - `atlas_infer.py` — Python `AtlasModel` class with `generate_c()`
 - `atlas_ffi.h` — C API declarations (v6 header layout)
 - `atlas_packer.py` — v5/v6 format writer for Falcon3 models
-- `atlas_packer_g128.py` — Block-scaled g128 packer for Bonsai/Qwen3/BitNet models
+- `atlas_packer_bonsai.py` — Block-scaled g128 packer for Bonsai/Qwen3 models
+- `atlas_packer_bitnet.py` — BF16→TQ1.0 packer (per-tensor absmean, matching Microsoft QAT) AND U8→TQ1.0 packer (use `--packed` for Microsoft pre-quantized weights)
 - `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
@@ -187,6 +189,7 @@ See `atlas_ffi.h` for full API.
 - **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
 - **v6 format**: v5 + binary tokenizer block (128-byte header, offsets/lengths/pool, BPE merges, byte_encoder, special tokens).
 - **Chat template**: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation prompt: `<|assistant|>\n`.
+  BitNet: `{Role}: {content}<|eot_id|>\n` — generation prompt: `Assistant: `. EOS token `<|eot_id|>` = 128009.
 - **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
 - **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).
 - **Cache**: `.i8` cache auto-generated on first full int8 decompress, mmap'd on reload.
