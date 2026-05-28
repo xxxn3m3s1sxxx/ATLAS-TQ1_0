@@ -1,4 +1,4 @@
-// atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
+// atlas_api.cpp â€” C-exported DLL for TQ1.0 inference acceleration
 // atlas_ffi.h is the pure C API contract for FFI consumers (standalone reference)
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +17,7 @@
   #include <malloc.h>
   #include <io.h>
   #include <windows.h>
-  // VirtualAlloc returns memory to OS on free — no fragmentation
+  // VirtualAlloc returns memory to OS on free â€” no fragmentation
   struct AllocHdr { void* base; size_t total; };
   static uint8_t* atlas_valloc(size_t size) {
       size_t hdr = sizeof(AllocHdr), align = 32;
@@ -45,7 +45,7 @@
   #include <sys/mman.h>
   #include <sys/stat.h>
   #include <fcntl.h>
-  // mmap-based allocator — MAP_POPULATE hints pages into RAM
+  // mmap-based allocator â€” MAP_POPULATE hints pages into RAM
   struct AllocHdr { void* base; size_t total; };
   static uint8_t* atlas_valloc(size_t size) {
       size_t hdr = sizeof(AllocHdr), align = 32;
@@ -70,7 +70,7 @@
   #define STRICMP strcasecmp
 #endif
 
-// ─── Xoshiro256** PRNG (thread-safe, 64-bit) ──────────────────────────
+// â”€â”€â”€ Xoshiro256** PRNG (thread-safe, 64-bit) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static uint64_t xoshiro_state[4] = {0};
 
 static void xoshiro_seed(uint64_t seed) {
@@ -104,7 +104,7 @@ static float xoshiro_float() {
     return (float)((xoshiro_next() >> 11) * 0x1.0p-53);
 }
 
-// ─── Gumbel-max sample internal (used by both atlas_sample and atlas_generate) ──
+// â”€â”€â”€ Gumbel-max sample internal (used by both atlas_sample and atlas_generate) â”€â”€
 // Modifies logits in-place as scratch. Returns sampled token ID.
 // When temperature <= 0: deterministic argmax (greedy).
 static int gumbel_sample(float* logits, int V,
@@ -191,7 +191,7 @@ static int gumbel_sample(float* logits, int V,
     // Multinomial sampling on survivors (replaces Gumbel-max for stability)
     {
         // Collect valid survivors (skip -inf pruned entries)
-        // Use a small array on the stack — at most top_k → 40 entries
+        // Use a small array on the stack â€” at most top_k â†’ 40 entries
         int valid[128];
         float val_buf[128];
         int n_valid = 0;
@@ -253,7 +253,7 @@ typedef void (*atlas_token_callback)(int token_id, void* user_data);
 static inline float fp16_to_fp32(uint16_t h) {
     float r;
     __m128i h4 = _mm_cvtsi32_si128((int)(unsigned)h);  // zero-extend to 32-bit
-    __m128 f4 = _mm_cvtph_ps(h4);                       // F16C: fp16→fp32
+    __m128 f4 = _mm_cvtph_ps(h4);                       // F16C: fp16â†’fp32
     _mm_store_ss(&r, f4);
     return r;
 }
@@ -262,7 +262,7 @@ static inline uint16_t fp32_to_fp16(float v) {
     return (uint16_t)(unsigned)_mm_extract_epi16(_mm_cvtps_ph(f4, 0), 0);
 }
 
-// ─── Tensor info ────────────────────────────────────────────────────────
+// â”€â”€â”€ Tensor info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 struct TensorInfo {
     int ttype;          // 0=TQ1, 1=norm/embed, 2=other, 5=TQ1+per-block scales
     int row_dim;        // output rows (weight) or flat size (norm/embed)
@@ -293,9 +293,9 @@ struct AtlasModel {
     int pad_id = 0;    // default padding token
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
-    bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4× less memory)
+    bool use_packed_matmul = false; // v1.3.1: operate on 2-bit packed ternary weights (4Ã— less memory)
     bool use_hybrid_matmul = false; // v1.3.2: FFN int8 cache, QKV packed
-    bool use_relu2 = false;         // v2.8.0: ReLU² activation (BitNet b1.58)
+    bool use_relu2 = false;         // v2.8.0: ReLUÂ² activation (BitNet b1.58)
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
     std::vector<std::string> tensor_names;
@@ -308,7 +308,7 @@ struct AtlasModel {
     float* buf_gate = nullptr;      // [max_batch * inter_dim]
     float* buf_up = nullptr;        // [max_batch * inter_dim]
     float* buf_hidden = nullptr;    // [max_batch * inter_dim]
-    float* buf_act = nullptr;       // [max_batch * max_dim] quantized f32→i8 scratch
+    float* buf_act = nullptr;       // [max_batch * max_dim] quantized f32â†’i8 scratch
     uint8_t* buf_i8 = nullptr;      // [max_batch * max_dim] uint8 quantized activations
     float* buf_out = nullptr;       // [max_batch * hidden_dim] layer output ping-pong for atlas_forward
     // Attention workspace (heap-allocated, avoids stack overflow with large B)
@@ -342,7 +342,7 @@ struct AtlasModel {
         cache_max_seq_len = max_seq_len;
     }
     size_t mmap_size = 0;           // actual file size for range checks
-    // mmap atlas file handles (for fp16 tensor data — demand-paged by OS)
+    // mmap atlas file handles (for fp16 tensor data â€” demand-paged by OS)
     void* atlas_mmap_base = nullptr;
     void* atlas_mmap_handle = nullptr;  // CreateFileMapping handle (Win) / file size (Lin)
     void* atlas_mmap_file = nullptr;    // duplicated fd (Win: HANDLE, Lin: fd)
@@ -371,7 +371,7 @@ struct AtlasModel {
         const uint16_t* byte_encoder;  // [256]
         const uint16_t* byte_decoder;  // [256]
         const uint32_t* special;       // [7] eos/bos/pad/unk/mask/sep/cls
-        int* merge_lookup;             // hash table: (left<<12)|right → merged_id, size = vocab_size*2
+        int* merge_lookup;             // hash table: (left<<12)|right â†’ merged_id, size = vocab_size*2
     } tok = {};
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
@@ -430,7 +430,7 @@ struct AtlasModel {
     }
 };
 
-// ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
+// â”€â”€â”€ TQ1 byte â†’ int8 decode LUT (v1.3.1 chunked decode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
 static std::once_flag tq1_decode_init_flag;
 alignas(32) static int8_t tq1_decode[256][5];
@@ -448,7 +448,7 @@ static void init_tq1_decode_lut() {
     }); // std::call_once
 }
 
-// ─── Load model ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Load model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API AtlasModel* atlas_load(const char* path) {
     init_tq1_decode_lut();
     FILE* f = fopen(path, "rb");
@@ -486,7 +486,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     if (eos_val != 0) m->eos_id = (int)eos_val;
     if (pad_val != 0) m->pad_id = (int)pad_val;
 
-    // Byte 53: model_flags — gate_act (bit 3) for ReLU² (BitNet b1.58)
+    // Byte 53: model_flags â€” gate_act (bit 3) for ReLUÂ² (BitNet b1.58)
     m->use_relu2 = (hdr[53] >> 3) & 1;
 
     printf("[ATLAS] v%d model: %dL %dH %dI %d/%d heads %d vocab %.0f theta | %d tensors %s\n",
@@ -616,7 +616,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         if (t.ttype == 5) {
             t.block_size = t.data[0];
             uint16_t nb; memcpy(&nb, t.data + 1, 2); t.n_blocks = nb;
-            t.data_size = 3 + t.n_blocks * 2 + t.row_dim * t.packed_cols;
+            t.data_size = 3 + t.row_dim * t.n_blocks * 2 + t.row_dim * t.packed_cols;
         }
     }
 
@@ -647,7 +647,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             m->tok.byte_decoder = (const uint16_t*)(base + offs[8]); // offset_byte_dec
             m->tok.special = (const uint32_t*)(base + offs[9]);     // offset_special
 
-            // Build merge lookup hash table for O(1) pair → merged_id
+            // Build merge lookup hash table for O(1) pair â†’ merged_id
             // Open-addressing, table size = 2 * vocab_size (power of 2)
             int V = (int)m->tok.vocab_size;
             int ht_size = 1;
@@ -662,7 +662,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
                 uint32_t left = m->tok.merge_left[merged_id];
                 uint32_t right = m->tok.merge_right[merged_id];
                 if (left == 0xFFFFFFFF) continue;
-                // Hash: (left << 12) | right  (12 bits for right, up to 4096 — sufficient for BPE)
+                // Hash: (left << 12) | right  (12 bits for right, up to 4096 â€” sufficient for BPE)
                 // Better: use full 32-bit hash
                 uint32_t h = (left * 2654435761u) ^ (right * 2246822519u);
                 int idx = (int)(h & (ht_size - 1));
@@ -683,7 +683,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     return m;
 }
 
-// ─── Free model ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Free model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_free(AtlasModel* m) {
     if (!m) return;
     // Free valloc'd tensors (not mmap'd ones)
@@ -720,7 +720,7 @@ ATLAS_API void atlas_free(AtlasModel* m) {
     delete m;
 }
 
-// ─── Model config struct ───────────────────────────────────────────────
+// â”€â”€â”€ Model config struct â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 typedef struct {
     int n_layers;
     int hidden_dim;
@@ -732,7 +732,7 @@ typedef struct {
     float rope_theta;
 } AtlasModelConfig;
 
-// ─── Get model info ────────────────────────────────────────────────────
+// â”€â”€â”€ Get model info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API AtlasModelConfig atlas_get_config(AtlasModel* m) {
     AtlasModelConfig cfg;
     cfg.n_layers = m->n_layers;
@@ -758,7 +758,7 @@ ATLAS_API void atlas_get_info(AtlasModel* m, int* n_layers, int* hidden_dim,
     if (vocab_size) *vocab_size = m->vocab_size;
 }
 
-// ─── Tensor name API (v4+, no safetensors dependency) ─────────────────
+// â”€â”€â”€ Tensor name API (v4+, no safetensors dependency) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API int atlas_get_tensor_count(AtlasModel* m) {
     return m ? (int)m->tensor_names.size() : 0;
 }
@@ -774,7 +774,7 @@ ATLAS_API int atlas_get_tensor_name(AtlasModel* m, int idx, char* buf, int buf_s
     return copy;
 }
 
-// ─── Embedded tokenizer API (v5+) ────────────────────────────────────
+// â”€â”€â”€ Embedded tokenizer API (v5+) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API const uint8_t* atlas_get_tokenizer(AtlasModel* m, int* size) {
     if (!m || !m->tokenizer_size || !m->atlas_mmap_base) {
         if (size) *size = 0; return nullptr;
@@ -783,13 +783,13 @@ ATLAS_API const uint8_t* atlas_get_tokenizer(AtlasModel* m, int* size) {
     return (const uint8_t*)m->atlas_mmap_base + (ptrdiff_t)m->tokenizer_offset;
 }
 
-// ─── v6 Binary Tokenizer API ─────────────────────────────────────────
+// â”€â”€â”€ v6 Binary Tokenizer API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API int atlas_has_binary_tokenizer(AtlasModel* m) {
     if (!m) return 0;
     return (m->tok.magic == 0x544F4B42) ? 1 : 0;
 }
 
-// Pre-encode UTF-8 text → byte-level token IDs (raw byte_encoder lookup, no BPE).
+// Pre-encode UTF-8 text â†’ byte-level token IDs (raw byte_encoder lookup, no BPE).
 // Returns number of tokens, or -1 on error.
 ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
     const char* text, int text_len,
@@ -814,7 +814,7 @@ ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
 }
 
 // Run BPE merge loop on pre-encoded byte token IDs. Modifies ids in-place.
-// Uses priority queue for O(n log n) instead of O(n²) scan.
+// Uses priority queue for O(n log n) instead of O(nÂ²) scan.
 // n_ids is updated to the final token count. Returns 0 on success, -1 on error.
 ATLAS_API int atlas_tokenizer_merge(AtlasModel* m,
     int* ids, int* n_ids) {
@@ -909,7 +909,7 @@ ATLAS_API int atlas_tokenizer_merge(AtlasModel* m,
     return 0;
 }
 
-// Decode token IDs → UTF-8 text via pool lookup.
+// Decode token IDs â†’ UTF-8 text via pool lookup.
 // Returns number of bytes written, or -1 on error.
 ATLAS_API int atlas_tokenizer_decode(AtlasModel* m,
     const int* ids, int n_ids,
@@ -954,7 +954,7 @@ ATLAS_API int atlas_get_tensor_index(AtlasModel* m, const char* name) {
     return -1;
 }
 
-// ─── Cache file ──────────────────────────────────────────────────────
+// â”€â”€â”€ Cache file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Save decompressed int8 tensors to a .i8 cache file for instant reload.
 // Format: [n_tensors:4] then per-tensor [ttype:1][row_dim:4][pc:4][ds:4][off:8]
 //         then all tensor data concatenated.
@@ -1181,7 +1181,7 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         // Validate offset + size fits within file
         if (cttype == 3 && ds > 0 && off >= 0) {
             if ((size_t)(data_start + off + ds) > file_size) {
-                // Truncated/partial cache — unsafe to use
+                // Truncated/partial cache â€” unsafe to use
                 printf("[CACHE] Truncated (tensor %d exceeds file), ignoring cache\n", i);
 #ifdef _WIN32
                 UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
@@ -1223,9 +1223,9 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     return replaced > 0 ? 1 : 0;
 }
 
-// ─── Decompress all TQ1 tensors to int8 in-place ──────────────────────
+// â”€â”€â”€ Decompress all TQ1 tensors to int8 in-place â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Handles ttype=0 (raw ternary) only.
-// ttype=5 (block-scaled) stays packed — fused kernel preserves per-block scales.
+// ttype=5 (block-scaled) stays packed â€” fused kernel preserves per-block scales.
 // Call after Python closes safetensors.
 ATLAS_API void atlas_decompress_all(AtlasModel* m) {
     int total = 0;
@@ -1237,7 +1237,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
 
-        // ─── ttype=0: raw ternary {-1,0,1} decompression ───
+        // â”€â”€â”€ ttype=0: raw ternary {-1,0,1} decompression â”€â”€â”€
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
@@ -1268,8 +1268,8 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
     printf("[ATLAS] Decompressed %d TQ1 tensors to int8\n", total);
 }
 
-// ─── Decompress ttype=5 (block-scaled) tensors to int8 ──────────────
-// Converts per-block fp16 scales → uniform int8 for f32_bypass path.
+// â”€â”€â”€ Decompress ttype=5 (block-scaled) tensors to int8 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Converts per-block fp16 scales â†’ uniform int8 for f32_bypass path.
 // Only called for small models (hidden <= 2048) where f32_bypass avoids
 // the uint8+128 signal collapse amplification.
 ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
@@ -1304,6 +1304,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int blk = col / bs;
                     float scale = decoded_scales[r * nbk + blk];
                     f32_row[col] = (float)l[t2] * scale;
+                    f32_row[col] /= 127.0f;
                     float av = fabsf(f32_row[col]);
                     if (av > global_max) global_max = av;
                 }
@@ -1311,7 +1312,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         }
 
         float quant_scale = global_max / 127.0f;
-        float stored_scale = 127.0f / global_max;
+        float stored_scale = 1.0f / global_max;
 
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
         uint16_t scale_u16 = fp32_to_fp16(stored_scale);
@@ -1328,7 +1329,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int col = c * 5 + t2;
                     if (col >= input_dim) break;
                     int blk = col / bs;
-                    float val = (float)l[t2] * decoded_scales[r * nbk + blk];
+                    float val = (float)l[t2] * decoded_scales[r * nbk + blk] / 127.0f;
                     int q = (int)(val / quant_scale + 0.5f);
                     if (q < -127) q = -127;
                     if (q > 127) q = 127;
@@ -1349,8 +1350,8 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
     printf("[ATLAS] Decompressed %d ttype=5 tensors to int8\n", total);
 }
 
-// ─── v1.3.2: Decompress only FFN tensors to int8 (gate/up/down) ────
-// v2.4.0: Also handles ttype=5 (per-row block-scaled TQ1) — dequantizes
+// â”€â”€â”€ v1.3.2: Decompress only FFN tensors to int8 (gate/up/down) â”€â”€â”€â”€
+// v2.4.0: Also handles ttype=5 (per-row block-scaled TQ1) â€” dequantizes
 // per-block scales, then re-quantizes to uniform int8 with a single global scale.
 ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
     int total = 0;
@@ -1359,7 +1360,7 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
         auto& t = m->tensors[i];
         if (t.ttype != 0) continue;
         // Check name: only decompress MLP tensors
-        // ttype=5 (block-scaled) handled directly by fused kernel — skip
+        // ttype=5 (block-scaled) handled directly by fused kernel â€” skip
         if (m->tensor_names.size() > i) {
             const std::string& name = m->tensor_names[i];
             if (name.find("mlp") == std::string::npos &&
@@ -1371,7 +1372,7 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
         int n_vals = t.row_dim * input_dim;
         total++;
 
-        // ─── ttype=0: raw ternary {-1,0,1} decompression ───
+        // â”€â”€â”€ ttype=0: raw ternary {-1,0,1} decompression â”€â”€â”€
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
@@ -1402,7 +1403,7 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
     printf("[ATLAS] Decompressed %d FFN tensors to int8\n", total);
 }
 
-// ─── Prefetch int8 data into physical RAM ─────────────────────────────
+// â”€â”€â”€ Prefetch int8 data into physical RAM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Touch one byte per 4KB page to force page-in / prevent working-set trim lag.
 ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
     int64_t total = 0;
@@ -1422,7 +1423,7 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
     printf("[ATLAS] Prefetched %lld int8 values\n", (long long)total);
 }
 
-// ─── Get int8-decoded tensor from C++ side ─────────────────────────────
+// â”€â”€â”€ Get int8-decoded tensor from C++ side â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Returns i8 data pointer or nullptr if not decoded
 ATLAS_API const int8_t* atlas_get_int8(AtlasModel* m, int idx, int* rows,
                                         int* input_dim, float* scale,
@@ -1443,7 +1444,7 @@ ATLAS_API const int8_t* atlas_get_int8(AtlasModel* m, int idx, int* rows,
     return (const int8_t*)(t.data + 2);
 }
 
-// ─── Get tensor info ────────────────────────────────────────────────────
+// â”€â”€â”€ Get tensor info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_tensor_info(AtlasModel* m, int idx, int* ttype,
                                   int* row_dim, int* col_dim) {
     if (idx < 0 || idx >= (int)m->tensors.size()) return;
@@ -1453,26 +1454,26 @@ ATLAS_API void atlas_tensor_info(AtlasModel* m, int idx, int* ttype,
     if (col_dim) *col_dim = (t.ttype == 0 || t.ttype == 5) ? t.packed_cols * 5 : 0;
 }
 
-// ─── Access tensor data ─────────────────────────────────────────────────
+// â”€â”€â”€ Access tensor data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API const uint8_t* atlas_tensor_data(AtlasModel* m, int idx, int* size) {
     if (idx < 0 || idx >= (int)m->tensors.size()) return nullptr;
     if (size) *size = m->tensors[idx].data_size;
     return m->tensors[idx].data;
 }
 
-// ─── Matmul: int8 weights × uint8 activations → float32 output ──────────
+// â”€â”€â”€ Matmul: int8 weights Ã— uint8 activations â†’ float32 output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-// ─── Matmul: int8 weights × int8 activations → float32 output ──────────
+// â”€â”€â”€ Matmul: int8 weights Ã— int8 activations â†’ float32 output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Uses _mm256_maddubs_epi16 with offset trick:
-//   act_int8 ∈ [-127, 127],  act_u8 = act_int8 + 128 ∈ [1, 255]
-//   w_int8 ∈ {-1, 0, 1}
+//   act_int8 âˆˆ [-127, 127],  act_u8 = act_int8 + 128 âˆˆ [1, 255]
+//   w_int8 âˆˆ {-1, 0, 1}
 //   sum(act_i * w_i) = sum((act_u8 - 128) * w_i)
 //                    = sum(act_u8 * w_i) - 128 * row_sum
 //   where _mm256_maddubs_epi16(act_u8, w_i8) computes sum(act_u8 * w_i)
 //
-// activations: [n_tokens × input_dim] int8 (IN THE RANGE [-127, 127])
-// output:      [n_tokens × rows] float32
-// row_sums:    [rows] int32 — precomputed Σ w_i per output row
+// activations: [n_tokens Ã— input_dim] int8 (IN THE RANGE [-127, 127])
+// output:      [n_tokens Ã— rows] float32
+// row_sums:    [rows] int32 â€” precomputed Î£ w_i per output row
 ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                                     const int8_t* weights, const uint8_t* act_u8,
                                     const int32_t* row_sums, float* output,
@@ -1490,7 +1491,7 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
             int c = 0;
             int dot = 0;
 
-            // AVX2: 32 bytes per iteration → 16 pairs via maddubs → 8 int32 via madd
+            // AVX2: 32 bytes per iteration â†’ 16 pairs via maddubs â†’ 8 int32 via madd
             __m256i acc = _mm256_setzero_si256();
 
             for (; c + 32 <= input_dim; c += 32) {
@@ -1514,7 +1515,7 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                 dot += (int)a[c] * (int)w[c];
             }
 
-            // Undo 128 offset: dot' = dot - 128 * Σ w_i
+            // Undo 128 offset: dot' = dot - 128 * Î£ w_i
             int result = dot - 128 * sum_w;
             output[t * rows + r] = (float)result;
         }
@@ -1522,7 +1523,7 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
 
 }
 
-// ─── Norm: float16 tensor → RMSNorm ────────────────────────────────────
+// â”€â”€â”€ Norm: float16 tensor â†’ RMSNorm â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Performs: output[i] = x[i] * weight[i] * rms(mean(x^2) + eps)
 // Where weight is loaded from atlas tensor (float16)
 ATLAS_API void atlas_rmsnorm_f32(const float* x, const uint8_t* weight_f16,
@@ -1552,9 +1553,9 @@ ATLAS_API void atlas_rmsnorm_f32(const float* x, const uint8_t* weight_f16,
     }
 }
 
-// ─── RoPE: apply rotary embeddings ──────────────────────────────────────
+// â”€â”€â”€ RoPE: apply rotary embeddings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Modifies q and k in-place for a single position
-// q/k: [n_heads × head_dim] float32 (interleaved format)
+// q/k: [n_heads Ã— head_dim] float32 (interleaved format)
 ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
                                int head_dim, int position, float rope_theta) {
     float theta_base = rope_theta;
@@ -1582,16 +1583,16 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
     }
 }
 
-// ─── Fused attention: QK-Norm + RoPE + GQA + softmax + weighted sum ───
+// â”€â”€â”€ Fused attention: QK-Norm + RoPE + GQA + softmax + weighted sum â”€â”€â”€
 // v2.3.0: Int8 KV cache with per-position scaling (half memory bandwidth)
-// q: [B, n_heads * head_dim] float32 — RoPE applied in-place, modified
-// k: [B, n_kv_heads * head_dim] float32 — RoPE applied in-place, modified
+// q: [B, n_heads * head_dim] float32 â€” RoPE applied in-place, modified
+// k: [B, n_kv_heads * head_dim] float32 â€” RoPE applied in-place, modified
 // v: [B, n_kv_heads * head_dim] float32
 // positions: [B] int32
-// k_cache: [n_kv_heads, max_seq, head_dim] int8 — quantized K cache
-// k_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for K
-// v_cache: [n_kv_heads, max_seq, head_dim] int8 — quantized V cache
-// v_scale_cache: [n_kv_heads, max_seq] float — per-(kv_head,pos) scale for V
+// k_cache: [n_kv_heads, max_seq, head_dim] int8 â€” quantized K cache
+// k_scale_cache: [n_kv_heads, max_seq] float â€” per-(kv_head,pos) scale for K
+// v_cache: [n_kv_heads, max_seq, head_dim] int8 â€” quantized V cache
+// v_scale_cache: [n_kv_heads, max_seq] float â€” per-(kv_head,pos) scale for V
 // output: [B, n_heads * head_dim] float32
 // q_norm_w, k_norm_w: [head_dim] uint8 fp16 RMSNorm weights (QK-Norm, Qwen3), NULL = skip
 // v2.5.0: Ring buffer (cache_pos = pos % max_seq_len) + NTK context extension (base_seq_len)
@@ -1607,7 +1608,7 @@ ATLAS_API void atlas_attention_f32(
 
     int n_rep = n_heads / n_kv_heads;
     float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
-    // v2.5.0: NTK context extension — compound rope_scale with ctx_scale
+    // v2.5.0: NTK context extension â€” compound rope_scale with ctx_scale
     float ctx_scale = base_seq_len > 0 ? (float)max_seq_len / (float)base_seq_len : 1.0f;
     if (ctx_scale < 1.0f) ctx_scale = 1.0f;
     float total_scale = rope_scale;
@@ -1617,11 +1618,11 @@ ATLAS_API void atlas_attention_f32(
         eff_theta *= powf(total_scale, (float)head_dim / (float)(head_dim - 2));
     }
 
-    // v2.5.0: Ring buffer — first valid position in cache
+    // v2.5.0: Ring buffer â€” first valid position in cache
     int ring_start = seq_now > max_seq_len ? seq_now - max_seq_len : 0;
     int ring_len = seq_now > max_seq_len ? max_seq_len : seq_now;
 
-    // Attention scores — heap-allocated, reusable buffer (avoids ~192KB stack alloca)
+    // Attention scores â€” heap-allocated, reusable buffer (avoids ~192KB stack alloca)
     int max_seq = ring_len;
     static thread_local float* scores_buf = nullptr;
     static thread_local size_t scores_cap = 0;
@@ -1795,8 +1796,8 @@ ATLAS_API void atlas_attention_f32(
     }
 }
 
-// ─── Helper: quantize float32 activations → uint8 (+128 offset) ────────
-// act: [B, D] float32 → act_u8: [B, D] uint8, max_abs: [B] float32
+// â”€â”€â”€ Helper: quantize float32 activations â†’ uint8 (+128 offset) â”€â”€â”€â”€â”€â”€â”€â”€
+// act: [B, D] float32 â†’ act_u8: [B, D] uint8, max_abs: [B] float32
 static void quantize_f32_to_u8(const float* act, int B, int D,
                                 float* max_abs_out, uint8_t* act_u8_out) {
     for (int t = 0; t < B; t++) {
@@ -1816,31 +1817,31 @@ static void quantize_f32_to_u8(const float* act, int B, int D,
     }
 }
 
-// ─── Set f32 matmul mode (no activation quantization) ────────────────
+// â”€â”€â”€ Set f32 matmul mode (no activation quantization) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_set_use_f32_matmul(AtlasModel* m, int val) {
     if (m) m->use_f32_matmul = val ? true : false;
 }
 
-// ─── v1.3.0: Set ternary matmul mode (vpsignb, no multiplication) ────
+// â”€â”€â”€ v1.3.0: Set ternary matmul mode (vpsignb, no multiplication) â”€â”€â”€â”€
 // Uses _mm256_sign_epi8 for pure sign-based ternary dot product.
-// Eliminates 128*row_sum correction. Requires weights ∈ {-1, 0, +1}.
+// Eliminates 128*row_sum correction. Requires weights âˆˆ {-1, 0, +1}.
 ATLAS_API void atlas_set_use_ternary_matmul(AtlasModel* m, int val) {
     if (m) m->use_ternary_matmul = val ? true : false;
 }
 
-// ─── v1.3.1: Set packed matmul mode (2-bit packed ternary weights) ────
+// â”€â”€â”€ v1.3.1: Set packed matmul mode (2-bit packed ternary weights) â”€â”€â”€â”€
 // Operates directly on 2-bit compressed weights (4 values/byte).
-// Requires TQ1→2-bit conversion at load time. 4× less memory bandwidth.
+// Requires TQ1â†’2-bit conversion at load time. 4Ã— less memory bandwidth.
 ATLAS_API void atlas_set_use_packed_matmul(AtlasModel* m, int val) {
     if (m) m->use_packed_matmul = val ? true : false;
 }
 
-// ─── v1.3.2: Set hybrid matmul mode (FFN int8, QKV packed) ──────────
+// â”€â”€â”€ v1.3.2: Set hybrid matmul mode (FFN int8, QKV packed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_set_use_hybrid_matmul(AtlasModel* m, int val) {
     if (m) m->use_hybrid_matmul = val ? true : false;
 }
 
-// ─── v1.3.1: Set OpenMP thread count ──────────────────────────────────
+// â”€â”€â”€ v1.3.1: Set OpenMP thread count â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // n=0 resets to default (all available threads).
 ATLAS_API void atlas_set_num_threads(AtlasModel* m, int n) {
     (void)m;
@@ -1849,12 +1850,12 @@ ATLAS_API void atlas_set_num_threads(AtlasModel* m, int n) {
     #endif
 }
 
-// ─── v2.4.0: Set YaRN NTK RoPE scaling factor ────────────────────────
+// â”€â”€â”€ v2.4.0: Set YaRN NTK RoPE scaling factor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_set_rope_scale(AtlasModel* m, float scale) {
     if (m) m->rope_scale = scale;
 }
 
-// ─── v2.4.0: Set layer stride (9 Falcon3, 11 Qwen3 with QK-Norm) ────
+// â”€â”€â”€ v2.4.0: Set layer stride (9 Falcon3, 11 Qwen3 with QK-Norm) â”€â”€â”€â”€
 ATLAS_API void atlas_set_layer_stride(AtlasModel* m, int stride) {
     if (m) m->layer_stride = stride;
 }
@@ -1862,17 +1863,17 @@ ATLAS_API void atlas_set_layer_stride(AtlasModel* m, int stride) {
 // Forward declaration (defined after atlas_generate)
 static void ensure_layer_idx(AtlasModel* m);
 
-// ─── v2.7.6: Ensure layer index cache + model arch detection ───
+// â”€â”€â”€ v2.7.6: Ensure layer index cache + model arch detection â”€â”€â”€
 ATLAS_API void atlas_ensure_layer_idx(AtlasModel* m) {
     if (m) ensure_layer_idx(m);
 }
 
-// ─── v2.5.0: Set base sequence length (trained context for NTK extension) ──
+// â”€â”€â”€ v2.5.0: Set base sequence length (trained context for NTK extension) â”€â”€
 ATLAS_API void atlas_set_base_seq_len(AtlasModel* m, int seq_len) {
     if (m && seq_len > 0) m->base_seq_len = seq_len;
 }
 
-// v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
+// v2.6.0: Reset KV cache â€” zeros all cache data without freeing allocation.
 // Call between conversations to prevent context leakage across sessions.
 ATLAS_API void atlas_reset_cache(void* model) {
     AtlasModel* m = (AtlasModel*)model;
@@ -1885,7 +1886,7 @@ ATLAS_API void atlas_reset_cache(void* model) {
     memset(m->v_scale_cache, 0, scale_bytes * sizeof(float));
 }
 
-// ─── Helper: horizontal sum of __m256 float ──────────────────────────
+// â”€â”€â”€ Helper: horizontal sum of __m256 float â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static inline float hsum_ps(__m256 v) {
     __m128 l = _mm256_castps256_ps128(v);
     __m128 h = _mm256_extractf128_ps(v, 1);
@@ -1895,13 +1896,13 @@ static inline float hsum_ps(__m256 v) {
     return _mm_cvtss_f32(l);
 }
 
-// ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
+// â”€â”€â”€ v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) â”€
 // act_u8: [B, input_dim] uint8 quantized activations [1, 255]
 // weights: [rows, input_dim] int8 ternary weights {-1, 0, +1}
 // max_abs: [B] per-token max abs (for dequant)
 // scale: per-tensor dequant scale
 // output: [B, rows] reordered float
-// Uses _mm256_sign_epi8 → pure sign/flip/zero, no i8×i8 multiply.
+// Uses _mm256_sign_epi8 â†’ pure sign/flip/zero, no i8Ã—i8 multiply.
 static void matmul_ternary_add_reorder(int rows, int input_dim,
     const int8_t* weights, const uint8_t* act_u8,
     const float* max_abs, float scale, float* output, int B) {
@@ -1951,11 +1952,11 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
     }
 }
 
-// ─── Fused TQ1 decode + int32 dot product for packed weights ──────────
+// â”€â”€â”€ Fused TQ1 decode + int32 dot product for packed weights â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Decodes TQ1 bytes to int8 trits on-the-fly and computes the activation dot
 // product in one pass. No intermediate decode buffer needed.
 // Uses the +128 offset trick:
-//   sum(act_u8[i] * w[i]) → dot = sum(act_u8[i] * lut[t]) - 128 * sum_w
+//   sum(act_u8[i] * w[i]) â†’ dot = sum(act_u8[i] * lut[t]) - 128 * sum_w
 //   result = dot / (127.0 * scale)  -- dequant scale applied by caller
 static void matmul_tq1_packed_reorder(int rows, int input_dim,
     const uint8_t* packed, int packed_cols,
@@ -2027,7 +2028,7 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
     }
 }
 
-// ─── Gate activation: SiLU (default) vs ReLU² (BitNet) ────────────
+// â”€â”€â”€ Gate activation: SiLU (default) vs ReLUÂ² (BitNet) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static inline float gate_activation(float g, bool use_relu2) {
     if (use_relu2) {
         float r = g > 0.0f ? g : 0.0f;
@@ -2046,7 +2047,7 @@ static inline void apply_sub_norm(float* buf, int n, const uint8_t* w_data) {
     }
 }
 
-// ─── Block-scaled TQ1 matmul (ttype=5, Bonsai g128 per-row format) ──
+// â”€â”€â”€ Block-scaled TQ1 matmul (ttype=5, Bonsai g128 per-row format) â”€â”€
 // Per-row per-block fp16 scales decoded from tensor_data header.
 // Each output row has its own set of n_blocks fp16 scales.
 // tensor_data layout: [block_size:1][n_blocks:2][scales: rows*n_blocks*2][packed_TQ1]
@@ -2188,13 +2189,13 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
     free(block_scales);
 }
 
-// ─── v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant ───
+// â”€â”€â”€ v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant â”€â”€â”€
 // act_f32: [B, input_dim] raw float activations (no pre-quantization needed)
 // tensor_data: ttype=5 TQ1-packed weights + per-row per-block fp16 scales
 // output: [B, rows] reordered float output
-// Fuses: per-token max_abs → symmetric int8 → _mm256_sign_epi8 ternary matmul
-//        → per-block fp16 scale → per-token dequant (scale_x)
-// No uint8+128 offset, no row_sum correction. Eliminates the 14912× signal collapse.
+// Fuses: per-token max_abs â†’ symmetric int8 â†’ _mm256_sign_epi8 ternary matmul
+//        â†’ per-block fp16 scale â†’ per-token dequant (scale_x)
+// No uint8+128 offset, no row_sum correction. Eliminates the 14912Ã— signal collapse.
 static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32,
@@ -2352,7 +2353,7 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     }
 }
 
-// ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
+// â”€â”€â”€ Helper: f32Ã—i8 matmul + reorder (no activation quantization) â”€â”€â”€
 // act_f32: [B, input_dim] float activations (not quantized)
 // weights: [rows, input_dim] int8 weights
 // scale: per-tensor dequant scale
@@ -2392,7 +2393,7 @@ static void matmul_f32_reorder(int rows, int input_dim,
     }
 }
 
-// ─── Helper: int8 matmul + reorder + dequant ──────────────────────────
+// â”€â”€â”€ Helper: int8 matmul + reorder + dequant â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // act_u8: [B, input_dim] quantized activations
 // max_abs: [B] per-token max
 // scratch: [B, rows] raw matmul scratch
@@ -2423,7 +2424,7 @@ static void matmul_reorder_deq(int rows, int input_dim,
 }
 
 
-// ─── Internal: forward one transformer layer ──────────────────────────
+// â”€â”€â”€ Internal: forward one transformer layer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // input: [B, H] float32 (read-only, preserved for residual)
 // output: [B, H] float32 (must not alias input)
 // K/V cache is accessed from model struct (int8 + per-position scaling)
@@ -2444,7 +2445,13 @@ static void forward_layer_internal(
     int inter = m->inter_dim;
     float theta = m->rope_theta;
 
-    // ─── 1. Pre-attention RMSNorm ───
+    if (getenv("ATLAS_DEBUG")) {
+        fprintf(stderr, "[DEBUG fwd_in] input[0:10]:");
+        for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", input[i]);
+        fprintf(stderr, "\n");
+    }
+
+    // â”€â”€â”€ 1. Pre-attention RMSNorm â”€â”€â”€
     {
         auto& t = m->tensors[idx_ln1];
         const uint8_t* w = t.data;
@@ -2461,8 +2468,13 @@ static void forward_layer_internal(
         }
     }
     float* x_norm = output;
+    if (getenv("ATLAS_DEBUG")) {
+        fprintf(stderr, "[DEBUG ln1] x_norm[0:10]:");
+        for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", x_norm[i]);
+        fprintf(stderr, "\n");
+    }
 
-    // ─── 2. QKV projections (int8) ───
+    // â”€â”€â”€ 2. QKV projections (int8) â”€â”€â”€
     auto get_i8 = [](const TensorInfo& t, int8_t*& w, int32_t*& rs,
                      int& rows, int& dim, float& scale) {
         if (t.ttype != 3) { rows = 0; dim = 0; w = nullptr; rs = nullptr; return; }
@@ -2557,7 +2569,7 @@ static void forward_layer_internal(
             matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs, scale, m->buf_up, B);
         }
     } else if (m->use_f32_matmul) {
-        // Full-precision path: f32×i8, no activation quantization
+        // Full-precision path: f32Ã—i8, no activation quantization
         {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(tq, w, rs, rows, dim, scale);
@@ -2618,7 +2630,7 @@ static void forward_layer_internal(
     }
 
 
-    // ─── 3. Fused attention (reuse atlas_attention_f32) ───
+    // â”€â”€â”€ 3. Fused attention (reuse atlas_attention_f32) â”€â”€â”€
     int ws = B * nH * hd;
     float* attn_out = m->attn_ws;
     float* q_f32 = m->attn_ws + ws;
@@ -2637,15 +2649,14 @@ static void forward_layer_internal(
         nH, nKV, hd, theta, m->rope_scale, attn_out, qn_w, kn_w,
         m->base_seq_len);
 
-    // ─── 3.5. attn_sub_norm: RMSNorm(attn_out) per BitNet reference ───
+    // ---- 3.5. attn_sub_norm: applied BEFORE O_proj (matching HuggingFace) ----
     if (m->model_arch == ARCH_BITNET && idx_q_norm >= 0) {
         for (int b = 0; b < B; b++) {
-            float* ap = attn_out + b * qd;
-            apply_sub_norm(ap, qd, m->tensors[idx_q_norm].data);
+            apply_sub_norm(attn_out + b * qd, qd, m->tensors[idx_q_norm].data);
         }
     }
 
-    // ─── 4. O projection (int8) ───
+    // â”€â”€â”€ 4. O projection (int8) â”€â”€â”€
     {
         auto& to = m->tensors[idx_o];
         if (to.ttype == 5) {
@@ -2688,11 +2699,16 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 5. Residual: output = input + attn_out_proj ───
+    // ---- 5. Residual: output = input + attn_out_proj â”€â”€â”€
     for (int i = 0; i < B * H; i++) {
         output[i] = input[i] + m->buf_gate[i];
     }
-    // ─── 6. Post-attention RMSNorm ───
+    if (getenv("ATLAS_DEBUG")) {
+        fprintf(stderr, "[DEBUG attn_res] output[0:10]:");
+        for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", output[i]);
+        fprintf(stderr, "\n");
+    }
+    // â”€â”€â”€ 6. Post-attention RMSNorm â”€â”€â”€
     {
         auto& t = m->tensors[idx_ln2];
         const uint8_t* w = t.data;
@@ -2710,7 +2726,7 @@ static void forward_layer_internal(
     }
     float* x_norm2 = m->buf_act;
 
-    // ─── 7. FFN: fused gate + up projections (one OMP region) ───
+    // â”€â”€â”€ 7. FFN: fused gate + up projections (one OMP region) â”€â”€â”€
     // Fused kernel processes both in one pass: shared activation, no scratch buffer,
     // reorder+dequant inline.
     auto& tg = m->tensors[idx_gate];
@@ -2824,7 +2840,7 @@ static void forward_layer_internal(
                         u_dot += ai8 * (int)wu[c];
                     }
 
-                    // No 128*row_sum correction needed — vpsignb already gives Σ(ai8 * w_i)
+                    // No 128*row_sum correction needed â€” vpsignb already gives Î£(ai8 * w_i)
                     g_val[sub] = (float)g_dot * deq / g_scale;
                     u_val[sub] = (float)u_dot * deq / u_scale;
                 }
@@ -2842,7 +2858,7 @@ static void forward_layer_internal(
             }
         }
     } else if (m->use_f32_matmul) {
-        // Full-precision FFN: f32 activations × int8 weights, no quantization
+        // Full-precision FFN: f32 activations Ã— int8 weights, no quantization
         int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
         int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
         get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
@@ -2979,7 +2995,7 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 8. Fused SiLU(gate)*up → down matmul ───
+    // â”€â”€â”€ 8. Fused SiLU(gate)*up â†’ down matmul â”€â”€â”€
     {
         auto& td = m->tensors[idx_down];
         if (td.ttype == 5) {
@@ -2988,7 +3004,7 @@ static void forward_layer_internal(
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * td.packed_cols * 5;
                 for (int i = 0; i < inter; i++) {
-                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                    tmp[i] = gate_activation(g[i], m->use_relu2) * u[i];
                 }
                 if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
                     apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
@@ -3001,13 +3017,13 @@ static void forward_layer_internal(
         } else if (td.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(td, wp, rows, dim, pc, scale);
-            // SiLU(gate)*up → quantize to u8 → TQ1-packed matmul
+            // SiLU(gate)*up â†’ quantize to u8 â†’ TQ1-packed matmul
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++) {
-                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                    tmp[i] = gate_activation(g[i], m->use_relu2) * u[i];
                 }
                 if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
                     apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
@@ -3031,13 +3047,13 @@ static void forward_layer_internal(
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(td, w, rs, rows, dim, scale);
             if (m->use_ternary_matmul) {
-            // Ternary-add: SiLU(gate)*up or ReLU²(gate)*up
+            // Ternary-add: SiLU(gate)*up or ReLUÂ²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++) {
-                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                    tmp[i] = gate_activation(g[i], m->use_relu2) * u[i];
                 }
                 if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
                     apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
@@ -3059,13 +3075,13 @@ static void forward_layer_internal(
             matmul_ternary_add_reorder(rows, dim, w, m->buf_i8, max_abs,
                                       scale, m->buf_gate, B);
         } else if (m->use_f32_matmul) {
-            // Full-precision: compute SiLU(gate)*up or ReLU²(gate)*up
+            // Full-precision: compute SiLU(gate)*up or ReLUÂ²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++)
-                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                    tmp[i] = gate_activation(g[i], m->use_relu2) * u[i];
                 if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
                     apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
                 }
@@ -3073,13 +3089,13 @@ static void forward_layer_internal(
             }
             matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
         } else {
-            // Quantized path: SiLU(gate)*up or ReLU²(gate)*up
+            // Quantized path: SiLU(gate)*up or ReLUÂ²(gate)*up
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++) {
-                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                    tmp[i] = gate_activation(g[i], m->use_relu2) * u[i];
                 }
                 if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
                     apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
@@ -3104,18 +3120,23 @@ static void forward_layer_internal(
         }
     }
 
-    // ─── 10. Residual: output += down_proj ───
+    // â”€â”€â”€ 10. Residual: output += down_proj â”€â”€â”€
     for (int i = 0; i < B * H; i++) {
         output[i] += m->buf_gate[i];
+    }
+    if (getenv("ATLAS_DEBUG")) {
+        fprintf(stderr, "[DEBUG layer_out] output[0:10]:");
+        for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", output[i]);
+        fprintf(stderr, "\n");
     }
 }
 
 
-// ─── Forward ALL transformer layers in one C call ────────────────────
-// (single-layer atlas_forward_layer removed — fusion is always used)
-// hidden_states: [B, H] float32 — overwritten with final layer output
+// â”€â”€â”€ Forward ALL transformer layers in one C call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// (single-layer atlas_forward_layer removed â€” fusion is always used)
+// hidden_states: [B, H] float32 â€” overwritten with final layer output
 // positions: [B] int32 position indices
-// layer_idx: [n_layers * 9] int32 — flat array of tensor indices per layer
+// layer_idx: [n_layers * 9] int32 â€” flat array of tensor indices per layer
 //           (ln1, q, k, v, o, ln2, gate, up, down) repeated for each layer
 // K/V cache is internal to the model (int8 + per-position scales)
 ATLAS_API void atlas_forward(
@@ -3147,6 +3168,11 @@ ATLAS_API void atlas_forward(
             idx[0], idx[1], idx[2], idx[3], idx[4],
             idx[5], idx[6], idx[7], idx[8],
             qn_i, kn_i);
+        if (getenv("ATLAS_DEBUG") && L == 0) {
+            fprintf(stderr, "[DEBUG L0 out] %.6f %.6f %.6f %.6f %.6f  %.6f %.6f %.6f %.6f %.6f\n",
+                buf_b[0], buf_b[1], buf_b[2], buf_b[3], buf_b[4],
+                buf_b[5], buf_b[6], buf_b[7], buf_b[8], buf_b[9]);
+        }
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
     }
 
@@ -3157,7 +3183,7 @@ ATLAS_API void atlas_forward(
     }
 }
 
-// ─── Quantize lm_head from fp16 to per-row symmetric int8 ─────────────
+// â”€â”€â”€ Quantize lm_head from fp16 to per-row symmetric int8 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Reads the fp16 tensor at idx, quantizes each row to int8, stores in
 // AtlasModel fields. Frees the fp16 data (saves 768 MB).
 // Call after Python has created its fp32 copy (never before step 4 above).
@@ -3209,14 +3235,14 @@ ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx, int keep_data) {
     m->lm_head_quantized = true;
 
     float mb = (float)(n_vals + (int64_t)V * 6) / (1024.0f * 1024.0f);
-    printf("[ATLAS] Quantized lm_head: %d × %d = %.1f MB int8\n", V, H, mb);
+    printf("[ATLAS] Quantized lm_head: %d Ã— %d = %.1f MB int8\n", V, H, mb);
 }
 
-// ─── GEMV: int8 lm_head × u8 quantized activations ────────────────────
+// â”€â”€â”€ GEMV: int8 lm_head Ã— u8 quantized activations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Quantizes B hidden-state vectors [B, H] to u8, then computes full vocab
 // dot products with per-row dequant. AVX2 maddubs + offset trick.
 //
-//   out[b][v] = (Σ_h act_u8[b][h] * W_i8[v][h] - offset[v])
+//   out[b][v] = (Î£_h act_u8[b][h] * W_i8[v][h] - offset[v])
 //               * (max_abs_act[b] / 127) * (weight_scale[v])
 //
 // act: [B, H] float32    output: [B, V] float32
@@ -3293,12 +3319,12 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
     atlas_vfree((uint8_t*)max_abs);
 }
 
-// ─── v1.2.0: Seed PRNG ─────────────────────────────────────────────────
+// â”€â”€â”€ v1.2.0: Seed PRNG â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_set_seed(uint64_t seed) {
     xoshiro_seed(seed);
 }
 
-// ─── v1.2.0: Sample one token via Gumbel-max ──────────────────────────
+// â”€â”€â”€ v1.2.0: Sample one token via Gumbel-max â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API void atlas_sample(AtlasModel* m, float* logits, int* output,
                              float temperature, int top_k, float top_p) {
     (void)m;
@@ -3308,7 +3334,7 @@ ATLAS_API void atlas_sample(AtlasModel* m, float* logits, int* output,
                              nullptr, 0, 1.0f);
 }
 
-// ─── v1.2.0: End-to-end generation (single C call) ───────────────────
+// â”€â”€â”€ v1.2.0: End-to-end generation (single C call) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Builds layer index array from tensor names (cached after first call).
 static void ensure_layer_idx(AtlasModel* m) {
     if (m->has_layer_idx) return;
@@ -3420,7 +3446,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     }
     memcpy(context, input_ids, (size_t)n_input * sizeof(int));
 
-    // ─── Prefill: embed NEW tokens only (cache_offset..n_input-1) ───
+    // â”€â”€â”€ Prefill: embed NEW tokens only (cache_offset..n_input-1) â”€â”€â”€
     int n_gen = 0;
     for (int i = 0; i < n_new; i++) {
         int idx = cache_offset + i;
@@ -3428,6 +3454,21 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         if (tid < 0 || tid >= V) tid = 0;
         for (int j = 0; j < H; j++)
             embed_buf[i * H + j] = fp16_to_fp32(embed_w[tid * H + j]);
+    }
+
+    // Debug: show embed_buf right after fill
+    if (getenv("ATLAS_DEBUG")) {
+        fprintf(stderr, "[DEBUG embed_buf] input_ids[0]=%d idx_embed=%d embed_w=%p\n",
+                input_ids[0], idx_embed, (void*)embed_w);
+        fprintf(stderr, "[DEBUG embed_buf] embed_buf[0:16]:");
+        for (int i = 0; i < 16; i++) fprintf(stderr, " %.6f", embed_buf[i]);
+        fprintf(stderr, "\n");
+        // Check second token too
+        if (n_new > 1) {
+            fprintf(stderr, "[DEBUG embed_buf] token1[0:16]:");
+            for (int i = 0; i < 16; i++) fprintf(stderr, " %.6f", embed_buf[H + i]);
+            fprintf(stderr, "\n");
+        }
     }
 
     // Build position array starting from cache_offset
@@ -3443,11 +3484,38 @@ ATLAS_API int atlas_generate(AtlasModel* m,
                   max_seq_len, n_input,
                   layer_idx, m->n_layers);
 
-    // Final RMSNorm + LM head — only the last new token's logits are needed
+    // Final RMSNorm + LM head â€” only the last new token's logits are needed
     {
         const float* x = embed_buf + (int64_t)(n_new - 1) * H;
+        if (getenv("ATLAS_DEBUG")) {
+            fprintf(stderr, "[DEBUG final_h] x[0:10]:");
+            for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", x[i]);
+            fprintf(stderr, "\n");
+        }
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
+        if (getenv("ATLAS_DEBUG")) {
+            fprintf(stderr, "[DEBUG norm_h] h_norm[0:10]:");
+            for (int i = 0; i < 10; i++) fprintf(stderr, " %.6f", h_norm[i]);
+            fprintf(stderr, "\n");
+        }
         atlas_lmhead_gemv(m, h_norm, logits, 1);
+        if (getenv("ATLAS_DEBUG")) {
+            // Find top-5 logit values
+            int top5_ids[5] = {0,0,0,0,0}; float top5_vals[5] = {-1e9,-1e9,-1e9,-1e9,-1e9};
+            for (int i = 0; i < V; i++) {
+                for (int j = 0; j < 5; j++) {
+                    if (logits[i] > top5_vals[j]) {
+                        for (int k = 4; k > j; k--) { top5_ids[k] = top5_ids[k-1]; top5_vals[k] = top5_vals[k-1]; }
+                        top5_ids[j] = i; top5_vals[j] = logits[i]; break;
+                    }
+                }
+            }
+            fprintf(stderr, "[DEBUG logits] top5:");
+            for (int j = 0; j < 5; j++) fprintf(stderr, " %d:%.2f", top5_ids[j], top5_vals[j]);
+            fprintf(stderr, " | eos=%d logit[eos]=%.2f\n", m->eos_id, logits[m->eos_id >= 0 ? m->eos_id : 0]);
+            fprintf(stderr, "[DEBUG logits] non0:%.2f non-nan:%d\n",
+                    logits[0], (int)(logits[0] == logits[0]));
+        }
     }
 
     // Sample first token from prefill logits
@@ -3465,7 +3533,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         return n_gen;
     }
 
-    // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
+    // â”€â”€â”€ Decode loop (v2.5.0: ring buffer â€” no veto, wraps at max_seq_len) â”€â”€â”€
     atlas_vfree((uint8_t*)positions);
     for (int step = 1; step < max_new_tokens; step++) {
         // Embed last generated token
@@ -3501,7 +3569,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     return n_gen;
 }
 
-// ─── v2.3.0: Streaming generation (callback per token) ───────────────────
+// â”€â”€â”€ v2.3.0: Streaming generation (callback per token) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 ATLAS_API int atlas_generate_stream(AtlasModel* m,
     const int* input_ids, int n_input,
     int max_seq_len, int max_new_tokens,
@@ -3553,7 +3621,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     }
     memcpy(context, input_ids, (size_t)n_input * sizeof(int));
 
-    // ─── Prefill: NEW tokens only ───
+    // â”€â”€â”€ Prefill: NEW tokens only â”€â”€â”€
     int n_gen = 0;
     for (int i = 0; i < n_new; i++) {
         int idx = cache_offset + i;
@@ -3595,7 +3663,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         return n_gen;
     }
 
-    // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
+    // â”€â”€â”€ Decode loop (v2.5.0: ring buffer â€” no veto, wraps at max_seq_len) â”€â”€â”€
     atlas_vfree((uint8_t*)positions);
     for (int step = 1; step < max_new_tokens; step++) {
         int tid = next_token;

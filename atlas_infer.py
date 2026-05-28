@@ -256,6 +256,7 @@ class AtlasModel:
 
         # Cache tensor indices for fast lookup
         self._cache_indices()
+        self._is_bitnet = any('attn_sub_norm' in name for name in self.idx)
 
         # v2.8.0: Persistent KV cache tracking for multi-turn
         self._cached_input_ids = []
@@ -335,7 +336,7 @@ class AtlasModel:
         # TriLM: base LLaMA with no chat format
         self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
         # Qwen3/Bonsai detection: not TriLM, and head_dim<=128 or large vocab (>131k)
-        self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and (self.head_dim <= 128 or self.vocab_size > 131072))
+        self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and not self._is_bitnet and (self.head_dim <= 128 or self.vocab_size > 131072))
         self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
@@ -358,6 +359,9 @@ class AtlasModel:
                     eos_cfg = cfg.get('eos_token')
                     if eos_cfg and isinstance(eos_cfg, dict) and 'id' in eos_cfg:
                         self._eos_id = eos_cfg['id']
+                    elif eos_cfg and isinstance(eos_cfg, str):
+                        if self._tok is not None:
+                            self._eos_id = self._tok.token_to_id(eos_cfg) or 0
             except Exception:
                 pass
 
@@ -388,7 +392,14 @@ class AtlasModel:
                 self._tok = Tokenizer.from_buffer(raw[pos:pos+js_size])
             except Exception as e:
                 print(f"[Atlas] Python tokenizer load failed: {e}")
-        else:
+
+        # BitNet EOS fix: tokenizer_config.json says eos_token=<|eot_id|> (128009)
+        # despite config.json having eos_token_id=128001 (wrong).
+        if self._is_bitnet and self._tok is not None:
+            eot_id = self._tok.token_to_id('<|eot_id|>')
+            if eot_id is not None:
+                self._eos_id = eot_id
+        if not tok_ptr or tok_size.value == 0:
             if not self._use_cpp_tokenizer:
                 print("[Atlas] No embedded tokenizer found")
 
@@ -1049,6 +1060,18 @@ class AtlasModel:
                 enable = getattr(self, '_enable_thinking', True)
                 if not enable:
                     result += '<think>\n\n</think>\n\n'
+            return result
+
+        # BitNet: Role: content<|eot_id|> (per tokenizer_config.json Jinja2 template)
+        if self._is_bitnet:
+            eos = '<|eot_id|>'
+            result = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg.get('content', '')
+                result += f"{role.capitalize()}: {content}{eos}\n"
+            if add_generation_prompt:
+                result += 'Assistant: '
             return result
 
         eos = '<|endoftext|>'
