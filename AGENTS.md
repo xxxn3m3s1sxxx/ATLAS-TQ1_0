@@ -27,7 +27,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.
+Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.
 
 ## Build
 

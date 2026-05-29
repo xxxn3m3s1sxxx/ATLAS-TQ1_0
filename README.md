@@ -108,8 +108,8 @@ python atlas_packer_bitnet.py path/to/bitnet-b1.58-2B-4T --packed
 # Falcon3 (tiiuae/Falcon3-1B-Instruct / -3B / -7B / -10B):
 python atlas_packer.py path/to/falcon3-3b-instruct
 
-# Bonsai (prism-ml/Ternary-Bonsai-1.7B-Chat-unpacked / -4B / -8B):
-python atlas_packer_bonsai.py path/to/bonsai-1.7b-chat
+# Bonsai (prism-ml/Ternary-Bonsai-1.7B-unpacked / -4B / -8B):
+python atlas_packer_bonsai.py path/to/ternary-bonsai-1.7b
 
 # TriLM-1.1B (SpectraSuite/TriLM_1.1B_Unpacked):
 python atlas_packer.py path/to/trilm-1.1b
@@ -136,7 +136,7 @@ Each packer autodetects model family from `config.json` and generates the output
 
 ## Performance
 
-### v2.7.7 — Current (BitNet b1.58 Fixes)
+### v2.8.0 — Current (int4 FFN Quantization)
 
 Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). Warm, `generate_c()` at T=0.7 / top_k=40 for sampling models, T=0 for deterministic. Times shown as sustained gen tok/s where available, otherwise total (prefill+gen).
 
@@ -149,8 +149,10 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz). Warm, `generat
 | **Bonsai-1.7B** | hybrid+int8 | 19.2 | "The capital of France is Paris." (minor quant noise) |
 | **Bonsai-4B** | hybrid+int8 | **17.4** | "The capital of France is Paris." (YaRN 8K ctx) |
 | **Bonsai-8B** | f32 bypass | **1.8** | T=0.7 coherent reasoning. |
-| **Falcon3-7B** | hybrid+int8 | **1.9** | 61 tokens (sampling-dependent). |
-| **Falcon3-10B** | hybrid+int8 | **1.3** | 29 tokens (sampling-dependent). |
+| **Falcon3-7B (int8)** | hybrid+int8 | **2.5** | 61 tokens (sampling-dependent). |
+| **Falcon3-7B (int4)** | hybrid+int8 | **3.15** | +26% vs int8, 200 tokens (no EOS). |
+| **Falcon3-10B (int8)** | hybrid+int8 | **1.9** | 29 tokens (sampling-dependent). |
+| **Falcon3-10B (int4)** | hybrid+int8 | **2.25** | +18% vs int8, 29 tokens (sampling-dependent). |
 
 Bonsai-1.7B defaults to f32 bypass (hidden=2048). Quantized hybrid yields higher throughput with minor quantization noise.
 
@@ -229,6 +231,7 @@ All supported models (Falcon3 1B–10B, Bonsai 1.7B–8B, BitNet-2B4T, TriLM-1.1
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.8.0** | **Load-time int4 FFN quantization (18-26% faster 7B/10B)**: New `atlas_matmul_i4_f32` AVX2 kernel — nibble-unpack + `(nibble^8)-8` sign-extension + `vpmaddubsw`. `atlas_quantize_ffn_to_i4()` converts int8→int4 at load time, halves FFN memory bandwidth. ttype=8 dispatch with `use_f32_matmul` guard for hybrid safety. Lane-permute fix. All 6 models verified. |
 | **v2.7.9** | **Fix duplicate attn_sub_norm (BitNet collapse)**: Merge artifact in `forward_layer_internal` — sub-norm was applied twice to attention output. BitNet-2B4T: `/ / / / /` → `"The capital of France is Paris."`. `data_size` formula fixed for ttype=5 (`row_dim * n_blocks * 2`). |
 | **v2.7.7** | **BitNet b1.58 Packing Fixes**: Fixed I2_S bit order/layout (Microsoft stores row 0 in high bits, was reading from low). Fixed `stored_scale` formula (`127/g→1/g`). Added `/127.0f` in ttype=5 decompress. Pipeline verified: 210/210 tensors at correlation 1.000000. U8 `--packed` path recommended. |
 | **v2.7.6** | **BitNet b1.58 Final Fixes**: Correct dimensions (30L/2560H/6912I/20/5 heads). ReLU² confirmed (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized weights. Correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). |
