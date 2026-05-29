@@ -6,7 +6,7 @@
 
 CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **v2.7.9**: BitNet regression fixed — duplicate `attn_sub_norm` removed. All models correct: Falcon3, Bonsai g128/v7, BitNet-2B4T.
+> ⚡ **v2.8.0**: Load-time int4 FFN quantization (18-26% faster 7B/10B). All 6 models correct: Falcon3, Bonsai, BitNet-2B4T.
 
 ## Supported Models
 
