@@ -57,6 +57,13 @@ except AttributeError:
 dll.atlas_decompress_ffn.restype = None
 dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
 
+try:
+    dll.atlas_quantize_ffn_to_i4.restype = None
+    dll.atlas_quantize_ffn_to_i4.argtypes = [ctypes.c_void_p]
+    _HAS_FFN_I4 = True
+except AttributeError:
+    _HAS_FFN_I4 = False
+
 dll.atlas_save_cache.restype = None
 dll.atlas_save_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
@@ -294,6 +301,8 @@ class AtlasModel:
             else:
                 dll.atlas_decompress_ffn(self.model_ptr)
                 print("[Atlas] Hybrid: FFN int8, QKV packed")
+            if _HAS_FFN_I4:
+                dll.atlas_quantize_ffn_to_i4(self.model_ptr)
             dll.atlas_prefetch_int8(self.model_ptr)
         else:
             # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
@@ -309,12 +318,22 @@ class AtlasModel:
                 if _HAS_TTYPE7_DECOMPRESS:
                     dll.atlas_decompress_ttype7(self.model_ptr)
                 dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
-            # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
-            dll.atlas_prefetch_int8(self.model_ptr)
+            # Always decompress packed→int8 even on cache loads (FFN tensors not in cache)
+            dll.atlas_decompress_all(self.model_ptr)
+            if _HAS_TTYPE5_DECOMPRESS:
+                dll.atlas_decompress_ttype5(self.model_ptr)
+            if _HAS_TTYPE7_DECOMPRESS:
+                dll.atlas_decompress_ttype7(self.model_ptr)
             # f32_bypass: for small, block-scaled, or BitNet models
+            # MUST be set before int4 conversion (guard checks use_f32_matmul)
             is_bitnet = any('attn_sub_norm' in name for name in self.idx)
             if is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
                 dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
+            # Convert FFN int8 to int4 (halves weight bandwidth). Skips if f32_bypass.
+            if _HAS_FFN_I4:
+                dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+            # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
+            dll.atlas_prefetch_int8(self.model_ptr)
 
         # Max sequence length for KV cache ring buffer (v2.5.0: configurable)
         self.max_seq_len = max_seq_len

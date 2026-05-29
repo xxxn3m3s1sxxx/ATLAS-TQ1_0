@@ -6,7 +6,8 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 - **TQ1.0 format**: 5 ternary trits per byte (Base-3 encoding), ~1.58 bits/weight
 - **TQ1.0 g128** (ttype=5): Per-row per-block fp16 scales (block_size=128), 16/128 = 0.125 b/w overhead. Used by Bonsai/Qwen3 models. Packed via `matmul_tq1_block_reorder`.
-- **4 matmul modes**: int8 (default, `vpmaddubs` SIMD), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
+- **5 matmul modes**: int8 (default, `vpmaddubs` SIMD), int4 (v2.8.0, nibble-unpack + `vpmaddubsw`, halves FFN memory bandwidth), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
+- **ttype=8 (int4 packed)**: 2 int4 weights per byte, sign-extension via `(nibble ^ 8) - 8`. Converted at load time from existing int8 FFN tensors — no packer changes required. `[fp16_scale:2][packed_weights:rows*packed_cols][row_sums:rows*4]`. Guarded by `use_f32_matmul` to avoid activation quantization for hybrid architectures.
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
 - **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN architectures where weights are ~0.01× and u8+128 activation quant destroys signal.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
@@ -51,10 +52,14 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 | **3B** | **7.1** | — | 200 (no EOS) |
 | **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
 | **2B (BitNet)** | **2.8** (f32 bypass) | — | T=0: Correct short answers ("The capital of France is Paris."), degenerates into repetition after 10-15 tokens. T=0.7: Coherent first sentence, then degrades. f32_bypass required (SubLN signal destroyed by u8+128 activation quant). U8-packed path (Microsoft pre-quantized) strongly preferred over BF16 ternarization. Two bugs fixed: I2_S bit order/layout (k*B+ur) + stored_scale formula (127/g→1/g). |
-| **7B** | **1.9** | — | 61 (sampling-dependent) |
-| **10B** | **1.3** | — | 29 (sampling-dependent) |
+| **7B (int8)** | **2.5** | — | 61 (sampling-dependent) |
+| **7B (int4)** | **3.15** | — | 200 (no EOS, +26%) |
+| **10B (int8)** | **1.9** | — | 29 (sampling-dependent) |
+| **10B (int4)** | **2.25** | — | 29 (sampling-dependent, +18%) |
 
 **10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
+
+**int4 FFN quantization** (v2.8.0): Load-time int8→int4 conversion halves FFN memory bandwidth. 7B achieves **3.15 tok/s** (+26% vs int8), 10B achieves **2.25 tok/s** (+18% vs int8). Automatic skip for f32_bypass models (Bonsai, BitNet, 1B).
 
 **T=0 argmax behavior** (deterministic mode):  
 - **10B/7B**: Clean output ("The capital of France is Paris."), EOS after answer.  
@@ -111,6 +116,14 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
+### v2.8.0 ✅ — Load-Time int4 FFN Quantization (ABGESCHLOSSEN)
+- **New AVX2 kernel `atlas_matmul_i4_f32`**: Nibble-unpack + `(nibble^8)-8` sign-extension + `vpmaddubsw` — 64 elements per iteration.
+- **`atlas_quantize_ffn_to_i4()`**: Load-time int8→int4 conversion for gate/down/up FFN tensors. Clip to [-8,7], pack 2/byte. Guarded by `use_f32_matmul` for hybrid architecture safety.
+- **ttype=8 dispatch**: Gate+up and down projection branches in `forward_layer_internal`, inserted before ternary/f32/fallback dispatch.
+- **Lane-permute fix**: `_mm256_unpack*_epi8` per-128-bit-lane behavior corrected via `_mm256_permute2f128_si256`.
+- **Python reorder**: `set_use_f32_matmul()` called before `quantize_ffn_to_i4()` to ensure f32_bypass models skip int4 conversion.
+- **Target erreicht**: 7B +26% (2.5→3.15 tok/s), 10B +18% (1.9→2.25 tok/s). Alle 6 Modelle (3B/7B/10B/Bonsai-1.7B/Bonsai-4B/BitNet) korrekt.
+
 ### v2.4.0 — Qwen3/Bonsai-Okosystem-Upgrade (AKTIV)
 - **Packer (`atlas_packer_bonsai.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
 - **head_dim=128**: Alle Attention-Pfade (RoPE, Scores, Weighted Sum, KV-Cache) auf variablen head_dim umstellen.
@@ -143,6 +156,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.8.0** | **Load-time int4 FFN quantization (18-26% faster)**: New `atlas_matmul_i4_f32` AVX2 kernel — nibble-unpack + sign-extension via `(nibble^8)-8` + `vpmaddubsw`. `atlas_quantize_ffn_to_i4()` converts int8→int4 at load time, halves FFN memory bandwidth. ttype=8 dispatch in `forward_layer_internal` with `use_f32_matmul` guard for hybrid safety. 7B: 2.5→3.15 tok/s (+26%), 10B: 1.9→2.25 tok/s (+18%). Lane-permute bug fixed: `_mm256_unpack*_epi8` per-128-bit-lane issue patched via `_mm256_permute2f128_si256`. |
 | **v2.7.9** | **Fix duplicate attn_sub_norm (BitNet collapse)**: Merge-Artefakt in `forward_layer_internal` — sub-norm wurde zweimal auf Attention-Output angewandt. BitNet-2B4T: `/ / / / /` → `"The capital of France is Paris."`. `data_size`-Formel für ttype=5 korrigiert (`row_dim * n_blocks * 2`). |
 | **v2.7.7** | **BitNet Packing Fixes**: Fixed U8 bit ordering (Microsoft I2_S stores row 0 in high bits, was reading from low). Switched BF16 to per-tensor absmean + `weight_scale` loading. Fixed `data_size` header calc for ttype=5. U8 `--packed` path recommended. |
 | **v2.7.6** | **BitNet b1.58 Final Fixes**: AGENTS.md dimensions corrected to 30L/2560H/6912I/20/5 heads. ReLU² confirmed correct (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized Microsoft weights. Python BitNet detection (`_is_bitnet` via attn_sub_norm), correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). Misidentification as Qwen3 fixed. |
