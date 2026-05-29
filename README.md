@@ -2,9 +2,9 @@
   <img src="atlas_banner.svg" alt="ATLAS Banner" width="100%">
 </p>
 
-# ATLAS — Run 10B LLMs on a 4GB RAM Laptop
+# ATLAS — Run 10B LLMs on a 8GB RAM Laptop
 
-**No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Models that normally need 20 GB+ GPU VRAM run on an old laptop at 2-10 tokens/second.
+**No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
 > ⚡ **v2.8.0**: Load-time int4 FFN quantization (18-26% faster 7B/10B). CLI binary available.
 
