@@ -8,6 +8,7 @@
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
+  #include <shellapi.h>
 #else
   #include <dlfcn.h>
   typedef void* HMODULE;
@@ -21,6 +22,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+
+#ifdef _WIN32
+#include <shellapi.h> // CommandLineToArgvW
+#endif
 
 // ─── Function pointer typedefs ──────────────────────────────────────────
 // Mirrors atlas_ffi.h signatures. Loaded via GetProcAddress at runtime.
@@ -153,6 +158,18 @@ static void unload_dll() {
         g_dll = NULL;
     }
 }
+
+// ─── Windows UTF-8 helper ────────────────────────────────────────────
+#ifdef _WIN32
+static std::string wchar_to_utf8(const wchar_t* wstr) {
+    if (!wstr) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string result(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &result[0], len, NULL, NULL);
+    return result;
+}
+#endif
 
 // ─── Args ───────────────────────────────────────────────────────────────
 struct Config {
@@ -482,8 +499,25 @@ static void interactive_loop(void* model, const ModelInfo& info, const Config& c
 // ─── Main ───────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    // Override ANSI-codepage argv with UTF-8 (handles Umlaute, accents, CJK)
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    int argc_w = 0;
+    LPWSTR* argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
+    std::vector<std::string> utf8_args;
+    std::vector<char*> utf8_ptrs;
+    if (argv_w && argc_w > 0) {
+        for (int i = 0; i < argc_w; i++)
+            utf8_args.push_back(wchar_to_utf8(argv_w[i]));
+        for (auto& s : utf8_args)
+            utf8_ptrs.push_back(&s[0]);
+        argc = argc_w;
+        argv = utf8_ptrs.data();
+    }
+    LocalFree(argv_w);
+#else
+    (void)argc;
+    (void)argv;
 #endif
 
     Config cfg = parse_args(argc, argv);
@@ -491,6 +525,32 @@ int main(int argc, char** argv) {
     if (cfg.help || cfg.model_path.empty()) {
         print_usage();
         return cfg.help ? 0 : 1;
+    }
+
+    // ─── Input validation ────────────────────────────────────────────────
+    if (cfg.temperature < 0.0f || !std::isfinite(cfg.temperature)) {
+        fprintf(stderr, "[Error] --temp must be a finite value >= 0 (got %g)\n", cfg.temperature);
+        return 1;
+    }
+    if (cfg.max_new_tokens <= 0 || cfg.max_new_tokens > 100000) {
+        fprintf(stderr, "[Error] --max-new must be 1..100000 (got %d)\n", cfg.max_new_tokens);
+        return 1;
+    }
+    if (cfg.max_seq_len < 64 || cfg.max_seq_len > 262144) {
+        fprintf(stderr, "[Error] --max-seq must be 64..262144 (got %d)\n", cfg.max_seq_len);
+        return 1;
+    }
+    if (cfg.top_p < 0.0f || cfg.top_p > 1.0f) {
+        fprintf(stderr, "[Error] --top-p must be 0..1 (got %g)\n", cfg.top_p);
+        return 1;
+    }
+    if (cfg.rep_penalty < 0.0f || !std::isfinite(cfg.rep_penalty)) {
+        fprintf(stderr, "[Error] --rep-penalty must be a finite value >= 0 (got %g)\n", cfg.rep_penalty);
+        return 1;
+    }
+    if (cfg.num_threads < 0) {
+        fprintf(stderr, "[Error] --threads must be >= 0 (got %d)\n", cfg.num_threads);
+        return 1;
     }
 
     // Determine DLL path (next to EXE, or ATLAS_DLL env var)

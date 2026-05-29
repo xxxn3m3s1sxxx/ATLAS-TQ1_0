@@ -119,6 +119,7 @@ atlas.exe <model.atlas> [prompt] [options]
 | `--temp 0.0` | Factual QA, deterministic answers |
 | `--temp 0.7` + `--top-k 40` | Creative writing, conversation |
 | `--threads 4` | On battery, or shared CPU |
+| `--threads <P-cores>` | **Hybrid CPUs** (Alder Lake+): set to physical P-core count. E-cores slow synchronized matmul barriers. |
 | `--max-seq 2048` | Lower RAM usage (shorter context) |
 
 - **7B+ models**: Use `--max-new 100` for faster responses

@@ -17,7 +17,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo [Atlas] OK -- atlas.dll built
 
 echo [Atlas] Compiling atlas.exe (standalone CLI)...
-%CC% -o atlas.exe atlas_cli.cpp -O2 -std=c++17
+%CC% -o atlas.exe atlas_cli.cpp -O2 -std=c++17 -lshell32
 if %ERRORLEVEL% EQU 0 (
     echo [Atlas] OK -- atlas.exe built
 ) else (

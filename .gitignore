@@ -26,3 +26,5 @@ atlas.dll.release
 *.diff
 *.patch
 _*.py
+
+tests/mock.atlas

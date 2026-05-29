@@ -1,174 +1,31 @@
-# Bugfix Chronology
-
-Twenty bugs were discovered and fixed during development. Any one of them would cause the model to produce garbage output (correlation near zero with reference activations) or crash.
-
-### Bug 1 [FIXED]: `fseek` 32-bit overflow
-
-The ATLAS file for Falcon3-7B is 2.74 GB. Tensors beyond offset ~2 GB were being read from the wrong file position because `fseek` (32-bit) truncated the offset. Fixed by replacing with `_fseeki64` (Windows) / `fseeko` (POSIX) via a `FSEEK` macro.
-
-**Symptoms**: Layer-0 projections correct, deeper layers produce NaN or garbage.
-
-### Bug 2 [FIXED]: 2-bit packing vs Base-3 unpacking
-
-HuggingFace BitNet safetensors store 2-bit packed ternary values: `byte = v0 + v1*4 + v2*16 + v3*64`. The original packer decoded them with `%3` and `//3` (Base-3), producing incorrect ternary values. Fixed by using `& 3`, `>> 2`, etc.
-
-**Symptoms**: Weight values off by ~5% per element, correlation still measurable (~0.5) but never reaching 1.0.
-
-### Bug 3 [FIXED]: Row ordering (interleaved vs stride)
-
-BitNet stores weights in a row-aware interleaved format: uint8 row `ur` contains columns for output rows `4*ur+0` through `4*ur+3`. The C++ matmul output is in this interleaved order (`ur*4+q`). But the reference HuggingFace `unpack_weights` produces stride-order output (`q*rows_packed+ur`). Without reordering, every projected tensor had correlation near 0 despite correct ternary values.
-
-**Fix**: `out.reshape(batch, rows_packed, 4).transpose(0, 2, 1).reshape(batch, rows)`.
-
-### Bug 4 [FIXED]: K/V cache swap
-
-In `atlas_forward_layer`, K was written to `buf_hidden` but the attention copy read from `buf_up`; V was written to `buf_up` but read from `buf_hidden`. Fixed by swapping the copy destinations so K→buf_up and V→buf_hidden.
-
-### Bug 5 [FIXED]: `_rmsnorm` weight truncation (create_string_buffer)
-
-`ctypes.create_string_buffer()` treats the input as a C-string and truncates at the first NULL byte (`\x00`). FP16 value `1.0` = bytes `\x00\x3C` (little-endian), so RMSNorm weights containing many values ≈1.0 got truncated at the first such value, zeroing most norm outputs.
-
-**Fix**: Cache the DLL's raw `ctypes.POINTER(c_uint8)` directly instead of converting to `bytes` → `create_string_buffer`.
-
-### Bug 6 [FIXED]: Snap buffer overflow (batch resize)
-
-Debug snapshot buffers were allocated once with the initial batch size and never resized. Prefill (B=12) after decode warmup (B=1) wrote past the end, causing access violation.
-
-### Bug 7 [FIXED]: Activation buffer overflow on non-aligned TQ1 dimensions
-
-TQ1 packing rounds dimensions up to multiples of 5: a projection with `inter_dim=8192` produces `packed_cols = ceil(8192/5) = 1639`, so the activation buffer must hold `1639 × 5 = 8195` floats per batch. But `max_aligned` was computed from the raw `inter_dim` (8192), rounding to 8192.
-
-**Fix**: 7 bytes of extra padding before alignment to accommodate any TQ1 rounding.
-
-### Bug 8 [FIXED]: Int8 cache corruption (five root causes)
-
-The `.i8` mmap cache had five independent defects:
-1. **Duplicate file offsets**: Precompute all offsets into a `std::vector<int64_t>`, write once.
-2. **GQA scale over-read**: Only cache ttype==3 (int8-decoded) tensors.
-3. **Inflated cache entries**: Only cache int8-decoded tensors.
-4. **Missing prefetch**: Always call `atlas_prefetch_int8` regardless of cache source.
-5. **Short fwrite on 70 MB+ tensors**: Wrap `fwrite` in retry loop with 64 KB chunks.
-
-### Bug 8.6 [FIXED v1.0.8]: Cache Short-Write Protection
-
-Disk space check via `GetDiskFreeSpaceExA`, `setvbuf` unbuffered writes, retry on short writes, file size validation on load.
-
-### Bug 9 [FIXED]: Ping-pong buffer analysis
-
-Even `n_layers` (all Falcon3 models: 18, 22, 28, 40) means `buf_a == hidden_states` after loop — no copy needed. The `if (n_layers % 2 == 1)` fix is correct for all cases.
-
-### Bug 10 [FIXED]: KV cache pointer mismatch in forward_layer
-
-Per-layer `forward_layer` passed full K/V caches but C++ always offset from index 0. Fixed by offsetting pointer per layer.
-
-### Bug 11 [FIXED v1.2.0]: 10B tokenizer_offset int32 overflow
-
-`int` (32-bit) overflow bei >2 GB Dateigröße. 10B Offset bei ~3.3 GB → negativ als int32. Fix: `uint32_t` + `ptrdiff_t` cast.
-
-### Bug 12 [FIXED v1.4.0]: Stack overflow from alloca in forward_layer_internal
-
-Four `alloca(B * qd * sizeof(float))` calls used ~2.9 MB stack at B=60+, exceeding 1 MB default Windows stack. Floated all 4 buffers to heap via `attn_ws` struct field, allocated in `ensure_buffers`. Also moved `scores` alloca outside per-batch loop. Total stack now ~210 KB max.
-
-### Bug Re-Analysis v1.0.8: 1B Coherence False Alarm
-
-Corr=0.23 test failure traced to **two bugs in Python test script**, not engine:
-- **RMSNorm in-place corruption**: `_rmsnorm` modified input in-place, corrupting residual path.
-- **Shared quantization gap**: C++ fused FFN uses one shared scale for gate+up; Python per-layer uses separate scales (0.3% expected variance).
-
-**Result with fixes**: corr=0.9967, max_diff=4.0. Engine correct.
-
-### Bug 13 [FIXED v2.6.3]: BitNet SubLN signal collapse (u8×i8 activation quant)
-
-BitNet's SubLN (sub-layer normalization) architecture uses RMSNorm weights of magnitude ~0.01×. The uint8×int8 quantized matmul path (`vpmaddubbs` SIMD) adds +128 to activations, destroying these small signals in quantization rounding. Output was pure noise — correlation near zero, max token probability near uniform.
-
-**Root cause**: `u8+128 activation_quant + vpmaddubbs` is lossy for activation magnitudes < ~0.05. SubLN-produced activations are ~10-50× smaller than standard LayerNorm outputs.
-
-**Fix**: Force `f32_bypass` for `ARCH_BITNET` models — raw fp32 matmul preserves full signal. Added `atlas_ensure_layer_idx()` C API to set `model_arch` on C++ side for Python `forward()` path.
-
-**Symptoms**: BitNet models produce empty/garbled output via default quantized path; T=0.7 yields near-uniform distribution. f32_bypass path produces correct output ("Paris is the capital of France.").
-
-### Bug 15 [FIXED v2.7.7]: I2_S bit order + row layout (BitNet U8 packer)
-
-Microsoft's pre-quantized BitNet-2B4T stores 2-bit packed ternary values in I2_S format: each uint8 byte holds 4 ternary values, but in a specific bit order and row layout that differs from the naive unpack.
-
-**Two sub-bugs**:
-
-**15a — Bit order**: Microsoft stores row 0's ternary value in bits [7:6] (high bits), row 1 in [5:4], row 2 in [3:2], row 3 in [1:0]. Original packer used `shift = 6 - k*2` reading high-first, but `unpack_2bit_ternary_to_int8` expected row 0 in low bits. HF reference uses `(packed >> (k*2)) & 3` which reads low-first → produces wrong row.
-
-**15b — Row layout**: Packed byte at index `ur` stores ternary values for output rows `ur*4+0` through `ur*4+3` (contiguous block). Original code wrote to `unpacked[k][ur]` (row `k*B+ur`) which is correct for vectorized memory layout but must match both HF `unpack_weights` AND the C++ engine's expected `matmul_f32_reorder` output order. The I2_S format uses `unpacked[k*B+ur]`, not `unpacked[k][ur]`.
-
-**Fix**: `shift = k*2` (bits 1-0 for k=0 up to 7-6 for k=3) + `unpacked[k*B + ur]` where B = rows/4. Both changes are required together — either alone causes correlation ~0.
-
-### Bug 16 [FIXED v2.7.7]: `stored_scale` formula + `/127.0f` in ttype=5 decompress
-
-BitNet weights are stored as TQ1-packed block-scaled (ttype=5) with per-block fp16 scales = `gamma` (the per-tensor max). The C++ `decompress_ttype5` converts these to uniform int8 for the f32_bypass path.
-
-**Two sub-bugs**:
-
-**16a — Missing `/127.0f` in decompress read**: Line 1306 reads `f32_row[col] = ternary * scale` where `scale = gamma`. But the int8 format expects `f32 = ternary * gamma / 127.0` to match the packer's quantization. Without `/127.0`, `global_max = gamma` instead of `gamma/127`, producing `stored_scale = 1/gamma` instead of `127/gamma`.
-
-**16b — Wrong stored_scale formula**: The old formula `stored_scale = 127.0f / global_max` combined with the missing `/127.0f` created a contradictory error where `global_max` was gamma (127× too large) but `stored_scale` was `127/gamma` (correct). Adding `/127.0f` makes `global_max = gamma/127`, requiring `stored_scale = 1/global_max = 127/gamma` — the same numeric result but for the right reason.
-
-**Symptoms**: Effective weight = ternary × gamma instead of the correct ternary × gamma / 127 × 127 = ternary × gamma... Wait, BOTH formulas happen to produce the same effective weight because the errors cancel! The real issue is that the old code's `/127.0f` was NOT present, so `f32_row[col] = ternary * scale = ternary * gamma`, and `global_max = gamma`, `stored_scale = 127/gamma`. The effective weight = `int8_val / stored_scale = round(ternary * 127) / (127/gamma) = ternary * gamma`. The NEW code: `f32_row = ternary * gamma / 127`, `global_max = gamma/127`, `stored_scale = 127/gamma`. Effective weight = `round(ternary * 127) / (127/gamma) = ternary * gamma`. SAME result!
-
-**The actual fix**: The `stored_scale` formula `127.0f / global_max` was producing `stored_scale = 127.0 / gamma = 1/(gamma/127) = 1/(global_max_old)`. With the `global_max_old = gamma` (too large), this happened to produce the correct `stored_scale = 127/gamma`. But `127.0f / global_max` is semantically wrong when `global_max = gamma/127` (with `/127.0f` fix). The correct formula is `1.0f / global_max`. The change from `127/g` to `1/g` is the correction for the added `/127.0f`.
-
-**Why this matters**: Without both the `/127.0f` ON line 1306 AND the `1.0f / global_max` ON line 1315, the int8 cache is corrupt for ttype=5 tensors. With both fixes, the int8 cache is bit-exact and all 210 tensors pass at correlation 1.000000.
-
-### Bug 14 [FIXED v2.6.3]: `atlas_ensure_layer_idx` missing for Python forward()
-
-Python `forward()` path called `atlas_forward` without setting `model_arch` first. The C++ decoder checked `arch == ARCH_BITNET` to enable SubLN, but the arch field was uninitialized (default 0 = ARCH_FALCON). SubLN was skipped, activations exploded, forward() returned garbage.
-
-**Fix**: New `atlas_ensure_layer_idx()` C API called during `AtlasModel.__init__()`. Sets `model_arch` from header byte 53, enabling proper SubLN routing for all generation paths.
-
-### v2.0.x Bugfix Summary
-
-Twelve additional bugs found and fixed during the v2.0.x cycle:
-
-| Bug | Severity | Fix | Version |
-|-----|----------|-----|---------|
-| Memory leak: `__del__` fehlte | HIGH | `atlas_free` in Python destructor | v2.0.2 |
-| KV-cache overflow: `pos < max_seq_len` ungeprüft | HIGH | Defense-in-depth clamp in generate + attention | v2.0.2 |
-| Stale `.i8` cache loading | MEDIUM | File-size validation + tensor shape check | v2.0.2 |
-| Thread-unsafe static vectors | MEDIUM | `thread_local` + `std::call_once` | v2.0.2 |
-| `atlas_set_seed(0)` → garbage | LOW | Pass seed 0 directly | v2.0.2 |
-| `n_input >= max_seq_len` vor Prefill | CRITICAL | Early return with -1 | v2.0.3 |
-| `scores_buf` null-deref bei OOM | LOW | Guard + early return | v2.0.3 |
-
-### Verification
-
-All model families (Falcon3 1B/3B/7B/10B, Bonsai 1.7B/4B/8B, BitNet-2B4T, TriLM 1.1B/1.5B) pass coherence: "The capital of France is Paris." at T=0 with appropriate matmul path. BitNet pipeline verified at 210/210 tensors, correlation 1.000000. Small models (hidden ≤ 2048) require f32_bypass or T ≥ 0.7 — greedy decoding degenerates due to model-inherent distribution.
-
-## Version History
-
-| Version | Key Changes |
-|---------|-------------|
-| **v2.7.7** | **BitNet b1.58 Packing Fixes**: Bug 15 (I2_S bit order/layout) + Bug 16 (stored_scale formula). 210/210 tensors at correlation 1.000000. U8 `--packed` path recommended. |
-| **v2.7.6** | BitNet b1.58 Final Fixes: dimensions corrected (30L/2560H/6912I/20/5 heads), ReLU² confirmed, `--packed` flag, correct chat template/EOS. |
-| **v2.7.5** | ttype=5 Decompress + f32_bypass everywhere for block-scaled models. Bonsai-8B: 0.2→1.6-2.2 tok/s. |
-| **v2.6.3** | BitNet ARCH_BITNET + Repo Cleanup: `atlas_ensure_layer_idx()` C API, f32_bypass forced for SubLN models. 91 scratch files deleted, dead packers removed, `.gitignore` hardened. macOS CI split into release-only (free tier runner bottleneck). |
-| **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
-| **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |
-| **v2.6.0** | SSE Web-Server + Prompt-Caching + CI Pipeline |
-| **v2.5.0** | Context Window Extension — ring buffer KV cache, NTK scaling |
-| **v2.4.1** | Static analysis bughunt (5 C++ bugs), ttype=5 int8 decompress for Bonsai (10× speedup) |
-| **v2.4.0** | Qwen3/Bonsai-4B TQ1.0 support — head_dim=128, QK-Norm, YaRN RoPE |
-| **v2.3.1** | Windows packer hotfix, 7B v6 repair |
-| **v2.3.0** | Int8 KV-Cache (fp16→int8), 10B@4K: 320→173 MB |
-| **v2.2.2** | F16C in attention + weighted sum, 10B +47%, 3B +5.7% |
-| **v2.2.1** | BPE-PQ priority queue (O(n²)→O(n log n)) |
-| **v2.2.0** | TQ1-LUT in decompression, F16C for fp16→fp32 |
-| **v2.1.1** | Repetition penalty in C-core |
-| **v2.1.0** | Streaming + chat history |
-| **v2.0.4** | Softmax sampling (replace Gumbel-max), default T=0.7 |
-| **v2.0.3** | n_input ≥ max_seq_len guard, scores_buf OOM guard |
-| **v2.0.2** | Memory leak, KV-cache overflow, stale .i8 cache, thread-local statics |
-| **v2.0.1** | scores alloca → heap (stack fully sterile) |
-| **v2.0.0** | C++ binary tokenizer (v6 format) |
-| **v1.4.0** | Stack overflow fix, survivor-list sampling |
-| **v1.3.2** | Hybrid mode (FFN int8 + QKV packed) |
-| **v1.3.1** | Direct TQ1-packed matmul |
-| **v1.3.0** | Ternary-add kernel (vpsignb) |
-| **v1.2.0** | C++ sampling, atlas_generate |
-| **v1.1.0** | AllocHdr-based valloc/vfree |
-| **v1.0.0** | Initial TQ1.0 inference engine |
+# Known Issues & Limitations
+
+## Hybrid CPU (Intel Alder Lake+) Thread Oversubscription
+- **Symptoms**: Lower tok/s than expected on Intel 12th gen+ CPUs. P-cores idle while waiting for E-cores at OpenMP barriers.
+- **Workaround**: Set `--threads` to your physical P-core count (not logical threads). Example: i7-12700H (6P+8E) → `--threads 6`.
+- **Status**: Architecture limit — no portable P/E-core detection API. Linux `lscpu -e` shows core types, but no runtime OS API.
+
+## Gumbel-max Early EOS (10B/7B Models)
+- **Symptoms**: Generation stops prematurely at EOS token, especially with T=0.7 sampling.
+- **Cause**: Gumbel noise occasionally boosts EOS logits above natural continuation tokens. Not an engine bug — expected Gumbel-max sampling behavior.
+- **Mitigation**: Use `--min-new <N>` to suppress EOS for first N tokens. Use T=0 (deterministic) for 7B+ models for clean argmax output.
+
+## Windows ANSI-Code Page Fallback
+- **Symptoms**: On Windows 10 builds before 1903, `SetConsoleCP(CP_UTF8)` may fail silently. Console input in interactive mode falls back to the system ANSI codepage.
+- **Workaround**: Use PowerShell 7+ or Windows Terminal. Pipe input via UTF-8 files: `type prompt.txt | atlas.exe model.atlas`.
+- **Status**: The CLI argument parser (`CommandLineToArgvW` + `WideCharToMultiByte`) correctly handles all non-ASCII *arguments* on all Windows versions. Only interactive *stdin* input is affected on legacy consoles.
+
+## Pre-Haswell CPUs (Before 2013)
+- **Symptoms**: `[ATLAS] Error: AVX2 instruction set required.` on startup.
+- **Cause**: ATLAS requires AVX2 (Haswell, ~2013+) for its int8 matmul kernels.
+- **Status**: By design. No fallback path for SSE4.1 or AVX1.
+
+## Model Format v5/v6 Compatibility
+- **v5 models** (Falcon3 only, pre-v2.0): Load without embedded tokenizer. The CLI falls back to raw token IDs; Python binding uses HuggingFace `AutoTokenizer`.
+- **v6+ models** (Falcon3/BitNet/Bonsai): Fully self-contained with binary tokenizer.
+- All engines are backward-compatible with v5. New models should be packed as v6+.
+
+## 1B / 3B Models at T=0
+- **Symptoms**: Newline collapse or repetition at deterministic sampling.
+- **Cause**: Model architecture limit — 1B (18 layers) and 3B (22 layers) lack the depth for stable argmax paths.
+- **Recommendation**: Always use `T=0.7, top_k=40` for models below 7B.

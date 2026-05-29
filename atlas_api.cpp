@@ -70,6 +70,26 @@
   #define STRICMP strcasecmp
 #endif
 
+// ─── AVX2 CPUID check ─────────────────────────────────────────────────
+// Returns 1 if AVX2 is supported, 0 otherwise. Prints error to stderr.
+// Prevents SIGILL on pre-Haswell CPUs (before 2013).
+#ifdef _WIN32
+#include <intrin.h>
+static int check_avx2(void) {
+    int info[4] = {0};
+    __cpuidex(info, 7, 0);
+    return (info[1] >> 5) & 1; // EBX bit 5 = AVX2
+}
+#else
+#include <cpuid.h>
+static int check_avx2(void) {
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
+        return (ebx >> 5) & 1;
+    return 0;
+}
+#endif
+
 // ─── Xoshiro256** PRNG (thread-safe, 64-bit) ──────────────────────────
 static uint64_t xoshiro_state[4] = {0};
 
@@ -450,6 +470,12 @@ static void init_tq1_decode_lut() {
 
 // ─── Load model ─────────────────────────────────────────────────────────
 ATLAS_API AtlasModel* atlas_load(const char* path) {
+    if (!check_avx2()) {
+        fprintf(stderr, "[ATLAS] Error: AVX2 instruction set required.\n");
+        fprintf(stderr, "  ATLAS needs AVX2 (Haswell, ~2013+) for fast int8 matmul.\n");
+        fprintf(stderr, "  Your CPU does not report AVX2 support.\n");
+        return nullptr;
+    }
     init_tq1_decode_lut();
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ATLAS] Cannot open %s\n", path); return nullptr; }
