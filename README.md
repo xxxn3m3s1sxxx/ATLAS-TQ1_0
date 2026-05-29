@@ -17,9 +17,9 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
 | Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
 | Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
-| Bonsai-1.7B-Chat | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
-| Bonsai-4B-Chat | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
-| Bonsai-8B-Chat | 2.47 GB | 28 | 4096 | 14400 | 32 | 8 | 151669 |
+| Ternary Bonsai-1.7B | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
+| Ternary Bonsai-4B | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
+| Ternary Bonsai-8B | 2.47 GB | 28 | 4096 | 14400 | 32 | 8 | 151669 |
 | TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
@@ -33,9 +33,9 @@ All v5/v6 `.atlas` format — embeds tokenizer (v6: binary pool-lookup decode, n
 | Model | HF Repo |
 |-------|---------|
 | BitNet-2B4T | `microsoft/bitnet-b1.58-2B-4T` (U8 pre-quantized, use `--packed` flag) |
-| Bonsai-1.7B-Chat | `prism-ml/Ternary-Bonsai-1.7B-Chat-unpacked` |
-| Bonsai-4B-Chat | `prism-ml/Ternary-Bonsai-4B-Chat-unpacked` |
-| Bonsai-8B-Chat | `prism-ml/Ternary-Bonsai-8B-Chat-unpacked` |
+| Ternary Bonsai-1.7B | `prism-ml/Ternary-Bonsai-1.7B-unpacked` |
+| Ternary Bonsai-4B | `prism-ml/Ternary-Bonsai-4B-unpacked` |
+| Ternary Bonsai-8B | `prism-ml/Ternary-Bonsai-8B-unpacked` |
 | Falcon3-1B-Instruct | `tiiuae/Falcon3-1B-Instruct` |
 | Falcon3-3B-Instruct | `tiiuae/Falcon3-3B-Instruct` |
 | Falcon3-7B-Instruct | `tiiuae/Falcon3-7B-Instruct` |
