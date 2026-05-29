@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DLL
+        shell: pwsh
+        run: |
+          $llvmDir = "C:\Program Files\LLVM"
+          if (-not (Test-Path $llvmDir)) { throw "LLVM not found at $llvmDir" }
+          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
+          if ($LASTEXITCODE -ne 0) { throw "DLL build failed" }
+
+      - name: Build CLI
+        shell: pwsh
+        run: |
+          clang++ -o atlas.exe atlas_cli.cpp -O2 -std=c++17
+          if ($LASTEXITCODE -ne 0) { throw "CLI build failed" }
+
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          $llvmDir = "C:\Program Files\LLVM"
+          Copy-Item "$llvmDir\bin\libomp.dll" -Destination . -Force
+          Copy-Item "$llvmDir\bin\libc++.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Copy-Item "$llvmDir\bin\libunwind.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Copy-Item "$llvmDir\bin\libwinpthread-1.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Write-Output "=== Release files ==="
+          Get-ChildItem *.exe,*.dll | ForEach-Object { Write-Output "$($_.Name) — $($_.Length/1MB -as [int]) MB" }
+
+      - name: Create Release Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path atlas.exe,atlas.dll,libomp.dll,libc++.dll,libunwind.dll,libwinpthread-1.dll,atlas_ffi.h -DestinationPath atlas-windows-x86_64.zip -Force
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: atlas-windows-x86_64.zip
+          fail_on_unmatched_files: true
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang + OpenMP
+        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
+
+      - name: Build shared library
+        run: |
+          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
+
+      - name: Build CLI (Linux)
+        run: |
+          clang++ -o atlas atlas_cli.cpp -O2 -std=c++17 -ldl
+
+      - name: Create Release Tar
+        run: |
+          tar czf atlas-linux-x86_64.tar.gz libatlas.so atlas atlas_ffi.h
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: atlas-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true
