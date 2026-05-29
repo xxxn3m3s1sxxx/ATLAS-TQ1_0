@@ -5,8 +5,13 @@
 // Build: compile.bat builds both atlas.dll and atlas.exe
 // Runtime: atlas.exe loads atlas.dll via LoadLibrary (no import lib needed)
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#else
+  #include <dlfcn.h>
+  typedef void* HMODULE;
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -84,6 +89,7 @@ static PFN_atlas_generate          atlas_generate;
 static PFN_atlas_has_binary_tokenizer atlas_has_binary_tokenizer;
 
 static bool load_dll(const char* dll_path) {
+#ifdef _WIN32
     g_dll = LoadLibraryA(dll_path);
     if (!g_dll) {
         fprintf(stderr, "[Error] Failed to load %s (error %lu)\n", dll_path, GetLastError());
@@ -93,6 +99,17 @@ static bool load_dll(const char* dll_path) {
     name = (PFN_##name)GetProcAddress(g_dll, #name); \
     if (!name) { fprintf(stderr, "[Error] Missing symbol: %s\n", #name); return false; } \
 } while(0)
+#else
+    g_dll = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
+    if (!g_dll) {
+        fprintf(stderr, "[Error] Failed to load %s: %s\n", dll_path, dlerror());
+        return false;
+    }
+#define LOAD(name) do { \
+    name = (PFN_##name)dlsym(g_dll, #name); \
+    if (!name) { fprintf(stderr, "[Error] Missing symbol: %s\n", #name); return false; } \
+} while(0)
+#endif
     LOAD(atlas_load);
     LOAD(atlas_free);
     LOAD(atlas_get_info);
@@ -112,7 +129,11 @@ static bool load_dll(const char* dll_path) {
     LOAD(atlas_get_tensor_index);
     LOAD(atlas_quantize_lmhead);
     // Optional: FFN int4 quantization
+#ifdef _WIN32
     atlas_quantize_ffn_to_i4 = (PFN_atlas_quantize_ffn_to_i4)GetProcAddress(g_dll, "atlas_quantize_ffn_to_i4");
+#else
+    atlas_quantize_ffn_to_i4 = (PFN_atlas_quantize_ffn_to_i4)dlsym(g_dll, "atlas_quantize_ffn_to_i4");
+#endif
     LOAD(atlas_tokenizer_preencode);
     LOAD(atlas_tokenizer_merge);
     LOAD(atlas_tokenizer_decode);
@@ -123,7 +144,14 @@ static bool load_dll(const char* dll_path) {
 }
 
 static void unload_dll() {
-    if (g_dll) { FreeLibrary(g_dll); g_dll = NULL; }
+    if (g_dll) {
+#ifdef _WIN32
+        FreeLibrary(g_dll);
+#else
+        dlclose(g_dll);
+#endif
+        g_dll = NULL;
+    }
 }
 
 // ─── Args ───────────────────────────────────────────────────────────────
@@ -453,8 +481,10 @@ static void interactive_loop(void* model, const ModelInfo& info, const Config& c
 
 // ─── Main ───────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#endif
 
     Config cfg = parse_args(argc, argv);
 

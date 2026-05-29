@@ -11,3 +11,12 @@ echo "[Atlas] Compiling libatlas.so..."
 $CXX -shared $CXXFLAGS -o "$OUT" "$SRC"
 ls -lh "$OUT"
 echo "[Atlas] OK -- $OUT built successfully"
+
+# Build CLI (optional — requires atlas_cli.cpp)
+if [ -f "atlas_cli.cpp" ]; then
+    CLI_OUT="atlas"
+    echo "[Atlas] Compiling $CLI_OUT (standalone CLI)..."
+    $CXX -o "$CLI_OUT" atlas_cli.cpp -O2 -std=c++17
+    ls -lh "$CLI_OUT"
+    echo "[Atlas] OK -- $CLI_OUT built"
+fi

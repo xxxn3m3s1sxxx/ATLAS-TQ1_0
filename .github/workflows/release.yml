@@ -41,7 +41,10 @@ jobs:
       - name: Create Release Zip
         shell: pwsh
         run: |
-          Compress-Archive -Path atlas.exe,atlas.dll,libomp.dll,libc++.dll,libunwind.dll,libwinpthread-1.dll,atlas_ffi.h -DestinationPath atlas-windows-x86_64.zip -Force
+          $files = @("atlas.exe","atlas.dll","atlas_ffi.h") + @("libomp.dll","libc++.dll","libunwind.dll","libwinpthread-1.dll") | Where-Object { Test-Path $_ }
+          Write-Output "=== Packaging $($files.Count) files ==="
+          $files | ForEach-Object { Write-Output "  $_ ($((Get-Item $_).Length/1KB -as [int]) KB)" }
+          Compress-Archive -Path $files -DestinationPath atlas-windows-x86_64.zip -Force
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
