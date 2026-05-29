@@ -1584,8 +1584,10 @@ ATLAS_API const uint8_t* atlas_tensor_data(AtlasModel* m, int idx, int* size) {
 // output:      [n_tokens × rows] float32
 // row_sums:    [rows] int32 — precomputed Σ w_i per output row
 ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
-                                    const int8_t* weights, const uint8_t* act_u8,
-                                    const int32_t* row_sums, float* output,
+                                    const int8_t* __restrict__ weights,
+                                    const uint8_t* __restrict__ act_u8,
+                                    const int32_t* __restrict__ row_sums,
+                                    float* __restrict__ output,
                                     int n_tokens) {
     #ifdef _OPENMP
     #pragma omp parallel for
@@ -1593,6 +1595,11 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
     for (int r = 0; r < rows; r++) {
         const int8_t* w = weights + r * input_dim;
         int sum_w = row_sums[r];
+
+        // Cross-row prefetch: hide DRAM latency for next 2 weight rows
+        if (r + 2 < rows) {
+            _mm_prefetch((const char*)(weights + (r + 2) * input_dim), _MM_HINT_T1);
+        }
 
         for (int t = 0; t < n_tokens; t++) {
             const uint8_t* a = act_u8 + t * input_dim;
@@ -2546,8 +2553,8 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
 // scale: per-tensor dequant scale
 // output: [B, rows] reordered float output
 static void matmul_f32_reorder(int rows, int input_dim,
-    const int8_t* weights, const float* act_f32,
-    float scale, float* output, int B) {
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    float scale, float* __restrict__ output, int B) {
     int rows_packed = rows / 4;
     #ifdef _OPENMP
     #pragma omp parallel for if(rows_packed > 4)
