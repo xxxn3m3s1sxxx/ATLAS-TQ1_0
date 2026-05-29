@@ -2862,21 +2862,6 @@ static void forward_layer_internal(
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
-        // Apply attn_sub_norm to attention output BEFORE O projection
-        if (idx_attn_sub_norm >= 0) {
-            auto& sn = m->tensors[idx_attn_sub_norm];
-            const uint8_t* snw = sn.data;
-            for (int b = 0; b < B; b++) {
-                float* ob = attn_out + b * qd;
-                float ss = 0.0f;
-                for (int i = 0; i < qd; i++) ss += ob[i] * ob[i];
-                float rms = 1.0f / sqrtf(ss / qd + 1e-6f);
-                for (int i = 0; i < qd; i++) {
-                    uint16_t w16; memcpy(&w16, snw + i * 2, 2);
-                    ob[i] *= rms * fp16_to_fp32(w16);
-                }
-            }
-        }
         if (to.ttype == 5) {
             for (int b = 0; b < B; b++) {
                 memcpy(m->buf_act + b * to.packed_cols * 5, attn_out + b * qd, qd * sizeof(float));
