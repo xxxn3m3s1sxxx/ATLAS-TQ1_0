@@ -143,6 +143,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.7.9** | **Fix duplicate attn_sub_norm (BitNet collapse)**: Merge-Artefakt in `forward_layer_internal` — sub-norm wurde zweimal auf Attention-Output angewandt. BitNet-2B4T: `/ / / / /` → `"The capital of France is Paris."`. `data_size`-Formel für ttype=5 korrigiert (`row_dim * n_blocks * 2`). |
 | **v2.7.7** | **BitNet Packing Fixes**: Fixed U8 bit ordering (Microsoft I2_S stores row 0 in high bits, was reading from low). Switched BF16 to per-tensor absmean + `weight_scale` loading. Fixed `data_size` header calc for ttype=5. U8 `--packed` path recommended. |
 | **v2.7.6** | **BitNet b1.58 Final Fixes**: AGENTS.md dimensions corrected to 30L/2560H/6912I/20/5 heads. ReLU² confirmed correct (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized Microsoft weights. Python BitNet detection (`_is_bitnet` via attn_sub_norm), correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). Misidentification as Qwen3 fixed. |
 |---------|-------------|

@@ -6,7 +6,7 @@
 
 CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
-> ⚡ **v2.7.7**: BitNet b1.58 packing fixes — I2_S bit order/layout + `stored_scale` formula. Pipeline verified: 210/210 tensors at correlation 1.000000. `--packed` U8 path recommended. See [BUGS.md](BUGS.md) for root cause analysis.
+> ⚡ **v2.7.9**: BitNet regression fixed — duplicate `attn_sub_norm` removed. All models correct: Falcon3, Bonsai g128/v7, BitNet-2B4T.
 
 ## Supported Models
 
@@ -229,6 +229,7 @@ All supported models (Falcon3 1B–10B, Bonsai 1.7B–8B, BitNet-2B4T, TriLM-1.1
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.7.9** | **Fix duplicate attn_sub_norm (BitNet collapse)**: Merge artifact in `forward_layer_internal` — sub-norm was applied twice to attention output. BitNet-2B4T: `/ / / / /` → `"The capital of France is Paris."`. `data_size` formula fixed for ttype=5 (`row_dim * n_blocks * 2`). |
 | **v2.7.7** | **BitNet b1.58 Packing Fixes**: Fixed I2_S bit order/layout (Microsoft stores row 0 in high bits, was reading from low). Fixed `stored_scale` formula (`127/g→1/g`). Added `/127.0f` in ttype=5 decompress. Pipeline verified: 210/210 tensors at correlation 1.000000. U8 `--packed` path recommended. |
 | **v2.7.6** | **BitNet b1.58 Final Fixes**: Correct dimensions (30L/2560H/6912I/20/5 heads). ReLU² confirmed (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized weights. Correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). |
 | **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: All ttype=5 tensors decompressed to int8 at load. f32_bypass forced for block-scaled models (rope_theta≥3M or hidden≤2048). Bonsai-8B: 0.2→1.6-2.2 tok/s. |

@@ -617,7 +617,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         if (t.ttype == 5 || t.ttype == 7) {
             t.block_size = t.data[0];
             uint16_t nb; memcpy(&nb, t.data + 1, 2); t.n_blocks = nb;
-            t.data_size = 3 + t.n_blocks * 2 + t.row_dim * t.packed_cols;
+            t.data_size = 3 + t.row_dim * t.n_blocks * 2 + t.row_dim * t.packed_cols;
         }
     }
 
