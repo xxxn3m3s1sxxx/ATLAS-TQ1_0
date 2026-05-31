@@ -10,6 +10,7 @@
 *.zip
 *.dll
 *.i8
+*.i4
 *.pkl
 __pycache__/
 *.pyc
