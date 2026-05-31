@@ -5,7 +5,10 @@
 extern "C" {
 
 // VNNI available detection: returns 1 if real VNNI kernel compiled, 0 for stub
-#if defined(__clang__) && __clang_major__ >= 19
+// Guard: clang >= 19 with working target("avx10.2").
+//   Linux clang >= 19 works (ubuntu-24.04 CI).
+//   Windows needs clang >= 21 (clang 20 ignores avx10.2 in target attribute).
+#if defined(__clang__) && __clang_major__ >= 19 && (__clang_major__ >= 21 || !defined(_WIN32))
 int atlas_vnni_available(void) { return 1; }
 
 __attribute__((target("avx10.2")))

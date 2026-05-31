@@ -157,9 +157,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
 
       - name: Build with ASan+UBSan
-        env:
-          CXXFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -fopenmp -O1 -g -mavx2 -mfma -mf16c -std=c++17 -fPIC"
-        run: clang++ $CXXFLAGS -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
+        run: |
+          ASAN_FLAGS="-fsanitize=address,undefined -shared-libasan -fno-omit-frame-pointer"
+          clang++ $ASAN_FLAGS -fopenmp -O1 -g -mavx2 -mfma -mf16c -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
 
       - name: Install test deps
         run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
@@ -172,9 +172,11 @@ jobs:
           OMP_NUM_THREADS: "4"
           ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
         run: |
-          python tests/ci_smoke.py
-          python -m pytest tests/test_dll.py -v
-          python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q
+          ASAN_LIB=$(clang++ --print-file-name=libclang_rt.asan-x86_64.so)
+          echo "ASan runtime: $ASAN_LIB"
+          LD_PRELOAD=$ASAN_LIB python tests/ci_smoke.py
+          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_dll.py -v
+          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:
