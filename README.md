@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.9.3**: AKI-Bug-Fix + HF-Alignment-Verifikation. `scripts/verify_hf_alignment.py` prüft 18 Modelle (16 PASS, 0 FAIL) gegen HF Hub ohne Download. TriLM-3.9B Mutation entdeckt. CI gehärtet mit Coverage-Gates.
+> ⚡ **v2.9.3**: AKI-Bug-Fix + CI-Hardening + Coverage-Gates. `scripts/verify_hf_alignment.py` validates 18 TQ1.0 models (16 PASS, 0 FAIL) against HF Hub without download. TriLM-3.9B mutation auto-detected. CI hardened with coverage gates.
 
 ## Quickstart
 
@@ -223,13 +223,14 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 | `atlas_server.py` | SSE web server (FastAPI, `/v1/chat/completions`) |
 | `atlas_packer*.py` | Model converters (safetensors → .atlas) |
 | `compile.bat` | Windows build script |
+| `BUGS.md` | Known issues & limitations |
 | `.github/workflows/` | CI + auto-release pipelines |
 
 ## Version History
 
 | Version | What's New |
 |---------|------------|
-| **v2.9.3** | AKI-Bug-Fix: `row_dim==vocab_size` Heuristik durch Name-Guard abgesichert. HF-Alignment-Verifikation (`scripts/verify_hf_alignment.py`) — 18 Modelle: 16 PASS, 0 FAIL, 2 SKIP. TriLM-3.9B Blindspot entdeckt (SubLN vs non-SubLN). Coverage gehärtet (44 Tests, stale-gcda Fix). CI: OMP+E2E Tests + HF-Check integriert. Coverage: Lines 68.6%, Functions 86.0%, Branches 54.2%. |
+| **v2.9.3** | AKI-Bug-Fix: `row_dim==vocab_size` heuristic replaced by name-guard. HF alignment check (`scripts/verify_hf_alignment.py`) — 18 models: 16 PASS, 0 FAIL, 2 SKIP. TriLM-3.9B blindspot found (SubLN vs non-SubLN arch mutation). Coverage hardened (44 tests, stale-gcda fix). CI: OMP+E2E tests + HF check integrated. Coverage: Lines 68.6%, Functions 86.0%, Branches 54.2%. |
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
 | **v2.7.9** | BitNet fix: duplicate sub-norm collapse resolved. |
