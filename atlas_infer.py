@@ -512,6 +512,19 @@ class AtlasModel:
         self._cached_input_ids = []
         self._cache_valid = False
 
+    def load_i4_cache(self):
+        """v2.10.0: Load i4 cache — restore int4 (ttype=8) + int8 (ttype=3) state.
+        Returns 1 if loaded, 0 if not found or invalid."""
+        if not _HAS_I4_CACHE:
+            return 0
+        return dll.atlas_load_i4_cache(self.model_ptr, self._atlas_path.encode())
+
+    def save_i4_cache(self):
+        """v2.10.0: Save i4 cache — persist int4 (ttype=8) + int8 (ttype=3) state."""
+        if not _HAS_I4_CACHE:
+            return
+        dll.atlas_save_i4_cache(self.model_ptr, self._atlas_path.encode())
+
     def convert_to_tq2(self):
         """v2.9.3: Convert all weight tensors to TQ2 (ttype=10) universal format.
         Call after load, before first inference. Enables symmetric s8 activation
