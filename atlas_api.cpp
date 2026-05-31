@@ -641,8 +641,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     if (version >= 8) {
         fread(&meta_size, 1, 4, f);
         if (meta_size > 4 && meta_size <= 4096) {
-            char* json_buf = (char*)malloc(meta_size - 4);
+            char* json_buf = (char*)malloc(meta_size - 3);
             if (json_buf && fread(json_buf, 1, meta_size - 4, f) == (size_t)(meta_size - 4)) {
+                json_buf[meta_size - 4] = '\0';
                 parse_meta_block(m, json_buf);
             }
             free(json_buf);
