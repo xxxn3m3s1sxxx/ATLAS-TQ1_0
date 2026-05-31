@@ -511,7 +511,7 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     } else if (strcmp(arch, "qwen3") == 0) {
         m->model_arch = ARCH_QWEN3;
         m->layer_stride = 11;
-    } else if (strcmp(arch, "bitnet") == 0) {
+    } else if (strcmp(arch, "bitnet") == 0 || strcmp(arch, "trilm") == 0) {
         m->model_arch = ARCH_BITNET;
         m->layer_stride = 11;
     }
