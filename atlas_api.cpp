@@ -3043,7 +3043,7 @@ static int quantize_weights_to_tq2(
     int packed_size = rows * packed_per_row;
     int total = hdr + scales_size + packed_size;
 
-    uint8_t* buf = (uint8_t*)malloc(total);
+    uint8_t* buf = atlas_valloc(total);
     if (!buf) return -1;
 
     // Write header
@@ -3127,12 +3127,12 @@ ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
             // ttype=10: [block_size:1][n_blocks:2][flags:1][scales:...][packed:...]
             // Insert flags byte at offset 3, shift data by 1
             int new_size = t.data_size + 1;
-            uint8_t* new_data = (uint8_t*)malloc(new_size);
+            uint8_t* new_data = atlas_valloc(new_size);
             if (!new_data) continue;
             memcpy(new_data, t.data, 3);              // block_size + n_blocks
             new_data[3] = 0;                          // flags = 0
             memcpy(new_data + 4, t.data + 3, t.data_size - 3);  // scales + packed
-            if (t.data && !m->is_mapped(t.data)) free(t.data);
+            if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
             t.data = new_data;
             t.data_size = new_size;
             t.ttype = 10;
@@ -3216,7 +3216,7 @@ ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
                 if (t.ttype == 0 || t.ttype == 8) {
                     free((void*)i8_weights);  // we allocated this
                 }
-                free(t.data);
+                atlas_vfree(t.data);
             }
             t.data = tq2_buf;
             t.data_size = tq2_size;
