@@ -154,13 +154,15 @@ def test_e2e_pipeline(corridor):
     assert not np.any(np.isinf(q))
 
     # ── 15. atlas_sample (standalone sampling) ──
-    logits = np.array([1.0, 2.0, 3.0, 0.5, 0.1], dtype=np.float32)
+    V = m.vocab_size
+    logits = np.random.randn(V).astype(np.float32) * 0.1
+    logits[1] = 10.0  # deterministic argmax → 1
     token = ctypes.c_int()
     dll.atlas_set_seed(42)
     dll.atlas_sample(m.model_ptr,
         logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         ctypes.byref(token), 0.0, 0, 0.0)
-    assert token.value >= 0
+    assert token.value == 1
 
     # ── 16. atlas_decompress_ffn (FFN decompress) ──
     dll.atlas_decompress_ffn(m.model_ptr)
