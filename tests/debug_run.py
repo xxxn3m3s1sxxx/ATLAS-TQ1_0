@@ -19,7 +19,7 @@ RELEASE_DLL = os.path.join(ROOT, "atlas.dll")
 DEBUG_DLL = os.path.join(ROOT, "atlas_d.dll")
 
 ALL_FIXTURES = []
-for arch in ["falcon3", "qwen3", "bitnet"]:
+for arch in ["falcon3", "qwen3", "bitnet", "trilm"]:
     for ver in [6, 8]:
         path = os.path.join(HERE, f"{arch}_v{ver}.atlas")
         ALL_FIXTURES.append((f"{arch}_v{ver}", path))

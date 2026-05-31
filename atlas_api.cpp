@@ -514,6 +514,9 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     } else if (strcmp(arch, "bitnet") == 0) {
         m->model_arch = ARCH_BITNET;
         m->layer_stride = 11;
+    } else if (strcmp(arch, "trilm") == 0) {
+        m->model_arch = ARCH_BITNET;
+        m->layer_stride = 11;
     }
 
     v = find_after(json, "\"rope_interleaved\"");

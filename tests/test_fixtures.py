@@ -36,7 +36,7 @@ else:
     LIB = os.path.join(ROOT, "libatlas.so")
 
 ALL_FIXTURES = []
-for arch in ["falcon3", "qwen3", "bitnet"]:
+for arch in ["falcon3", "qwen3", "bitnet", "trilm"]:
     for ver in [6, 8]:
         path = os.path.join(HERE, f"{arch}_v{ver}.atlas")
         ALL_FIXTURES.append((f"{arch}_v{ver}", path))

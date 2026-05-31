@@ -26,6 +26,24 @@ def _fp16(rows, cols=None):
     return bytes(n * 2)
 
 ARCHES = {
+    "trilm": {
+        "stride": 11,
+        "meta": {"arch": "trilm", "use_f32_bypass": 1},
+        "tensors": lambda L: [
+            (f"model.layers.{L}.self_attn.attn_sub_norm.weight", 1, H, lambda: _fp16(H)),
+            (f"model.layers.{L}.self_attn.q_proj.weight", 0, nH*hd, lambda: _tq1(nH*hd, H)),
+            (f"model.layers.{L}.self_attn.k_proj.weight", 0, nKV*hd, lambda: _tq1(nKV*hd, H)),
+            (f"model.layers.{L}.self_attn.v_proj.weight", 0, nKV*hd, lambda: _tq1(nKV*hd, H)),
+            (f"model.layers.{L}.self_attn.o_proj.weight", 0, H, lambda: _tq1(H, nH*hd)),
+            (f"model.layers.{L}.self_attn.attn_out_norm.weight", 1, H, lambda: _fp16(H)),
+            (f"model.layers.{L}.mlp.ffn_sub_norm.weight", 1, H, lambda: _fp16(H)),
+            (f"model.layers.{L}.mlp.gate_proj.weight", 0, I, lambda: _tq1(I, H)),
+            (f"model.layers.{L}.mlp.up_proj.weight", 0, I, lambda: _tq1(I, H)),
+            (f"model.layers.{L}.mlp.down_proj.weight", 0, H, lambda: _tq1(H, I)),
+            (f"model.layers.{L}.mlp.ffn_out_norm.weight", 1, H, lambda: _fp16(H)),
+        ],
+    },
+
     "falcon3": {
         "stride": 9,
         "meta": {"arch": "falcon3", "rope_interleaved": 1},
@@ -190,7 +208,7 @@ def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(__file__)
     os.makedirs(outdir, exist_ok=True)
     print(f"Generating test fixtures in {outdir}...")
-    for arch in ["falcon3", "qwen3", "bitnet"]:
+    for arch in ["falcon3", "qwen3", "bitnet", "trilm"]:
         for ver in [6, 8]:
             generate(arch, ver, outdir)
     print("Done.")

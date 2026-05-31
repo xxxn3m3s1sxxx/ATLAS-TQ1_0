@@ -7,6 +7,10 @@ on:
     paths:
       - "atlas_api.cpp"
       - "atlas_ffi.h"
+      - "compile.bat"
+      - ".github/workflows/build.yml"
+      - "tests/*.py"
+      - "tests/*.json"
   pull_request:
     branches: [master]
     paths:
@@ -28,6 +32,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install LLVM/Clang
         if: runner.os == 'Linux'
@@ -52,11 +61,16 @@ jobs:
       - name: Install test deps
         run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
 
+      - name: Generate test fixtures
+        shell: pwsh
+        run: python tests/generate_test_fixtures.py tests/
+
       - name: Test (Linux)
         if: runner.os == 'Linux'
         run: |
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
+          python -m pytest tests/test_fixtures.py -v
 
       - name: Test (Windows)
         if: runner.os == 'Windows'
@@ -65,6 +79,10 @@ jobs:
           $env:KMP_DUPLICATE_LIB_OK="TRUE"
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
+          $env:GENERATE_GOLDEN="1"
+          python -m pytest tests/test_fixtures.py::test_golden_regression -v --no-header -q 2>$null
+          $env:GENERATE_GOLDEN="0"
+          python -m pytest tests/test_fixtures.py -v
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:
@@ -81,11 +99,13 @@ jobs:
           echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
       - name: Install test deps
         run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+      - name: Generate test fixtures
+        run: python tests/generate_test_fixtures.py tests/
       - name: Test
         run: |
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
-
+          python -m pytest tests/test_fixtures.py -v
       - name: Upload artifact (release only)
         if: github.event_name == 'release'
         uses: actions/upload-artifact@v4
