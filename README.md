@@ -43,33 +43,42 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 |-------|:------------:|:----------:|:------:|:-----:|:----------:|
 | Falcon3-3B-Instruct | **2.0 GB** | **4 GB** | 22 | 12 | **7.1** |
 | Falcon3-1B-Instruct | 1.2 GB | 3 GB | 18 | 8 | **10.1** |
-| Bonsai-1.7B (Qwen3) | 0.9 GB | 3 GB | 28 | 16 | **13.0** |
-| Bonsai-4B (Qwen3) | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
 | Falcon3-7B-Instruct | 2.8 GB | 6 GB | 28 | 12 | **3.15** |
 | Falcon3-10B-Instruct | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
-| Bonsai-8B (Qwen3) | 2.5 GB | 8 GB | 36 | 32 | **1.8** |
-| BitNet-2B4T-b1.58 | 1.0 GB | 4 GB | 30 | 20 | **2.8** |
+| **Bonsai (Qwen3)** |||||
+| Bonsai-1.7B | 0.9 GB | 3 GB | 28 | 16 | **13.0** |
+| Bonsai-4B | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
+| Bonsai-8B | 2.5 GB | 8 GB | 36 | 32 | **1.8** |
+| **TriLM** |||||
+| TriLM-830M | 0.4 GB | 2 GB | 24 | 28 | — |
 | TriLM-1.1B | 0.5 GB | 3 GB | 24 | 28 | — |
+| TriLM-1.5B | 0.7 GB | 3 GB | 24 | 32 | — |
+| TriLM-2.4B | 0.9 GB | 4 GB | 30 | 36 | — |
+| TriLM-3.9B ⚠️ | 1.2 GB | 5 GB | 32 | 64 | — |
+| **Other** |||||
+| BitNet-2B4T-b1.58 | 1.0 GB | 4 GB | 30 | 20 | **2.8** |
 
 "Best tok/s" on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Your speed depends on CPU.
 - **3B+ models** work well on 4-8 GB RAM laptops
 - **7B/10B models** need 6-8 GB RAM (faster with int4 FFN mode)
 - **1B models** are fast but less capable
+- **TriLM 3.9B ⚠️**: Uses **standard Llama** architecture (head_dim=128, no SubLN) — different from smaller TriLMs (SubLN, head_dim=64). Auto-detected.
 
 ### Model Sources
 
-| Model | HuggingFace Repo |
-|-------|-----------------|
-| Falcon3-1B/3B/7B/10B | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) |
-| Bonsai-1.7B/4B/8B | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) |
-| BitNet b1.58 | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) |
-| TriLM-1.1B | [`SpectraSuite/TriLM_1.1B_Unpacked`](https://huggingface.co/SpectraSuite) |
-| TriLM-1.5B | [`SpectraSuite/TriLM_1.5B_Unpacked`](https://huggingface.co/SpectraSuite) |
-| TriLM-2.4B | [`SpectraSuite/TriLM_2.4B_Unpacked`](https://huggingface.co/SpectraSuite) |
-| TriLM-3.9B ⚠️ | [`SpectraSuite/TriLM_3.9B_Unpacked`](https://huggingface.co/SpectraSuite) — **NO SubLN** (standard Llama)! |
-| TriLM (all 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) — 99M→3.9B |
+| Family | HuggingFace Repo | License | Status |
+|--------|-----------------|:-------:|:------:|
+| **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | Falcon 1.0 | ✅ |
+| **Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
+| **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
+| **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
+| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | Falcon 1.0 | 🚧 |
+| OLMo-BitNet-1B | [`NousResearch/OLMo-Bitnet-1B`](https://huggingface.co/NousResearch/OLMo-Bitnet-1B) | Apache 2.0 | 🚧 |
+| Llama3-8B-1.58 | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama 3 | 🚧 |
 
-All Apache 2.0 licensed.
+✅ — Supported and tested. 🚧 — Experimental, needs packer work.
+
+**TriLM ⚠️**: TriLM 3.9B uses **standard Llama** (head_dim=128, no SubLN). Smaller TriLMs (≤2.4B) use SubLN (head_dim=64). Auto-detected by `derive_arch`.
 
 ### Converting Models to .atlas Format
 
@@ -161,6 +170,11 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 | Falcon3-10B (int4) | hybrid+int8 | **2.25** | 18% faster than int8 |
 | Bonsai-8B | f32 bypass | **1.8** | Most capable, slowest |
 | BitNet-2B4T | f32 bypass | **2.8** | Experimental |
+| TriLM-830M | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-1.1B | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-1.5B | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-2.4B | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-3.9B ⚠️ | hybrid+int8 | — | Standard Llama, no SubLN |
 
 ### How It Works
 
@@ -218,6 +232,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 |------|---------|
 | `atlas_cli.cpp` | Standalone CLI (`atlas.exe` — no Python needed) |
 | `atlas_api.cpp` | C++ inference engine — AVX2 kernels, attention, norms, tokenizer |
+| `atlas_vnni.cpp` | AVX-512 VNNI matmul kernel (separate TU, `target("avx10.2")`) |
 | `atlas_ffi.h` | C API contract |
 | `atlas_infer.py` | Python bindings (`AtlasModel` class) |
 | `atlas_server.py` | SSE web server (FastAPI, `/v1/chat/completions`) |
@@ -230,7 +245,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
-| **v2.9.3** | AKI-Bug-Fix: `row_dim==vocab_size` heuristic replaced by name-guard. HF alignment check (`scripts/verify_hf_alignment.py`) — 18 models: 16 PASS, 0 FAIL, 2 SKIP. TriLM-3.9B blindspot found (SubLN vs non-SubLN arch mutation). Coverage hardened (44 tests, stale-gcda fix). CI: OMP+E2E tests + HF check integrated. Coverage: Lines 68.6%, Functions 86.0%, Branches 54.2%. |
+| **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
 | **v2.7.9** | BitNet fix: duplicate sub-norm collapse resolved. |
