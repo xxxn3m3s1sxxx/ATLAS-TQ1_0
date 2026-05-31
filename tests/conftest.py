@@ -1,5 +1,7 @@
 """Test configuration and fixtures."""
-import os, sys, ctypes
+
+import os
+import sys
 
 # Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
