@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.10.0 — i4 Cache + VNNI Int4 Kernel**: Persistent load-time quantized state (ttype=3+8) for 0-click restart. VNNI-accelerated int4 matmul via `_mm512_dpbusd_epi32` (Clang 19+ Linux). 70/70 Tests passed, CI green on Windows + Linux.
+> ⚡ **v2.10.0 — ASan-Certified**: All ASan heap-bugs fixed (OOB-read, memcpy-overlap, allocator-mismatch). 70/70 Tests passed, CI green on Windows + Linux. Plus i4 Cache (0-click restart) + VNNI Int4 Kernel (`_mm512_dpbusd_epi32`). First ASan-certified release.
 
 ## Quickstart
 
