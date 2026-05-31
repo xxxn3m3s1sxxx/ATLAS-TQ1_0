@@ -170,13 +170,13 @@ jobs:
       - name: Run tests under ASan
         env:
           OMP_NUM_THREADS: "4"
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_stats=1"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_stats=1:log_path=/tmp/asan"
         run: |
           ASAN_LIB=$(clang++ --print-file-name=libclang_rt.asan-x86_64.so)
           echo "ASan runtime: $ASAN_LIB"
           LD_PRELOAD=$ASAN_LIB python tests/ci_smoke.py
           LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_dll.py -v
-          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q
+          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q 2>/tmp/asan_stderr.log; cat /tmp/asan_stderr.log 2>/dev/null || true
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:
