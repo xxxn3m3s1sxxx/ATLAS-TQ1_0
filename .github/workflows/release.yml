@@ -30,14 +30,14 @@ jobs:
       - name: Smoke test — generate mock model
         shell: pwsh
         run: |
-          pip install numpy -q
+          pip install numpy pytest -q
           python tests/create_mock_model.py tests/mock.atlas
           if ($LASTEXITCODE -ne 0) { throw "Mock model creation failed" }
 
       - name: Smoke test — load + generate
         shell: pwsh
         run: |
-          python tests/test_mock_model.py
+          python -m pytest tests/test_mock_model.py -q --no-header
           if ($LASTEXITCODE -ne 0) { throw "Smoke test failed" }
 
       - name: Collect runtime DLLs
@@ -83,12 +83,12 @@ jobs:
 
       - name: Smoke test — generate mock model
         run: |
-          python3 -m pip install numpy -q
+          python3 -m pip install numpy pytest -q
           python3 tests/create_mock_model.py tests/mock.atlas
 
       - name: Smoke test — load + generate
         run: |
-          LD_LIBRARY_PATH=$PWD python3 tests/test_mock_model.py
+          LD_LIBRARY_PATH=$PWD python3 -m pytest tests/test_mock_model.py -q --no-header
 
       - name: Create Release Tar
         run: |
