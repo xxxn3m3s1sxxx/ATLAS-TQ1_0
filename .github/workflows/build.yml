@@ -78,15 +78,25 @@ jobs:
           python -m pytest tests/test_fixtures.py -v
 
       - name: Coverage (Linux)
-        id: cov_linux
         if: runner.os == 'Linux'
         run: |
           pip install --quiet gcovr
+          # Find llvm-cov (clang coverage tools)
+          GCOV_TOOL="gcov"
+          if command -v llvm-cov-19 &>/dev/null; then
+            GCOV_TOOL="llvm-cov-19 gcov"
+          elif command -v llvm-cov-18 &>/dev/null; then
+            GCOV_TOOL="llvm-cov-18 gcov"
+          elif command -v llvm-cov &>/dev/null; then
+            GCOV_TOOL="llvm-cov gcov"
+          else
+            apt-get install -y -qq llvm 2>/dev/null && GCOV_TOOL="llvm-cov gcov"
+          fi
+          echo "Using GCOV tool: $GCOV_TOOL"
           clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas_cov.so atlas_api.cpp -lgomp --coverage
           cp libatlas_cov.so libatlas.so
           python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>/dev/null
-          python -m gcovr --html-details coverage.html --root . --filter "atlas_api\.cpp"
-          echo "done=true" >> $GITHUB_OUTPUT
+          python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp"
 
       - name: Test (Windows)
         if: runner.os == 'Windows'
