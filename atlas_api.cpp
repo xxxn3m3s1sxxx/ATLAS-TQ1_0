@@ -277,6 +277,16 @@ extern "C" {
 // Callback for streaming generation (v2.3.0)
 typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
+// Timer for debug profiling
+#ifdef ATLAS_DEBUG_MODE
+static inline double atlas_now() {
+    LARGE_INTEGER c, f;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+#endif
+
 static inline float fp16_to_fp32(uint16_t h) {
     float r;
     __m128i h4 = _mm_cvtsi32_si128((int)(unsigned)h);  // zero-extend to 32-bit
@@ -1622,7 +1632,11 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         uint8_t* packed = new_data + 2;
         int32_t* new_rs = (int32_t*)(packed + rows * packed_cols);
         
-        for (int r = 0; r < rows; r++) {
+        // OMP parallel over rows (each row is independent)
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (int r = 0; r < rows; r++) {
             int sum = 0;
             for (int c = 0; c < cols; c += 2) {
                 int v0 = (int)i8[r * cols + c];
@@ -1720,18 +1734,28 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
     #pragma omp parallel for reduction(+:total) schedule(dynamic, 4)
     for (int ti = 0; ti < n; ti++) {
         auto& t = m->tensors[ti];
-        if (t.ttype != 3) continue;
-        volatile uintptr_t d8 = (uintptr_t)t.data;
-        if (!d8) continue;
-        int n_vals = (int)(t.data_size - 2 - t.row_dim * 4);
-        if (n_vals <= 0) continue;
-        int8_t* data = (int8_t*)(d8 + 2);
-        for (int64_t i = 0; i < n_vals; i += step) {
-            volatile int sink = data[i]; (void)sink;
+        if (t.ttype == 3) {
+            volatile uintptr_t d8 = (uintptr_t)t.data;
+            if (!d8) continue;
+            int n_vals = (int)(t.data_size - 2 - t.row_dim * 4);
+            if (n_vals <= 0) continue;
+            int8_t* data = (int8_t*)(d8 + 2);
+            for (int64_t i = 0; i < n_vals; i += step) {
+                volatile int sink = data[i]; (void)sink;
+            }
+            total += n_vals;
+        } else if (t.ttype == 10) {
+            // Prefetch TQ2 packed data + fp16 scales
+            volatile const uint8_t* d = t.data;
+            if (!d) continue;
+            int64_t sz = t.data_size;
+            for (int64_t i = 0; i < sz; i += step) {
+                volatile int sink = d[i]; (void)sink;
+            }
+            total += sz;
         }
-        total += n_vals;
     }
-    printf("[ATLAS] Prefetched %lld int8 values\n", (long long)total);
+    printf("[ATLAS] Prefetched %lld int8/TQ2 values\n", (long long)total);
 }
 
 // ─── Get int8-decoded tensor from C++ side ─────────────────────────────
@@ -2725,32 +2749,35 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32,
     float* output, int B) {
+    #ifdef ATLAS_DEBUG_MODE
+    double t0 = atlas_now();
+    #endif
     init_tq1_decode_lut();
     int rows_packed = rows / 4;
 
     const uint8_t* scale_data = tensor_data + 3;
     const uint8_t* packed = tensor_data + 3 + rows * n_blocks * 2;
 
-    // thread_local persistent buffers (v2.7.5: eliminate per-call malloc)
-    static thread_local float* tl_block_scales = nullptr;
-    static thread_local size_t tl_block_scales_cap = 0;
+    // Shared (non-TLS) buffer for per-row per-block scales
+    static float* s_block_scales = nullptr;
+    static size_t s_block_scales_cap = 0;
+    static std::mutex s_bs_mutex;
+    {
+        size_t need_bs = (size_t)rows * n_blocks;
+        if (need_bs > s_block_scales_cap) {
+            std::lock_guard<std::mutex> lock(s_bs_mutex);
+            if (need_bs > s_block_scales_cap) {
+                free(s_block_scales);
+                s_block_scales = (float*)malloc(need_bs * sizeof(float));
+                s_block_scales_cap = need_bs;
+            }
+        }
+    }
+    float* block_scales = s_block_scales;
     static thread_local int8_t* tl_act_s8 = nullptr;
     static thread_local size_t tl_act_s8_cap = 0;
     static thread_local float* tl_scale_x = nullptr;
     static thread_local size_t tl_scale_x_cap = 0;
-
-    // Pre-decode per-row per-block scales to float
-    size_t need_bs = (size_t)rows * n_blocks;
-    if (need_bs > tl_block_scales_cap) {
-        free(tl_block_scales);
-        tl_block_scales = (float*)malloc(need_bs * sizeof(float));
-        tl_block_scales_cap = need_bs;
-    }
-    float* block_scales = tl_block_scales;
-    for (int i = 0; i < rows * n_blocks; i++) {
-        uint16_t sr; memcpy(&sr, scale_data + i * 2, 2);
-        block_scales[i] = fp16_to_fp32(sr);
-    }
 
     // Step 1: Quantize activations to symmetric int8 (per-token, no +128 offset)
     size_t need_as = (size_t)B * input_dim;
@@ -2766,29 +2793,23 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
         tl_scale_x_cap = B;
     }
     float* scale_x = tl_scale_x;
-    for (int b = 0; b < B; b++) {
-        const float* act = act_f32 + b * input_dim;
-        float max_val = 1e-5f;
-        for (int i = 0; i < input_dim; i++) {
-            float av = fabsf(act[i]);
-            if (av > max_val) max_val = av;
-        }
-        scale_x[b] = max_val / 127.0f;
-        float inv = 127.0f / max_val;
-        int8_t* aq = act_s8 + b * input_dim;
-        for (int i = 0; i < input_dim; i++) {
-            int q = (int)(act[i] * inv + 0.5f);
-            if (q < -127) q = -127;
-            if (q > 127) q = 127;
-            aq[i] = (int8_t)q;
-        }
-    }
 
     // Step 2: TQ1 decode + ternary matmul via _mm256_sign_epi8
+    // Scale decode (fp16→fp32) integrated into parallel region
     #ifdef _OPENMP
     #pragma omp parallel
     #endif
     {
+        // Parallel fp16→fp32 scale decode
+        #ifdef _OPENMP
+        #pragma omp for
+        #endif
+        for (int i = 0; i < rows * n_blocks; i++) {
+            uint16_t sr; memcpy(&sr, scale_data + i * 2, 2);
+            block_scales[i] = fp16_to_fp32(sr);
+        }
+
+        // Thread-local decode buffer
         static thread_local int8_t* tl_decode_buf = nullptr;
         static thread_local size_t tl_decode_buf_cap = 0;
         size_t need_db = (size_t)4 * input_dim;
@@ -2799,6 +2820,30 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
             memset(tl_decode_buf, 0, need_db * sizeof(int8_t));
         }
         int8_t* decode_buf = tl_decode_buf;
+
+        // Act quant single-threaded (sequential across b)
+        #ifdef _OPENMP
+        #pragma omp single
+        #endif
+        {
+            for (int b = 0; b < B; b++) {
+                const float* act = act_f32 + b * input_dim;
+                float max_val = 1e-5f;
+                for (int i = 0; i < input_dim; i++) {
+                    float av = fabsf(act[i]);
+                    if (av > max_val) max_val = av;
+                }
+                scale_x[b] = max_val / 127.0f;
+                float inv = 127.0f / max_val;
+                int8_t* aq = act_s8 + b * input_dim;
+                for (int i = 0; i < input_dim; i++) {
+                    int q = (int)(act[i] * inv + 0.5f);
+                    if (q < -127) q = -127;
+                    if (q > 127) q = 127;
+                    aq[i] = (int8_t)q;
+                }
+            }
+        }
 
         #ifdef _OPENMP
         #pragma omp for
@@ -2876,16 +2921,21 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
             }
         }
     }
+    #ifdef ATLAS_DEBUG_MODE
+    double elapsed = atlas_now() - t0;
+    if (elapsed > 0.1) {
+        printf("[TIMER] matmul_tq1_fused rows=%d dim=%d B=%d: %.3fs\n", rows, input_dim, B, elapsed);
+    }
+    #endif
 }
 
 // ─── TQ2: Universal block-scaled ternary matmul ─────────────────────
 // TQ2 header: [block_size:1][n_blocks:2][flags:1][scales:rows*n_blocks*2][packed_TQ1]
-// Uses symmetric s8 activation quant + on-the-fly TQ1 decode + sign_epi8 ternary.
-// P1: delegates to matmul_tq1_block_fused_s8 (ttype=5 kernel, skip flags byte).
+// P1 delegate to matmul_tq1_block_fused_s8 (skip flags byte, matching ttype=5 layout).
 static void matmul_tq2(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32, float* output, int B) {
-    // flags byte at offset 3 — skip it so ttype=5 format aligns
+    // skip flags byte so ttype=5 layout aligns (scales at +3, packed at +3+rows*n_blocks*2)
     const uint8_t* w5 = tensor_data + 1;
     matmul_tq1_block_fused_s8(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
@@ -3106,8 +3156,11 @@ ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
         }
     }
 
-    if (total > 0)
+    if (total > 0) {
         printf("[ATLAS] Converted %d tensors to TQ2\n", total);
+        // TQ2 uses symmetric s8 activation quant — no f32 bypass needed
+        m->use_f32_matmul = 0;
+    }
 }
 
 // ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
@@ -3484,7 +3537,7 @@ static void forward_layer_internal(
         auto& t = m->tensors[idx_o];
         matmul_tq2(t.row_dim, qd, t.packed_cols,
             t.data, t.block_size, t.n_blocks,
-            attn_out, m->buf_act, B);
+            attn_out, m->buf_gate, B);
     } else if (to.ttype == 5) {
             for (int b = 0; b < B; b++) {
                 memcpy(m->buf_act + b * to.packed_cols * 5, attn_out + b * qd, qd * sizeof(float));
@@ -4195,11 +4248,18 @@ ATLAS_API void atlas_forward(
                   L, B, seq_now, max_seq_len,
                   idx[0], idx[1], idx[2], idx[3], idx[4],
                   idx[5], idx[6], idx[7], idx[8]);
+        #ifdef ATLAS_DEBUG_MODE
+        double tL = atlas_now();
+        #endif
         forward_layer_internal(m, buf_a, buf_b, B, positions,
             kc, vc, max_seq_len, seq_now,
             idx[0], idx[1], idx[2], idx[3], idx[4],
             idx[5], idx[6], idx[7], idx[8],
             qn_i, kn_i, asn_i, fsn_i);
+        #ifdef ATLAS_DEBUG_MODE
+        double tLend = atlas_now() - tL;
+        if (tLend > 0.1) ATLAS_LOG("[TIMER] L=%d: %.3fs\n", L, tLend);
+        #endif
         ATLAS_LOG("forward L=%d done\n", L);
         float* tmp = buf_a; buf_a = buf_b; buf_b = tmp;
     }

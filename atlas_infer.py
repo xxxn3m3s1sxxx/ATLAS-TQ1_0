@@ -234,7 +234,8 @@ dll.atlas_generate_stream.restype = ctypes.c_int
 class AtlasModel:
     def __init__(self, atlas_path, safetensors_path=None, model_dir=None,
                  use_packed_matmul=False, use_hybrid_matmul=False,
-                 max_seq_len=4096, base_seq_len=None):
+                 max_seq_len=4096, base_seq_len=None,
+                 convert_to_tq2=False):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
@@ -242,6 +243,13 @@ class AtlasModel:
         self.model_ptr = dll.atlas_load(atlas_path.encode())
         if not self.model_ptr:
             raise RuntimeError("Failed to load model")
+
+        # TQ2: convert weights before any decompression (preserves block-scaled format)
+        if convert_to_tq2:
+            dll.atlas_convert_to_tq2(self.model_ptr)
+            use_packed_matmul = False
+            use_hybrid_matmul = False
+            print("[Atlas] TQ2 mode: on-the-fly block-scaled ternary decode")
 
         # Get model info
         nl = ctypes.c_int(); hd = ctypes.c_int(); id_ = ctypes.c_int()
