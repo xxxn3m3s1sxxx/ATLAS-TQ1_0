@@ -3691,7 +3691,7 @@ static void forward_layer_internal(
     int ffn_dim = g_dim > u_dim ? g_dim : u_dim;
 
     for (int b = 0; b < B; b++) {
-        memcpy(m->buf_act + b * ffn_dim, x_norm2 + b * H, H * sizeof(float));
+        memmove(m->buf_act + b * ffn_dim, x_norm2 + b * H, H * sizeof(float));
         memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
     }
 
