@@ -43,6 +43,9 @@ jobs:
       - name: Check API parity (C ⇄ Python)
         run: python scripts/check_api_parity.py
 
+      - name: HF alignment check
+        run: python scripts/verify_hf_alignment.py
+
       - name: Install LLVM/Clang
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
@@ -95,8 +98,14 @@ jobs:
           echo "Using GCOV tool: $GCOV_TOOL"
           clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas_cov.so atlas_api.cpp -lgomp --coverage
           cp libatlas_cov.so libatlas.so
-          python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>/dev/null
-          python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp"
+          python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header 2>/dev/null
+          python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
+
+      - name: Check coverage thresholds (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python -m gcovr --gcov-executable "$GCOV_TOOL" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
+          python scripts/check_coverage_thresholds.py coverage_summary.json
 
       - name: Test (Windows)
         if: runner.os == 'Windows'
@@ -117,14 +126,22 @@ jobs:
           $llvmDir = "C:\Program Files\LLVM"
           if (-not (Test-Path $llvmDir)) { throw "LLVM not found" }
           pip install --quiet gcovr
+          Remove-Item -Force *.gcda *.gcno -ErrorAction SilentlyContinue
           clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas_cov.dll atlas_api.cpp "$llvmDir\lib\libomp.lib" --coverage
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
           $env:KMP_DUPLICATE_LIB_OK="TRUE"
           Move-Item atlas.dll atlas.dll.bak -Force
           Move-Item atlas_cov.dll atlas.dll -Force
-          python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>$null
+          python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header 2>$null
           Move-Item atlas.dll.bak atlas.dll -Force
-          python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp"
+          python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
+
+      - name: Check coverage thresholds (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m gcovr --gcov-executable "llvm-cov gcov" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
+          python scripts/check_coverage_thresholds.py coverage_summary.json
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

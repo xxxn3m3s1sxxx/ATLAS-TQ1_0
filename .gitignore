@@ -20,6 +20,8 @@ hashline.py
 *.gcno
 *.gcda
 coverage.*
+*.gcov
+cov.json
 opencode.json
 debug_*.py
 !tests/debug_run.py
@@ -36,3 +38,5 @@ mock/
 models/
 scripts/
 !scripts/check_api_parity.py
+!scripts/verify_hf_alignment.py
+!scripts/check_coverage_thresholds.py

@@ -704,7 +704,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         } else if (t.ttype == 1) {  // raw float16 — norm, embed, or fp16 weight
             if (t.packed_cols > 1) {
                 t.data_size = (int64_t)t.row_dim * t.packed_cols * 2;
-            } else if (t.row_dim == m->vocab_size) {
+            } else if (t.row_dim == m->vocab_size && i < (int)m->tensor_names.size() &&
+                       (m->tensor_names[i].find("embed_tokens") != std::string::npos ||
+                        m->tensor_names[i].find("token_embd") != std::string::npos)) {
                 t.data_size = (int64_t)t.row_dim * m->hidden_dim * 2;
             } else {
                 t.data_size = (int64_t)t.row_dim * 2;

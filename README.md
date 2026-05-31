@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.8.0**: Load-time int4 FFN quantization (18-26% faster 7B/10B). CLI binary available.
+> ⚡ **v2.9.3**: AKI-Bug-Fix + HF-Alignment-Verifikation. `scripts/verify_hf_alignment.py` prüft 18 Modelle (16 PASS, 0 FAIL) gegen HF Hub ohne Download. TriLM-3.9B Mutation entdeckt. CI gehärtet mit Coverage-Gates.
 
 ## Quickstart
 
@@ -47,7 +47,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Bonsai-4B (Qwen3) | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
 | Falcon3-7B-Instruct | 2.8 GB | 6 GB | 28 | 12 | **3.15** |
 | Falcon3-10B-Instruct | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
-| Bonsai-8B (Qwen3) | 2.5 GB | 8 GB | 28 | 32 | **1.8** |
+| Bonsai-8B (Qwen3) | 2.5 GB | 8 GB | 36 | 32 | **1.8** |
 | BitNet-2B4T-b1.58 | 1.0 GB | 4 GB | 30 | 20 | **2.8** |
 | TriLM-1.1B | 0.5 GB | 3 GB | 24 | 28 | — |
 
@@ -64,6 +64,10 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Bonsai-1.7B/4B/8B | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) |
 | BitNet b1.58 | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) |
 | TriLM-1.1B | [`SpectraSuite/TriLM_1.1B_Unpacked`](https://huggingface.co/SpectraSuite) |
+| TriLM-1.5B | [`SpectraSuite/TriLM_1.5B_Unpacked`](https://huggingface.co/SpectraSuite) |
+| TriLM-2.4B | [`SpectraSuite/TriLM_2.4B_Unpacked`](https://huggingface.co/SpectraSuite) |
+| TriLM-3.9B ⚠️ | [`SpectraSuite/TriLM_3.9B_Unpacked`](https://huggingface.co/SpectraSuite) — **NO SubLN** (standard Llama)! |
+| TriLM (all 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) — 99M→3.9B |
 
 All Apache 2.0 licensed.
 
@@ -225,6 +229,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.9.3** | AKI-Bug-Fix: `row_dim==vocab_size` Heuristik durch Name-Guard abgesichert. HF-Alignment-Verifikation (`scripts/verify_hf_alignment.py`) — 18 Modelle: 16 PASS, 0 FAIL, 2 SKIP. TriLM-3.9B Blindspot entdeckt (SubLN vs non-SubLN). Coverage gehärtet (44 Tests, stale-gcda Fix). CI: OMP+E2E Tests + HF-Check integriert. Coverage: Lines 68.6%, Functions 86.0%, Branches 54.2%. |
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
 | **v2.7.9** | BitNet fix: duplicate sub-norm collapse resolved. |

@@ -15,19 +15,39 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 
 ## Supported Models
 
-| Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab |
-|-------|-----------|--------|--------|-------------|-------|----------|-------|
-| BitNet-2B4T-b1.58 | 1.03 GB | 30 | 2560 | 6912 | 20 | 5 | 128256 |
-| Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 |
-| Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 |
-| Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 |
-| Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 |
-| Ternary Bonsai-1.7B | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 |
-| Ternary Bonsai-4B | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 |
+| Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab | Arch |
+|-------|-----------|--------|--------|-------------|-------|----------|-------|------|
+| BitNet-2B4T-b1.58 | 1.03 GB | 30 | 2560 | 6912 | 20 | 5 | 128256 | SubLN, ReLU² |
+| Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 | Falcon3 |
+| Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 | Falcon3 |
+| Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 | Falcon3 |
+| Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 | Falcon3 |
+| Ternary Bonsai-1.7B | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 | Qwen3 (QK-Norm) |
+| Ternary Bonsai-4B | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 | Qwen3 (QK-Norm) |
+| Ternary Bonsai-8B | 3.72 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 | Qwen3 (QK-Norm) |
+| TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 | SubLN (head_dim=64) |
+| TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
+| TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.
+Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
+TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
+TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO SubLN** — different arch than smaller TriLMs!
+
+### HF Alignment Check — 22 Models Verified
+
+`scripts/verify_hf_alignment.py` auto-checks all models against HF Hub:
+
+| Family | Count | Status |
+|--------|-------|--------|
+| Falcon3 (1B/3B/7B/10B) | 4 | ✅ All PASS |
+| Bonsai (1.7B/4B/8B) | 3 | ✅ All PASS |
+| BitNet-2B4T | 1 | ⏭️ SKIP (restricted repo) |
+| TriLM (99M→3.9B, all sizes) | 10 | ✅ 9 PASS, ⏭️ 1 SKIP (2.3B private) |
+| Qwen reference (Qwen2.5/3/QwQ) | 4 | ✅ All PASS |
+
+**Critical finding**: TriLM family is **internally inconsistent** — ≤2.4B uses SubLN (head_dim=64), 3.9B uses standard Llama (head_dim=128, no SubLN). `derive_arch` auto-detects this via head_dim threshold.
 
 ## Build
 
@@ -118,8 +138,13 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
-### v2.9.2 ✅ — Mock-CI-Regressions-Suite (ABGESCHLOSSEN)
-- **3 Bugs gekillt**: ttype=1 data_size heuristic, ensure_buffers Q-buffer overflow (`inter_dim`→`max_dim`), `_cache_indices` BitNet stride (full per_layer rewrite).
+### v2.9.3 ✅ — AKI-Bug-Fix + HF-Alignment-Check + CI-Hardening (ABGESCHLOSSEN)
+- **AKI-Bug fix**: `row_dim==vocab_size` Heuristik in `atlas_api.cpp:707-710` durch Name-Guard abgesichert (`embed_tokens`/`token_embd` substring check via `m->tensor_names[i]`). Schützt vor Fehlklassifikation von 1D-Norm-Tensoren (`model.norm.weight`) als 2D-Embedding bei `hidden_dim == vocab_size`. In keinem Produktionsmodell getriggert (8/8 HF-Modelle OK), aber defensiv notwendig.
+- **HF-Alignment-Verifikation**: `scripts/verify_hf_alignment.py` — Zero-Download-Check gegen HuggingFace Hub (config.json + model.safetensors.index.json). **18 Modelle: 16 PASS, 0 FAIL, 2 SKIP** (restricted). Coverage: 4 Falcon3 + 3 Bonsai + 10 TriLM (99M→3.9B) + 1 BitNet (restricted). Auto-Discovery via `--discover` scannt alle bekannten HF-Orgs.
+- **TriLM 3.9B Blindspot entdeckt**: TriLM-Familie ist intern inkonsistent! ≤2.4B = SubLN (head_dim=64, 11 Tensoren), 3.9B = Standard-Llama (head_dim=128, 9 Tensoren, KEIN SubLN). `derive_arch` erkennt via head_dim-Schwelle (`trilm` vs `trilm_nosubln`). Packer muss beim Packen entsprechend triggern.
+- **Coverage gefixt**: Stale gcda/gcno-mismatch durch `del /Q *.gcda *.gcno` vor Rebuild. `compile.bat` läuft jetzt alle 44 Tests (inkl. OMP-Stress + E2E-Pipeline) unter Coverage. `--gcov-ignore-parse-errors` für Robustheit.
+- **CI gehärtet**: `build.yml` läuft jetzt `verify_hf_alignment.py` als eigenen Step. Coverage auf Linux+Windows inkl. OMP+E2E-Tests.
+- **Qwen-Arch-Differenzierung**: `qwen25` (ohne QK-Norm, `Qwen2ForCausalLM`) vs `qwen3` (mit QK-Norm, `Qwen3ForCausalLM`) — Arch-Detektion via `model_type`, nicht via Modell-ID.
 - **EOS-Fix aus tokenizer**: `eos_id` von `m->tok.special[0]` statt `header_guess(11)`. TriLM 1.5B jetzt korrektes EOS.
 - **2 neue C-APIs**: `atlas_set_rope_interleaved`, `atlas_set_rope_theta`.
 - **`tests/atlas_mock_model.py`**: Synthetische v8.8-Modelle (200-300 KB) mit echtem TQ1-Packing für 3 Architekturen. `pack_tq1_g128` aus Produktions-Packer.

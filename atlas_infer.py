@@ -172,7 +172,7 @@ dll.atlas_rmsnorm_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
 dll.atlas_rope_f32.restype = None
 dll.atlas_rope_f32.argtypes = [ctypes.POINTER(ctypes.c_float),
     ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,
-    ctypes.c_int, ctypes.c_int, ctypes.c_float]
+    ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_bool]
 
 dll.atlas_attention_f32.restype = None
 dll.atlas_attention_f32.argtypes = [
@@ -733,7 +733,8 @@ class AtlasModel:
             q.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             k.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             self.n_heads, self.n_kv_heads, self.head_dim,
-            position, ctypes.c_float(self.rope_theta))
+            position, ctypes.c_float(self.rope_theta),
+            getattr(self, '_rope_interleaved', True))
 
     def _silu(self, x):
         return x * (1.0 / (1.0 + np.exp(-x)))
