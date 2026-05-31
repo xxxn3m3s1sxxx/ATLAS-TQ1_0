@@ -176,7 +176,7 @@ jobs:
           echo "ASan runtime: $ASAN_LIB"
           LD_PRELOAD=$ASAN_LIB python tests/ci_smoke.py
           LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_dll.py -v
-          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q 2>/tmp/asan_stderr.log; cat /tmp/asan_stderr.log 2>/dev/null || true
+          rc=0; LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q 2>/tmp/asan_err.txt || rc=$?; echo "=== ASAN STDERR ==="; cat /tmp/asan_err.txt 2>/dev/null; echo "=== ASAN LOGFILE ==="; cat /tmp/asan.* 2>/dev/null; echo "=== EXIT CODE: $rc ==="; exit $rc
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:
