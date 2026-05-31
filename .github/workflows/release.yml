@@ -27,6 +27,17 @@ jobs:
           clang++ -o atlas.exe atlas_cli.cpp -O2 -std=c++17 -lshell32
           if ($LASTEXITCODE -ne 0) { throw "CLI build failed" }
 
+      - name: Collect runtime DLLs
+        shell: pwsh
+        run: |
+          $llvmDir = "C:\Program Files\LLVM"
+          Copy-Item "$llvmDir\bin\libomp.dll" -Destination . -Force
+          Copy-Item "$llvmDir\bin\libc++.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Copy-Item "$llvmDir\bin\libunwind.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Copy-Item "$llvmDir\bin\libwinpthread-1.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          Write-Output "=== Release files ==="
+          Get-ChildItem *.exe,*.dll | ForEach-Object { Write-Output "$($_.Name) — $($_.Length/1MB -as [int]) MB" }
+
       - name: Smoke test — generate mock model
         shell: pwsh
         run: |
@@ -39,17 +50,6 @@ jobs:
         run: |
           python -m pytest tests/test_mock_model.py -q --no-header
           if ($LASTEXITCODE -ne 0) { throw "Smoke test failed" }
-
-      - name: Collect runtime DLLs
-        shell: pwsh
-        run: |
-          $llvmDir = "C:\Program Files\LLVM"
-          Copy-Item "$llvmDir\bin\libomp.dll" -Destination . -Force
-          Copy-Item "$llvmDir\bin\libc++.dll" -Destination . -Force -ErrorAction SilentlyContinue
-          Copy-Item "$llvmDir\bin\libunwind.dll" -Destination . -Force -ErrorAction SilentlyContinue
-          Copy-Item "$llvmDir\bin\libwinpthread-1.dll" -Destination . -Force -ErrorAction SilentlyContinue
-          Write-Output "=== Release files ==="
-          Get-ChildItem *.exe,*.dll | ForEach-Object { Write-Output "$($_.Name) — $($_.Length/1MB -as [int]) MB" }
 
       - name: Create Release Zip
         shell: pwsh

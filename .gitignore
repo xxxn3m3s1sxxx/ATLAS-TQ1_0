@@ -20,6 +20,9 @@ hashline.py
 *.gcno
 *.gcda
 coverage.*
+cov_meta.json
+coverage_summary.json
+coverage_test.*
 *.gcov
 cov.json
 opencode.json
