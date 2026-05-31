@@ -1468,7 +1468,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int col = c * 5 + t2;
                     if (col >= input_dim) break;
                     int blk = col / bs;
-                    float scale = decoded_scales[r * nbk + blk];
+                    float scale = (blk < nbk) ? decoded_scales[r * nbk + blk] : 0.0f;
                     f32_row[col] = (float)l[t2] * scale;
                     float av = fabsf(f32_row[col]);
                     if (av > global_max) global_max = av;
@@ -1494,7 +1494,8 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int col = c * 5 + t2;
                     if (col >= input_dim) break;
                     int blk = col / bs;
-                    float val = (float)l[t2] * decoded_scales[r * nbk + blk];
+                    float scale2 = (blk < nbk) ? decoded_scales[r * nbk + blk] : 0.0f;
+                    float val = (float)l[t2] * scale2;
                     int q = (int)(val / quant_scale + 0.5f);
                     if (q < -127) q = -127;
                     if (q > 127) q = 127;
