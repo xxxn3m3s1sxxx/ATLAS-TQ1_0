@@ -29,3 +29,6 @@ atlas.dll.release
 _*.py
 
 tests/mock.atlas
+mock/
+models/
+scripts/

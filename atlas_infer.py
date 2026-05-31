@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atlas Inference Engine v2.6.4 — Falcon3/BitNet/Bonsai TQ1.0 inference."""
+"""Atlas Inference Engine v2.9.2 — Falcon3/BitNet/Bonsai TQ1.0 inference."""
 import ctypes, struct, os, sys, time, json, queue, threading, numpy as np
 # v2.0.0: No more AutoTokenizer dependency — C++ binary tokenizer handles encode/decode
 
@@ -87,6 +87,12 @@ dll.atlas_set_use_packed_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
 dll.atlas_set_use_hybrid_matmul.restype = None
 dll.atlas_set_use_hybrid_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_rope_interleaved.restype = None
+dll.atlas_set_rope_interleaved.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_rope_theta.restype = None
+dll.atlas_set_rope_theta.argtypes = [ctypes.c_void_p, ctypes.c_float]
 
 dll.atlas_set_rope_scale.restype = None
 dll.atlas_set_rope_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
@@ -445,6 +451,14 @@ class AtlasModel:
         """v1.3.2: Enable/disable f32 bypass (no activation quantization)."""
         dll.atlas_set_use_f32_matmul(self.model_ptr, 1 if enable else 0)
 
+    def set_rope_interleaved(self, enable=True):
+        """Toggle between interleaved (LLaMA2) and half-split (Falcon3) RoPE pair format."""
+        dll.atlas_set_rope_interleaved(self.model_ptr, 1 if enable else 0)
+
+    def set_rope_theta(self, theta=10000.0):
+        """Override RoPE theta (frequency). Override theta ONLY for debug."""
+        dll.atlas_set_rope_theta(self.model_ptr, ctypes.c_float(theta))
+
     def set_rope_scale(self, scale=1.0):
         """v2.4.0: Set YaRN NTK RoPE scaling factor (4.0 for Bonsai-4B)."""
         dll.atlas_set_rope_scale(self.model_ptr, ctypes.c_float(scale))
@@ -510,9 +524,13 @@ class AtlasModel:
             'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
             'self_attn.q_norm.weight', 'self_attn.k_norm.weight']
         if has_sub_norm:
-            # BitNet: attn_sub_norm + ffn_sub_norm instead of QK-Norm
-            per_layer[9] = 'self_attn.attn_sub_norm.weight'
-            per_layer[10] = 'mlp.ffn_sub_norm.weight'
+            per_layer = [
+                'input_layernorm.weight',
+                'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
+                'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
+                'post_attention_layernorm.weight',
+                'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
+                'self_attn.attn_sub_norm.weight', 'mlp.ffn_sub_norm.weight']
         elif not has_qk_norm:
             # Falcon3: remove q_norm/k_norm from per_layer
             per_layer = [n for n in per_layer if 'q_norm' not in n and 'k_norm' not in n]

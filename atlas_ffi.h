@@ -187,6 +187,8 @@ ATLAS_API void atlas_set_num_threads(void* model, int n);
 ATLAS_API void atlas_set_use_hybrid_matmul(void* model, int val);
 
 // v2.4.0: Set YaRN NTK RoPE scaling factor (1.0 = off, 4.0 = Bonsai-4B).
+ATLAS_API void atlas_set_rope_interleaved(void* model, int enable);
+ATLAS_API void atlas_set_rope_theta(void* model, float theta);
 ATLAS_API void atlas_set_rope_scale(void* model, float scale);
 
 // v2.5.0: Set base sequence length for NTK context extension.

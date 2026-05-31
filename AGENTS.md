@@ -107,14 +107,24 @@ void atlas_set_num_threads(int n);
 void atlas_set_use_hybrid_matmul(void* model, int enable);
 void atlas_set_use_packed_matmul(void* model, int enable);
 void atlas_set_use_f32_matmul(void* model, int enable);
-void atlas_set_base_seq_len(void* model, int seq_len);  // v2.5.0: NTK context base
+void atlas_set_base_seq_len(void* model, int seq_len);   // v2.5.0: NTK context base
 void atlas_reset_cache(void* model);                     // v2.6.0: Zero KV cache
+void atlas_set_rope_interleaved(void* model, int enable);// v2.9.2: Toggle interleaved/half-split RoPE
+void atlas_set_rope_theta(void* model, float theta);     // v2.9.2: Override RoPE theta frequency
 const char* atlas_get_tokenizer(void* model, int* size);
 ```
 
 See `atlas_ffi.h` for full API.
 
 ## Roadmap
+
+### v2.9.2 ✅ — Mock-CI-Regressions-Suite (ABGESCHLOSSEN)
+- **3 Bugs gekillt**: ttype=1 data_size heuristic, ensure_buffers Q-buffer overflow (`inter_dim`→`max_dim`), `_cache_indices` BitNet stride (full per_layer rewrite).
+- **EOS-Fix aus tokenizer**: `eos_id` von `m->tok.special[0]` statt `header_guess(11)`. TriLM 1.5B jetzt korrektes EOS.
+- **2 neue C-APIs**: `atlas_set_rope_interleaved`, `atlas_set_rope_theta`.
+- **`tests/atlas_mock_model.py`**: Synthetische v8.8-Modelle (200-300 KB) mit echtem TQ1-Packing für 3 Architekturen. `pack_tq1_g128` aus Produktions-Packer.
+- **`tests/test_mock_model.py`**: 9 parametrisierte pytest-Tests (load/forward/batch × Falcon3/Qwen3/BitNet) in 1.14s.
+- **Regression**: Falcon3-3B "Paris" ✓, Bonsai-8B "Paris" ✓, TriLM-1.5B coherent ✓.
 
 ### v2.8.0 ✅ — Load-Time int4 FFN Quantization (ABGESCHLOSSEN)
 - **New AVX2 kernel `atlas_matmul_i4_f32`**: Nibble-unpack + `(nibble^8)-8` sign-extension + `vpmaddubsw` — 64 elements per iteration.
@@ -156,6 +166,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.9.2** | **Mock-CI-Infrastruktur + Bugfixes**: 3 Bugs gekillt (ttype=1 data_size heuristic, ensure_buffers Q-buffer overflow, _cache_indices BitNet stride). 2 neue C-APIs (atlas_set_rope_interleaved, atlas_set_rope_theta). `tests/atlas_mock_model.py` generiert synthetische v8-Modelle (200-300 KB) für 3 Architekturen (Falcon3/Qwen3/BitNet) mit echtem TQ1-Packing. `tests/test_mock_model.py`: 9 parametrisierte pytest-Tests (load/forward/batch) in 1.14s. EOS-fix aus tokenizer special[0] statt header-guess. Regression: Falcon3-3B/Bonsai-8B/TriLM-1.5B — 3/3 pass. |
 | **v2.9.1** | **Hardening-Release**: Windows UTF-8 argv über `CommandLineToArgvW`+`WideCharToMultiByte` — Umlaute/Akzente korrekt. 6 Argument-Guards (NaN/Overflow/Sektor 2). CI/CD Smoke-Test (`tests/test_mock_model.py`). Proaktiver CPUID-AVX2-Check (`check_avx2()`) mit Fehlermeldung statt SIGILL. cross-platform release.yml mit shell32. |
 | **v2.9.0** | **Standalone C++ CLI** (`atlas_cli.cpp`): 575 Zeilen, `LoadLibrary`/`dlopen` dynamisches DLL-Binding, interaktiver `/reset`-Modus, Chat-Template-Detection (Falcon3/BitNet/Qwen3), vollständiges Arg-Parsing. `compile.bat` baut jetzt `atlas.dll` + `atlas.exe`. GitHub Auto-Release (`release.yml`) mit Windows/Linux Zip/Tar + LLVM-Runtime-DLLs. README komplett umgeschrieben — Community-Framing. |
 | **v2.8.0** | **Load-time int4 FFN quantization (18-26% faster)**: New `atlas_matmul_i4_f32` AVX2 kernel — nibble-unpack + sign-extension via `(nibble^8)-8` + `vpmaddubsw`. `atlas_quantize_ffn_to_i4()` converts int8→int4 at load time, halves FFN memory bandwidth. ttype=8 dispatch in `forward_layer_internal` with `use_f32_matmul` guard for hybrid safety. 7B: 2.5→3.15 tok/s (+26%), 10B: 1.9→2.25 tok/s (+18%). Lane-permute bug fixed: `_mm256_unpack*_epi8` per-128-bit-lane issue patched via `_mm256_permute2f128_si256`. |
@@ -201,8 +212,8 @@ See `atlas_ffi.h` for full API.
 - `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `compile.bat` — Windows Build-Script (DLL + optional CLI)
-- `tests/create_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests
-- `tests/test_mock_model.py` — CI Smoke-Test (Laden + Generate)
+- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (3 Architekturen, TQ1-Packing)
+- `tests/test_mock_model.py` — CI Smoke-Test (9 parametrisierte parametrisierte Tests, 1.14s)
 - `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
 - `.github/workflows/release.yml` — Auto-Release bei v*-Tag (Windows/Linux Zip/Tar)
 

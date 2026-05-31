@@ -225,6 +225,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
 | **v2.7.9** | BitNet fix: duplicate sub-norm collapse resolved. |
 | **v2.7.5** | ttype=5 decompress. Bonsai-8B: 0.2→1.8 tok/s. |

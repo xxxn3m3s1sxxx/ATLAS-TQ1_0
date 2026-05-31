@@ -440,9 +440,9 @@ struct AtlasModel {
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
         int max_aligned = ((max_dim + 7) + 31) & ~31;  // +7 for TQ1 padding (packed_cols*5 up to dim+4)
 
-        buf_gate = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
-        buf_up = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
-        buf_hidden = (float*)atlas_valloc((size_t)B * inter_dim * sizeof(float));
+        buf_gate = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
+        buf_up = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
+        buf_hidden = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         buf_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
         buf_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
         buf_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
@@ -512,9 +512,6 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
         m->model_arch = ARCH_QWEN3;
         m->layer_stride = 11;
     } else if (strcmp(arch, "bitnet") == 0) {
-        m->model_arch = ARCH_BITNET;
-        m->layer_stride = 11;
-    } else if (strcmp(arch, "trilm") == 0) {
         m->model_arch = ARCH_BITNET;
         m->layer_stride = 11;
     }
@@ -704,11 +701,13 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         }
         if (t.ttype == 0) {  // TQ1: 2-byte scale + packed data
             t.data_size = 2 + t.row_dim * t.packed_cols;
-        } else if (t.ttype == 1) {  // norm/embed: raw float16
-            if (t.row_dim == m->vocab_size) {
-                t.data_size = t.row_dim * m->hidden_dim * 2;
+        } else if (t.ttype == 1) {  // raw float16 — norm, embed, or fp16 weight
+            if (t.packed_cols > 1) {
+                t.data_size = (int64_t)t.row_dim * t.packed_cols * 2;
+            } else if (t.row_dim == m->vocab_size) {
+                t.data_size = (int64_t)t.row_dim * m->hidden_dim * 2;
             } else {
-                t.data_size = t.row_dim * 2;
+                t.data_size = (int64_t)t.row_dim * 2;
             }
             t.packed_cols = 0;
         } else if (t.ttype != 5 && t.ttype != 7) {  // lm_head / scales (not block-scaled TQ1)
@@ -794,6 +793,14 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
                 // Store merged_id as value (always >= base_vocab_size)
                 m->tok.merge_lookup[idx] = merged_id;
             }
+        }
+    }
+
+    // Read eos_id from binary tokenizer special tokens (reliable, not header-guess)
+    if (m->tok.special) {
+        uint32_t tok_eos = m->tok.special[0];
+        if (tok_eos != 0xFFFFFFFF) {
+            m->eos_id = (int)tok_eos;
         }
     }
 
@@ -2291,6 +2298,10 @@ ATLAS_API void atlas_set_rope_scale(AtlasModel* m, float scale) {
 // Auto-detected from model architecture during load, but user can override.
 ATLAS_API void atlas_set_rope_interleaved(AtlasModel* m, int enable) {
     if (m) m->rope_interleaved = (enable != 0);
+}
+
+ATLAS_API void atlas_set_rope_theta(AtlasModel* m, float theta) {
+    if (m) m->rope_theta = theta;
 }
 
 // ─── v2.4.0: Set layer stride (9 Falcon3, 11 Qwen3 with QK-Norm) ────
@@ -4088,17 +4099,17 @@ static void ensure_layer_idx(AtlasModel* m) {
             m->layer_idx_cache.push_back(find(buf));
         };
         if (model_arch == ARCH_BITNET) {
-            push("self_attn.attn_sub_norm.weight");
+            push("input_layernorm.weight");
             push("self_attn.q_proj.weight");
             push("self_attn.k_proj.weight");
             push("self_attn.v_proj.weight");
             push("self_attn.o_proj.weight");
-            push("self_attn.attn_out_norm.weight");
+            push("post_attention_layernorm.weight");
             push("mlp.gate_proj.weight");
             push("mlp.up_proj.weight");
             push("mlp.down_proj.weight");
+            push("self_attn.attn_sub_norm.weight");
             push("mlp.ffn_sub_norm.weight");
-            push("mlp.ffn_out_norm.weight");
         } else {
             push("input_layernorm.weight");
             push("self_attn.q_proj.weight");
