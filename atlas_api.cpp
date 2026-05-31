@@ -291,7 +291,7 @@ static inline uint16_t fp32_to_fp16(float v) {
 
 // ─── Tensor info ────────────────────────────────────────────────────────
 struct TensorInfo {
-    int ttype;          // 0=TQ1, 1=norm/embed, 2=other, 5=TQ1+per-block scales
+    int ttype;          // 0=TQ1, 1=norm/embed, 2=other, 5=TQ1+per-block scales, 10=TQ2 (universal)
     int row_dim;        // output rows (weight) or flat size (norm/embed)
     int packed_cols;    // packed bytes per row (0 for non-TQ1)
     uint32_t file_offset;
@@ -2878,6 +2878,238 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     }
 }
 
+// ─── TQ2: Universal block-scaled ternary matmul ─────────────────────
+// TQ2 header: [block_size:1][n_blocks:2][flags:1][scales:rows*n_blocks*2][packed_TQ1]
+// Uses symmetric s8 activation quant + on-the-fly TQ1 decode + sign_epi8 ternary.
+// P1: delegates to matmul_tq1_block_fused_s8 (ttype=5 kernel, skip flags byte).
+static void matmul_tq2(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32, float* output, int B) {
+    // flags byte at offset 3 — skip it so ttype=5 format aligns
+    const uint8_t* w5 = tensor_data + 1;
+    matmul_tq1_block_fused_s8(rows, input_dim, packed_cols,
+        w5, block_size, n_blocks, act_f32, output, B);
+}
+
+// ─── TQ1 encode: 5 ternary values → 1 byte (Base-3) ────────────────
+// Ternary values in {-1,0,1}, stored as int8.
+// Encoding: -1→0, 0→1, 1→2, then byte = t0 + t1*3 + t2*9 + t3*27 + t4*81
+static int tq1_encode_5(const int8_t v[5]) {
+    int b = 0, mul = 1;
+    for (int i = 0; i < 5; i++) {
+        b += (v[i] + 1) * mul;
+        mul *= 3;
+    }
+    if (b > 242) b = 242;  // 3^5 - 1 = 242, should never exceed
+    return b;
+}
+
+// ─── TQ2 Converter: int8 weights → block-scaled TQ2 format ────────
+// Takes int8 weight matrix [rows × input_dim] with per-tensor fp16 scale,
+// produces TQ2 packed buffer (caller must atlas_vfree).
+// Returns 0 on success, -1 on error.
+static int quantize_weights_to_tq2(
+    const int8_t* weights, float weight_scale,
+    int rows, int input_dim,
+    uint8_t** out_buf, int* out_size,
+    int block_size = 128) {
+
+    int n_blocks = (input_dim + block_size - 1) / block_size;
+    int packed_per_row = (input_dim + 4) / 5;  // ceil(input_dim / 5)
+    int hdr = 4;  // block_size + n_blocks + flags
+    int scales_size = rows * n_blocks * 2;
+    int packed_size = rows * packed_per_row;
+    int total = hdr + scales_size + packed_size;
+
+    uint8_t* buf = (uint8_t*)malloc(total);
+    if (!buf) return -1;
+
+    // Write header
+    buf[0] = (uint8_t)block_size;
+    buf[1] = (uint8_t)(n_blocks & 0xFF);
+    buf[2] = (uint8_t)((n_blocks >> 8) & 0xFF);
+    buf[3] = 0;  // flags: no bitmap
+
+    uint8_t* scales = buf + hdr;
+    uint8_t* packed = buf + hdr + scales_size;
+
+    for (int r = 0; r < rows; r++) {
+        const int8_t* row = weights + r * input_dim;
+
+        // Per-block scale: max(abs(weight)) for each block
+        int8_t ternary[128];  // block_size=128
+        int dc = 0;  // ternary index for this row
+
+        for (int blk = 0; blk < n_blocks; blk++) {
+            int blk_start = blk * block_size;
+            int blk_end = blk_start + block_size;
+            if (blk_end > input_dim) blk_end = input_dim;
+
+            float max_abs = 1e-10f;
+            int8_t blk_tern[128];
+            for (int c = blk_start; c < blk_end; c++) {
+                float v = (float)row[c] / weight_scale;
+                int t = (v >= 0) ? (int)(v + 0.5f) : (int)(v - 0.5f);
+                if (t < -1) t = -1;
+                if (t > 1) t = 1;
+                blk_tern[c - blk_start] = (int8_t)t;
+                if (t != 0) {
+                    float av = fabsf((float)t);
+                    if (av > max_abs) max_abs = av;
+                }
+            }
+
+            // Store fp16 scale (recomputed from actual ternary max)
+            int16_t scale_f16 = fp32_to_fp16(max_abs);
+            memcpy(scales + (r * n_blocks + blk) * 2, &scale_f16, 2);
+
+            // Copy block ternary values to row buffer
+            for (int c = 0; c < blk_end - blk_start; c++) {
+                ternary[dc++] = blk_tern[c];
+            }
+        }
+
+        // Pad to full blocks of 5
+        while (dc % 5 != 0) ternary[dc++] = 0;
+
+        // Pack 5 trits/byte
+        int n5 = dc / 5;
+        for (int g = 0; g < n5; g++) {
+            packed[r * packed_per_row + g] = (uint8_t)tq1_encode_5(ternary + g * 5);
+        }
+    }
+
+    *out_buf = buf;
+    *out_size = total;
+    return 0;
+}
+
+// ─── Load-time TQ2 conversion: scan tensors, convert old formats to ttype=10 ──
+// Converts ttype=0,3,5,7,8 to ttype=10 in-place. Leaves ttype=1,2 (norms/embeds).
+// Call after atlas_load(), before first inference.
+ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
+    AtlasModel* m = (AtlasModel*)model_ptr;
+    if (!m) return;
+    int total = 0;
+
+    for (size_t i = 0; i < m->tensors.size(); i++) {
+        auto& t = m->tensors[i];
+        if (t.ttype == 1 || t.ttype == 2) continue;  // norms/embeds — keep as fp16
+
+        if (t.ttype == 10) continue;  // already TQ2
+
+        if (t.ttype == 5 || t.ttype == 7) {
+            // Already block-scaled — just change ttype and add flags byte
+            // ttype=5: [block_size:1][n_blocks:2][scales:...][packed:...]
+            // ttype=7: [block_size:1][n_blocks:2][scales:...][packed:...]
+            // ttype=10: [block_size:1][n_blocks:2][flags:1][scales:...][packed:...]
+            // Insert flags byte at offset 3, shift data by 1
+            int new_size = t.data_size + 1;
+            uint8_t* new_data = (uint8_t*)malloc(new_size);
+            if (!new_data) continue;
+            memcpy(new_data, t.data, 3);              // block_size + n_blocks
+            new_data[3] = 0;                          // flags = 0
+            memcpy(new_data + 4, t.data + 3, t.data_size - 3);  // scales + packed
+            if (t.data && !m->is_mapped(t.data)) free(t.data);
+            t.data = new_data;
+            t.data_size = new_size;
+            t.ttype = 10;
+            total++;
+            continue;
+        }
+
+        // ttype=0: [fp16_scale:2][packed_TQ1:rows*packed_per_row]
+        // ttype=3: [fp16_scale:2][i8_weights:rows*cols][row_sums:rows*4]
+        // ttype=8: [fp16_scale:2][packed_i4:rows*packed_cols][row_sums:rows*4]
+        // Need to decompress → per-block scales → TQ1 repack
+
+        int rows = t.row_dim;
+        int cols = 0;
+        float scale = 0.0f;
+        const int8_t* i8_weights = nullptr;
+
+        if (t.ttype == 0) {
+            // TQ1 packed: decode to int8 first
+            init_tq1_decode_lut();
+            uint16_t s16; memcpy(&s16, t.data, 2);
+            scale = fp16_to_fp32(s16);
+            cols = t.packed_cols * 5;
+            int n_vals = rows * cols;
+            int8_t* i8 = (int8_t*)malloc(n_vals);
+            const uint8_t* packed = t.data + 2;
+            for (int r = 0; r < rows; r++) {
+                for (int c = 0; c < t.packed_cols; c++) {
+                    const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
+                    for (int t5 = 0; t5 < 5; t5++) {
+                        int col = c * 5 + t5;
+                        if (col < cols) i8[r * cols + col] = l[t5];
+                    }
+                }
+            }
+            i8_weights = i8;
+        } else if (t.ttype == 3) {
+            uint16_t s16; memcpy(&s16, t.data, 2);
+            scale = fp16_to_fp32(s16);
+            int rs_size = rows * 4;
+            cols = (t.data_size - 2 - rs_size) / rows;
+            i8_weights = (const int8_t*)(t.data + 2);
+        } else if (t.ttype == 8) {
+            // Int4 packed: decompress to int8
+            uint16_t s16; memcpy(&s16, t.data, 2);
+            scale = fp16_to_fp32(s16);
+            cols = t.packed_cols * 2;
+            int rs_size = rows * 4;
+            int n_vals = rows * cols;
+            int8_t* i8 = (int8_t*)malloc(n_vals);
+            const uint8_t* packed_i4 = t.data + 2;
+            for (int r = 0; r < rows; r++) {
+                for (int c = 0; c < t.packed_cols; c++) {
+                    int byte = packed_i4[r * t.packed_cols + c];
+                    int c2 = c * 2;
+                    if (c2 < cols) {
+                        int v0 = (int8_t)((byte & 0x0F) ^ 8) - 8;
+                        i8[r * cols + c2] = (int8_t)v0;
+                    }
+                    if (c2 + 1 < cols) {
+                        int v1 = (int8_t)(((byte >> 4) & 0x0F) ^ 8) - 8;
+                        i8[r * cols + c2 + 1] = (int8_t)v1;
+                    }
+                }
+            }
+            i8_weights = i8;
+        } else {
+            continue;  // unknown ttype, skip
+        }
+
+        if (!i8_weights || cols <= 0) continue;
+
+        uint8_t* tq2_buf = nullptr;
+        int tq2_size = 0;
+        t.block_size = 128;
+        t.n_blocks = (cols + 127) / 128;
+        int ret = quantize_weights_to_tq2(i8_weights, scale, rows, cols,
+                                          &tq2_buf, &tq2_size, 128);
+        if (ret == 0 && tq2_buf) {
+            if (t.data && !m->is_mapped(t.data)) {
+                if (t.ttype == 0 || t.ttype == 8) {
+                    free((void*)i8_weights);  // we allocated this
+                }
+                free(t.data);
+            }
+            t.data = tq2_buf;
+            t.data_size = tq2_size;
+            t.packed_cols = (cols + 4) / 5;
+            t.ttype = 10;
+            total++;
+        } else {
+            if (t.ttype == 0 || t.ttype == 8) free((void*)i8_weights);
+        }
+    }
+
+    if (total > 0)
+        printf("[ATLAS] Converted %d tensors to TQ2\n", total);
+}
+
 // ─── Helper: f32×i8 matmul + reorder (no activation quantization) ───
 // act_f32: [B, input_dim] float activations (not quantized)
 // weights: [rows, input_dim] int8 weights
@@ -3016,6 +3248,7 @@ static void forward_layer_internal(
 
     // ─── 2. QKV projections (int8) ───
     auto t3_dim = [](const TensorInfo& t) -> int {
+        if (t.ttype == 10 || t.ttype == 5) return t.packed_cols * 5;
         if (t.ttype == 3) return (int)((t.data_size - 2 - (int64_t)t.row_dim * 4) / t.row_dim);
         if (t.ttype == 7) return t.packed_cols * 4;
         if (t.ttype == 8) return t.packed_cols * 2;
@@ -3059,7 +3292,27 @@ static void forward_layer_internal(
     float* max_abs = (float*)alloca(B * sizeof(float));
 
     auto& tv = m->tensors[idx_v];
-    if (tq.ttype == 5) {
+    if (tq.ttype == 10) {
+        // TQ2 universal block-scaled ternary matmul
+        {
+            auto& t = m->tensors[idx_q];
+            matmul_tq2(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        }
+        {
+            auto& t = m->tensors[idx_k];
+            matmul_tq2(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_hidden, B);
+        }
+        {
+            auto& t = m->tensors[idx_v];
+            matmul_tq2(t.row_dim, max_qkv_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_up, B);
+        }
+    } else if (tq.ttype == 5) {
         // v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant
         {
             auto& t = m->tensors[idx_q];
@@ -3227,7 +3480,12 @@ static void forward_layer_internal(
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
-        if (to.ttype == 5) {
+        if (to.ttype == 10) {
+        auto& t = m->tensors[idx_o];
+        matmul_tq2(t.row_dim, qd, t.packed_cols,
+            t.data, t.block_size, t.n_blocks,
+            attn_out, m->buf_act, B);
+    } else if (to.ttype == 5) {
             for (int b = 0; b < B; b++) {
                 memcpy(m->buf_act + b * to.packed_cols * 5, attn_out + b * qd, qd * sizeof(float));
                 memset(m->buf_act + b * to.packed_cols * 5 + qd, 0,
@@ -3312,7 +3570,20 @@ static void forward_layer_internal(
         memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
     }
 
-    if (tg.ttype == 5) {
+    if (tg.ttype == 10) {
+        {
+            auto& t = m->tensors[idx_gate];
+            matmul_tq2(t.row_dim, ffn_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        }
+        {
+            auto& t = m->tensors[idx_up];
+            matmul_tq2(t.row_dim, ffn_dim, t.packed_cols,
+                t.data, t.block_size, t.n_blocks,
+                m->buf_act, m->buf_up, B);
+        }
+    } else if (tg.ttype == 5) {
         // v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant
         {
             auto& t = m->tensors[idx_gate];
@@ -3596,7 +3867,35 @@ static void forward_layer_internal(
     // ─── 8. Fused SiLU(gate)*up → down matmul with optional ffn_sub_norm ───
     {
         auto& td = m->tensors[idx_down];
-        if (td.ttype == 5) {
+        if (td.ttype == 10) {
+            int down_dim = td.packed_cols * 5;
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * down_dim;
+                for (int i = 0; i < inter; i++) {
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                }
+                for (int i = inter; i < down_dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * down_dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+            matmul_tq2(td.row_dim, down_dim, td.packed_cols,
+                td.data, td.block_size, td.n_blocks,
+                m->buf_act, m->buf_gate, B);
+        } else if (td.ttype == 5) {
             int down_dim = td.packed_cols * 5;
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;

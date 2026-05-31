@@ -36,6 +36,12 @@
 //       Layout: [block_size:1][n_blocks:2][scales:n_blocks*2 bytes fp16][packed_TQ1].
 //       Block size is always 128 (g128). Scales apply per 128-column group.
 //       Uses matmul_tq1_block_reorder (never decompressed to int8).
+//  10 = TQ2 universal block-scaled ternary (TurboQuant 2.0).
+//       Layout: [block_size:1][n_blocks:2][flags:1][scales:n_blocks*rows*2 fp16][packed_TQ1].
+//       flags: bit0=has_sparsity_bitmap, bit1-7 reserved.
+//       Block size default 128. Same TQ1 5-trit/byte Base-3 encoding as ttype=5.
+//       Uses matmul_tq2 (on-the-fly decode, no decompress buffer).
+//       Replaces ttype 0/3/5/7/8 — single universal weight format.
 //
 // All float16 values use IEEE 754 binary16.
 
@@ -207,6 +213,11 @@ ATLAS_API void atlas_ensure_layer_idx(void* model);
 
 // v1.3.2: Decompress only FFN tensors (gate/up/down) to int8, leave QKV packed.
 ATLAS_API void atlas_decompress_ffn(void* model);
+
+// v2.9.3: Convert all weight tensors to TQ2 (ttype=10) universal block-scaled format.
+// Call after atlas_load(), before first inference. Converts ttype 0/3/5/7/8 → 10.
+// Enables symmetric s8 activation quantization (no u8+128 offset, no f32 bypass).
+ATLAS_API void atlas_convert_to_tq2(void* model);
 
 // ─── Tensor access ────────────────────────────────────────────────────
 // Get tensor metadata: type, row_dim, col_dim (=packed_cols*5 for TQ1, 0 otherwise).

@@ -57,6 +57,9 @@ except AttributeError:
 dll.atlas_decompress_ffn.restype = None
 dll.atlas_decompress_ffn.argtypes = [ctypes.c_void_p]
 
+dll.atlas_convert_to_tq2.restype = None
+dll.atlas_convert_to_tq2.argtypes = [ctypes.c_void_p]
+
 try:
     dll.atlas_quantize_ffn_to_i4.restype = None
     dll.atlas_quantize_ffn_to_i4.argtypes = [ctypes.c_void_p]
@@ -476,6 +479,13 @@ class AtlasModel:
         dll.atlas_reset_cache(self.model_ptr)
         self._cached_input_ids = []
         self._cache_valid = False
+
+    def convert_to_tq2(self):
+        """v2.9.3: Convert all weight tensors to TQ2 (ttype=10) universal format.
+        Call after load, before first inference. Enables symmetric s8 activation
+        quantization — eliminates u8+128 offset and f32 bypass for SubLN models."""
+        dll.atlas_convert_to_tq2(self.model_ptr)
+        print("[ATLAS] All tensors converted to TQ2")
 
     def set_max_seq_len(self, seq_len):
         """v2.5.0: Set max sequence length (ring buffer window size).
