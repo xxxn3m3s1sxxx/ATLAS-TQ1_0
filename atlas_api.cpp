@@ -2853,7 +2853,16 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
             for (int sub = 0; sub < 4; sub++) {
                 const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
                 int8_t* row = decode_buf + sub * input_dim;
-                for (int c = 0; c < packed_cols; c++) {
+                int c = 0;
+                for (; c < packed_cols - 1; c++) {
+                    const int8_t* l = tq1_decode[w[c]];
+                    int col = c * 5;
+                    uint32_t v4 = (uint8_t)l[0] | ((uint32_t)(uint8_t)l[1] << 8) |
+                                  ((uint32_t)(uint8_t)l[2] << 16) | ((uint32_t)(uint8_t)l[3] << 24);
+                    memcpy(row + col, &v4, 4);
+                    row[col + 4] = l[4];
+                }
+                {
                     const int8_t* l = tq1_decode[w[c]];
                     int col = c * 5;
                     if (col < input_dim) row[col] = l[0];
@@ -2880,11 +2889,33 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
 
                         __m256i acc = _mm256_setzero_si256();
                         int j = blk_start;
+                        for (; j + 64 <= blk_end; j += 64) {
+                            __m256i av0 = _mm256_loadu_si256((const __m256i*)(act + j));
+                            __m256i wv0 = _mm256_loadu_si256((const __m256i*)(row + j));
+                            __m256i av1 = _mm256_loadu_si256((const __m256i*)(act + j + 32));
+                            __m256i wv1 = _mm256_loadu_si256((const __m256i*)(row + j + 32));
+                            __m256i prod0 = _mm256_sign_epi8(av0, wv0);
+                            __m256i prod1 = _mm256_sign_epi8(av1, wv1);
+                            __m128i lo0 = _mm256_castsi256_si128(prod0);
+                            __m128i hi0 = _mm256_extracti128_si256(prod0, 1);
+                            __m128i lo1 = _mm256_castsi256_si128(prod1);
+                            __m128i hi1 = _mm256_extracti128_si256(prod1, 1);
+                            __m256i lo16_0 = _mm256_cvtepi8_epi16(lo0);
+                            __m256i hi16_0 = _mm256_cvtepi8_epi16(hi0);
+                            __m256i lo16_1 = _mm256_cvtepi8_epi16(lo1);
+                            __m256i hi16_1 = _mm256_cvtepi8_epi16(hi1);
+                            __m256i sum32_0 = _mm256_add_epi32(
+                                _mm256_madd_epi16(lo16_0, _mm256_set1_epi16(1)),
+                                _mm256_madd_epi16(hi16_0, _mm256_set1_epi16(1)));
+                            __m256i sum32_1 = _mm256_add_epi32(
+                                _mm256_madd_epi16(lo16_1, _mm256_set1_epi16(1)),
+                                _mm256_madd_epi16(hi16_1, _mm256_set1_epi16(1)));
+                            acc = _mm256_add_epi32(acc, _mm256_add_epi32(sum32_0, sum32_1));
+                        }
                         for (; j + 32 <= blk_end; j += 32) {
                             __m256i av = _mm256_loadu_si256((const __m256i*)(act + j));
                             __m256i wv = _mm256_loadu_si256((const __m256i*)(row + j));
                             __m256i prod = _mm256_sign_epi8(av, wv);
-
                             __m128i lo = _mm256_castsi256_si128(prod);
                             __m128i hi = _mm256_extracti128_si256(prod, 1);
                             __m256i lo16 = _mm256_cvtepi8_epi16(lo);
