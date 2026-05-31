@@ -77,6 +77,17 @@ jobs:
           python -m pytest tests/test_dll.py -v
           python -m pytest tests/test_fixtures.py -v
 
+      - name: Coverage (Linux)
+        id: cov_linux
+        if: runner.os == 'Linux'
+        run: |
+          pip install --quiet gcovr
+          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas_cov.so atlas_api.cpp -lgomp --coverage
+          cp libatlas_cov.so libatlas.so
+          python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>/dev/null
+          python -m gcovr --html-details coverage.html --root . --filter "atlas_api\.cpp"
+          echo "done=true" >> $GITHUB_OUTPUT
+
       - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -88,6 +99,29 @@ jobs:
           python -m pytest tests/test_fixtures.py::test_golden_regression -v --no-header -q 2>$null
           $env:GENERATE_GOLDEN="0"
           python -m pytest tests/test_fixtures.py -v
+
+      - name: Coverage (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $llvmDir = "C:\Program Files\LLVM"
+          if (-not (Test-Path $llvmDir)) { throw "LLVM not found" }
+          pip install --quiet gcovr
+          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas_cov.dll atlas_api.cpp "$llvmDir\lib\libomp.lib" --coverage
+          Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
+          $env:KMP_DUPLICATE_LIB_OK="TRUE"
+          Move-Item atlas.dll atlas.dll.bak -Force
+          Move-Item atlas_cov.dll atlas.dll -Force
+          python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>$null
+          Move-Item atlas.dll.bak atlas.dll -Force
+          python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ runner.os }}
+          path: coverage.*
+          if-no-files-found: ignore
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:

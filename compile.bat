@@ -15,6 +15,7 @@ set CC=clang++
 
 if "%1"=="debug" goto build_debug
 if "%1"=="test" goto build_test
+if "%1"=="coverage" goto build_coverage
 
 :build_release
 echo [Atlas] Compiling atlas.dll (release)...
@@ -43,6 +44,38 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 echo [Atlas] OK -- atlas_d.dll built
+goto :eof
+
+:build_coverage
+echo [Atlas] Building coverage-instrumented DLL...
+%CC% -shared -o atlas_cov.dll atlas_api.cpp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp --coverage
+if %ERRORLEVEL% NEQ 0 (
+    echo [Atlas] FAILED -- coverage DLL build error
+    exit /b 1
+)
+echo [Atlas] OK -- atlas_cov.dll built
+REM Deploy coverage DLL, backup original
+if exist atlas.dll ( copy /Y atlas.dll atlas.dll.bak >nul )
+copy /Y atlas_cov.dll atlas.dll >nul
+echo [Atlas] Running tests with coverage instrumentation...
+python -m pytest tests/test_fixtures.py tests/test_mock_model.py -q --no-header 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    echo [Atlas] FAILED -- tests under coverage
+    if exist atlas.dll.bak ( copy /Y atlas.dll.bak atlas.dll >nul )
+    exit /b 1
+)
+echo [Atlas] Generating coverage report...
+python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp"
+if %ERRORLEVEL% NEQ 0 (
+    echo [Atlas] WARNING -- gcovr report generation failed
+) else (
+    echo [Atlas] OK -- coverage.html written
+)
+REM Restore original DLL
+if exist atlas.dll.bak (
+    copy /Y atlas.dll.bak atlas.dll >nul
+    del atlas.dll.bak
+)
 goto :eof
 
 :build_test

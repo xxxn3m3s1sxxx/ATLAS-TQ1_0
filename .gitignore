@@ -17,6 +17,9 @@ __pycache__/
 tmp/
 .opencode/
 hashline.py
+*.gcno
+*.gcda
+coverage.*
 opencode.json
 debug_*.py
 !tests/debug_run.py
