@@ -59,6 +59,44 @@ def test_turboquant_decompress():
     assert not np.any(np.isinf(logits))
 
 
+def test_sampling_coverage():
+    """Cover xoshiro RNG, gumbel_sample, top-k/top-p/argmax paths."""
+    path = os.path.join(MOCK_DIR, "ci-falcon3.atlas")
+    if not os.path.exists(path):
+        make(path, "falcon3", use_tq1=True)
+    m = AtlasModel(path)
+    V = m.vocab_size
+
+    logits = np.random.randn(max(V, 256)).astype(np.float32) * 0.1
+    logits_ptr = logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    out = ctypes.c_int()
+
+    # 1. Argmax path (T=0)
+    dll.atlas_set_seed(42)
+    dll.atlas_sample(m.model_ptr, logits_ptr, ctypes.byref(out), 0.0, 1, 0.0)
+    assert 0 <= out.value < V
+
+    # 2. Softmax+multinomial (T=0.7, top_k=40)
+    dll.atlas_set_seed(42)
+    dll.atlas_sample(m.model_ptr, logits_ptr, ctypes.byref(out), 0.7, 40, 0.0)
+    assert 0 <= out.value < V
+
+    # 3. Top-p probability path (T=0.7, top_k=40, top_p=0.5)
+    dll.atlas_set_seed(42)
+    dll.atlas_sample(m.model_ptr, logits_ptr, ctypes.byref(out), 0.7, 40, 0.5)
+    assert 0 <= out.value < V
+
+    # 4. No top-k filtering (top_k=0)
+    dll.atlas_set_seed(42)
+    dll.atlas_sample(m.model_ptr, logits_ptr, ctypes.byref(out), 0.7, 0, 0.0)
+    assert 0 <= out.value < V
+
+    # 5. Temperature scaling only (T=1.5)
+    dll.atlas_set_seed(42)
+    dll.atlas_sample(m.model_ptr, logits_ptr, ctypes.byref(out), 1.5, 256, 0.0)
+    assert 0 <= out.value < V
+
+
 @pytest.mark.parametrize("key", list(CORRIDORS.keys()))
 def test_corridor_load(key):
     """Load model with corridor dispatch config; verify post_init C API calls."""

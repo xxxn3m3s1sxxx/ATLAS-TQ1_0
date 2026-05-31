@@ -248,7 +248,7 @@ def _is_ffn(name):
     return any(x in name for x in ["gate_proj", "up_proj", "down_proj"])
 
 
-def make(output_path, arch_name, use_tq1=True, corridor=None):
+def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
     """Generate a synthetic ATLAS model file.
 
     Args:
@@ -259,6 +259,8 @@ def make(output_path, arch_name, use_tq1=True, corridor=None):
         corridor: Key into CORRIDORS dict. Overrides tensor types + meta flags.
     """
     cfg = dict(ARCHES[arch_name])
+    if head_dim is not None:
+        cfg["head_dim"] = head_dim
     core = dict(CORRIDORS[corridor]) if corridor else None
     n_layers = cfg["n_layers"]
     n_layers = cfg["n_layers"]

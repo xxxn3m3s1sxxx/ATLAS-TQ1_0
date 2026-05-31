@@ -14,6 +14,7 @@ on:
       - "scripts/*.py"
       - "tests/*.py"
       - "tests/*.json"
+      - "fuzz/*.atlas"
   pull_request:
     branches: [master]
     paths:
@@ -141,6 +142,39 @@ jobs:
           name: coverage-${{ runner.os }}
           path: coverage.*
           if-no-files-found: ignore
+
+  sanitizer-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install LLVM/Clang + OMP
+        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
+
+      - name: Build with ASan+UBSan
+        env:
+          CXXFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -fopenmp -O1 -g -mavx2 -mfma -mf16c -std=c++17 -fPIC"
+        run: clang++ $CXXFLAGS -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
+
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+
+      - name: Generate test fixtures
+        run: python tests/generate_test_fixtures.py tests/
+
+      - name: Run tests under ASan
+        env:
+          OMP_NUM_THREADS: "4"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+        run: |
+          python tests/ci_smoke.py
+          python -m pytest tests/test_dll.py -v
+          python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q
 
   # macOS only on release (free tier runner bottleneck)
   build-macos:

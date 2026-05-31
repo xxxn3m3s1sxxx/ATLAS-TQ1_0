@@ -61,7 +61,7 @@ REM Deploy coverage DLL, backup original
 if exist atlas.dll ( copy /Y atlas.dll atlas.dll.bak >nul )
 copy /Y atlas_cov.dll atlas.dll >nul
 echo [Atlas] Running tests with coverage instrumentation...
-python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header 2>nul
+python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -q --no-header 2>nul
 if %ERRORLEVEL% NEQ 0 (
     echo [Atlas] FAILED -- tests under coverage
     if exist atlas.dll.bak ( copy /Y atlas.dll.bak atlas.dll >nul )
