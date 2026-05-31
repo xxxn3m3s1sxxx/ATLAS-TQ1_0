@@ -170,7 +170,7 @@ jobs:
       - name: Run tests under ASan
         env:
           OMP_NUM_THREADS: "4"
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_stats=1"
         run: |
           ASAN_LIB=$(clang++ --print-file-name=libclang_rt.asan-x86_64.so)
           echo "ASan runtime: $ASAN_LIB"
