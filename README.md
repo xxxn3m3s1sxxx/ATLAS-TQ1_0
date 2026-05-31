@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.9.3**: AKI-Bug-Fix + CI-Hardening + Coverage-Gates. `scripts/verify_hf_alignment.py` validates 18 TQ1.0 models (16 PASS, 0 FAIL) against HF Hub without download. TriLM-3.9B mutation auto-detected. CI hardened with coverage gates.
+> ⚡ **v2.10.0 — ASan-Certified**: Alle ASan heap-bugs eliminiert (OOB-read, memcpy-overlap, allocator-mismatch). 70/70 Tests passed, CI grün auf Windows + Linux. Erster ASan-zertifizierter Release.
 
 ## Quickstart
 
@@ -238,6 +238,13 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 | `atlas_server.py` | SSE web server (FastAPI, `/v1/chat/completions`) |
 | `atlas_packer*.py` | Model converters (safetensors → .atlas) |
 | `compile.bat` | Windows build script |
+| `scripts/check_api_parity.py` | API parity scanner (C → Python) |
+| `scripts/check_coverage_thresholds.py` | Coverage gates in CI |
+| `tests/test_fuzz.py` | Fuzz tests (head_dim edge-cases) |
+| `tests/test_e2e_pipeline.py` | End-to-end pipeline tests |
+| `tests/test_omp_stress.py` | OMP stress tests |
+| `tests/test_bonsai8b_tq2.py` | Bonsai-8B TQ2 format tests |
+| `tests/generate_test_fixtures.py` | Test fixture generator |
 | `BUGS.md` | Known issues & limitations |
 | `.github/workflows/` | CI + auto-release pipelines |
 
@@ -245,6 +252,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.10.0** | **ASan-Certified**. 4 heap-bugs gefixt (OOB-read, memcpy-overlap, allocator-mismatch). 70/70 Tests, CI grün. Fuzz-Tests + OMP-Stress + E2E-Pipeline. API-Parity-Scanner + Coverage-Gates. |
 | **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
