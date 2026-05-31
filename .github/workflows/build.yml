@@ -100,11 +100,6 @@ jobs:
           cp libatlas_cov.so libatlas.so
           python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header
           python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
-          python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
-
-      - name: Check coverage thresholds (Linux)
-        if: runner.os == 'Linux'
-        run: |
           python -m gcovr --gcov-executable "$GCOV_TOOL" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python scripts/check_coverage_thresholds.py coverage_summary.json
 
@@ -136,11 +131,6 @@ jobs:
           python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header
           Move-Item atlas.dll.bak atlas.dll -Force
           python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
-
-      - name: Check coverage thresholds (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
           python -m gcovr --gcov-executable "llvm-cov gcov" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python scripts/check_coverage_thresholds.py coverage_summary.json
 
