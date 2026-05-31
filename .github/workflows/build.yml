@@ -7,8 +7,10 @@ on:
     paths:
       - "atlas_api.cpp"
       - "atlas_ffi.h"
+      - "atlas_infer.py"
       - "compile.bat"
       - ".github/workflows/build.yml"
+      - "scripts/*.py"
       - "tests/*.py"
       - "tests/*.json"
   pull_request:
@@ -37,6 +39,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Check API parity (C ⇄ Python)
+        run: python scripts/check_api_parity.py
 
       - name: Install LLVM/Clang
         if: runner.os == 'Linux'
@@ -92,6 +97,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install LLVM/Clang
         run: brew install llvm libomp
+      - name: Check API parity (C ⇄ Python)
+        run: python scripts/check_api_parity.py
       - name: Build
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)

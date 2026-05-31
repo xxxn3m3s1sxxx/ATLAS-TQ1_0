@@ -32,3 +32,4 @@ tests/mock.atlas
 mock/
 models/
 scripts/
+!scripts/check_api_parity.py
