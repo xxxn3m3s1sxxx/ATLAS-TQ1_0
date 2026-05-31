@@ -252,7 +252,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
-| **v2.10.0** | **i4 Cache + VNNI Int4 Kernel**. i4 Cache: persistenter Load-Time-Quant-Zustand (ttype=3+8) für 0-Click-Restart, invalidiert bei Atlas-Datei-Änderung. VNNI Int4 Kernel: nibble-unpack + `_mm512_dpbusd_epi32` (Clang 19+ Linux). Python i4 Cache Integration in `atlas_infer.py`. 70/70 Tests, CI grün. |
+| **v2.10.0** | **i4 Cache + VNNI Int4 Kernel**. i4 Cache: persistent load-time quantized state (ttype=3+8) for 0-click restart, invalidated on atlas file change. VNNI Int4 Kernel: nibble-unpack + `_mm512_dpbusd_epi32` (Clang 19+ Linux). Python i4 Cache integration in `atlas_infer.py`. 70/70 Tests, CI green. |
 | **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
