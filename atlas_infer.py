@@ -73,6 +73,14 @@ dll.atlas_save_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 dll.atlas_load_cache.restype = ctypes.c_int
 dll.atlas_load_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 
+# v2.10.0: i4 cache — fast reload, skip decompress + quantize
+_HAS_I4_CACHE = hasattr(dll, 'atlas_save_i4_cache')
+if _HAS_I4_CACHE:
+    dll.atlas_save_i4_cache.restype = None
+    dll.atlas_save_i4_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    dll.atlas_load_i4_cache.restype = ctypes.c_int
+    dll.atlas_load_i4_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
 dll.atlas_prefetch_int8.restype = None
 dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 
@@ -304,12 +312,16 @@ class AtlasModel:
             print("[Atlas] Using direct TQ1-packed matmul (no int8 decompression)")
         elif use_hybrid_matmul:
             # v1.3.2: FFN int8 cache, QKV packed — best speed/RAM balance
-            # For small models (1B, hidden<=2048) and block-scaled models (Bonsai),
-            # decompress ALL tensors for f32_bypass (avoids uint8+128 signal collapse)
+            # v2.10.0: Try i4 cache first — skip decompress+quantize on reload
             dll.atlas_set_use_hybrid_matmul(self.model_ptr, 1)
             is_bitnet = any('attn_sub_norm' in name for name in self.idx)
             needs_f32 = is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0
-            if needs_f32:
+            i4_loaded = 0
+            if _HAS_I4_CACHE and not needs_f32:
+                i4_loaded = dll.atlas_load_i4_cache(self.model_ptr, self._atlas_path.encode())
+            if i4_loaded:
+                print("[Atlas] i4 cache loaded — skip decompress + quantize")
+            elif needs_f32:
                 dll.atlas_decompress_all(self.model_ptr)
                 if _HAS_TTYPE5_DECOMPRESS:
                     dll.atlas_decompress_ttype5(self.model_ptr)
@@ -318,37 +330,49 @@ class AtlasModel:
             else:
                 dll.atlas_decompress_ffn(self.model_ptr)
                 print("[Atlas] Hybrid: FFN int8, QKV packed")
-            if _HAS_FFN_I4:
-                dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                if _HAS_FFN_I4:
+                    dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                if _HAS_I4_CACHE:
+                    dll.atlas_save_i4_cache(self.model_ptr, self._atlas_path.encode())
             dll.atlas_prefetch_int8(self.model_ptr)
         else:
-            # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
-            # Always decompress ttype=5 to int8 (no-op if none exist). Enables fast int8
-            # matmul + f32_bypass to avoid uint8+128 signal collapse on block-scaled models.
-            cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
-            if cache_loaded:
-                print("[Atlas] Loaded int8 weights from cache (mmap)")
+            # v2.10.0: Try i4 cache first (covers both int8 + int4 state)
+            i4_loaded = 0
+            if _HAS_I4_CACHE:
+                i4_loaded = dll.atlas_load_i4_cache(self.model_ptr, self._atlas_path.encode())
+            if i4_loaded:
+                print("[Atlas] i4 cache loaded — skip decompress + quantize")
             else:
+                # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
+                # Always decompress ttype=5 to int8 (no-op if none exist). Enables fast int8
+                # matmul + f32_bypass to avoid uint8+128 signal collapse on block-scaled models.
+                cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
+                if cache_loaded:
+                    print("[Atlas] Loaded int8 weights from cache (mmap)")
+                else:
+                    dll.atlas_decompress_all(self.model_ptr)
+                    if _HAS_TTYPE5_DECOMPRESS:
+                        dll.atlas_decompress_ttype5(self.model_ptr)
+                    if _HAS_TTYPE7_DECOMPRESS:
+                        dll.atlas_decompress_ttype7(self.model_ptr)
+                    dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
+                # Always decompress packed→int8 even on cache loads (FFN tensors not in cache)
                 dll.atlas_decompress_all(self.model_ptr)
                 if _HAS_TTYPE5_DECOMPRESS:
                     dll.atlas_decompress_ttype5(self.model_ptr)
                 if _HAS_TTYPE7_DECOMPRESS:
                     dll.atlas_decompress_ttype7(self.model_ptr)
-                dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
-            # Always decompress packed→int8 even on cache loads (FFN tensors not in cache)
-            dll.atlas_decompress_all(self.model_ptr)
-            if _HAS_TTYPE5_DECOMPRESS:
-                dll.atlas_decompress_ttype5(self.model_ptr)
-            if _HAS_TTYPE7_DECOMPRESS:
-                dll.atlas_decompress_ttype7(self.model_ptr)
-            # f32_bypass: for small, block-scaled, or BitNet models
-            # MUST be set before int4 conversion (guard checks use_f32_matmul)
-            is_bitnet = any('attn_sub_norm' in name for name in self.idx)
-            if is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
-                dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
-            # Convert FFN int8 to int4 (halves weight bandwidth). Skips if f32_bypass.
-            if _HAS_FFN_I4:
-                dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                # f32_bypass: for small, block-scaled, or BitNet models
+                # MUST be set before int4 conversion (guard checks use_f32_matmul)
+                is_bitnet = any('attn_sub_norm' in name for name in self.idx)
+                if is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
+                    dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
+                # Convert FFN int8 to int4 (halves weight bandwidth). Skips if f32_bypass.
+                if _HAS_FFN_I4:
+                    dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                # Save i4 cache for next reload
+                if _HAS_I4_CACHE:
+                    dll.atlas_save_i4_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)
 

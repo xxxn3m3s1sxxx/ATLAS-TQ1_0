@@ -219,6 +219,13 @@ ATLAS_API void atlas_decompress_ffn(void* model);
 // Enables symmetric s8 activation quantization (no u8+128 offset, no f32 bypass).
 ATLAS_API void atlas_convert_to_tq2(void* model);
 
+// v2.10.0: i4 cache — save/load decompressed+quantized state for fast reload.
+// Saves ttype=3 (int8) and ttype=8 (int4 packed) tensors to .i4 sidecar file.
+// On next load, atlas_load_i4_cache restores state directly, skipping
+// decompress_ffn + quantize_ffn_to_i4 entirely.
+ATLAS_API void atlas_save_i4_cache(void* model, const char* atlas_path);
+ATLAS_API int  atlas_load_i4_cache(void* model, const char* atlas_path);
+
 // ─── Tensor access ────────────────────────────────────────────────────
 // Get tensor metadata: type, row_dim, col_dim (=packed_cols*5 for TQ1, 0 otherwise).
 ATLAS_API void atlas_tensor_info(void* model, int idx, int* ttype,

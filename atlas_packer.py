@@ -267,6 +267,59 @@ def pack_tensor_row_wise(tensor):
 
     return packed.tobytes(), packed_per_row
 
+
+def pack_ffn_to_int4(tensor, scale_val):
+    """FFN uint8 [OUT/4, IN] → persistent int4 (ttype=8).
+    
+    Like pack_tensor_row_wise but packs 2 int8 values per byte (4-bit nibbles)
+    instead of 5 trits/byte TQ1. This matches the ttype=8 format expected
+    by atlas_matmul_i4_f32 with u8+128 activation quantization.
+    
+    Format: [fp16_scale:2][nibbles:OUT*packed_cols][row_sums:OUT*4]
+    packed_cols = (IN + 1) // 2
+    Each nibble stores int8 ∈ {-1,0,1} directly (clipped to [−8,7]).
+    """
+    arr = tensor.numpy()
+    u8_rows, in_cols = arr.shape
+    out_rows = u8_rows * 4
+    packed_cols = (in_cols + 1) // 2
+
+    # Unpack 4 ternary rows per uint8 byte, map {0,1,2}→{-1,0,+1}
+    packed = np.zeros(out_rows * packed_cols, dtype=np.uint8)
+    row_sums = np.zeros(out_rows, dtype=np.int32)
+
+    for ur in range(u8_rows):
+        row = arr[ur].astype(np.int32)
+        t0 = np.minimum(row & 3, 2)
+        t1 = np.minimum((row >> 2) & 3, 2)
+        t2 = np.minimum((row >> 4) & 3, 2)
+        t3 = np.minimum((row >> 6) & 3, 2)
+
+        for sub, src in enumerate([t0, t1, t2, t3]):
+            r = ur * 4 + sub
+            # Map: 0→-1, 1→0, 2→+1 (same as TQ1 decode)
+            tern = np.where(src == 0, -1, np.where(src == 2, 1, 0)).astype(np.int8)
+            row_sum = 0
+            for c in range(0, in_cols, 2):
+                v0 = int(tern[c]) & 0x0F
+                v1 = int(tern[c + 1]) & 0x0F if c + 1 < in_cols else 0
+                packed[r * packed_cols + c // 2] = np.uint8(v0 | (v1 << 4))
+                row_sum += int(tern[c])
+                if c + 1 < in_cols:
+                    row_sum += int(tern[c + 1])
+            row_sums[r] = row_sum
+
+    scale_bytes = struct.pack('<e', float(scale_val))
+    data = scale_bytes + packed.tobytes() + row_sums.tobytes()
+    return data, packed_cols
+
+
+def _is_ffn_tensor(name):
+    """Check if a tensor is an FFN weight (gate/down/up projection).
+    Matches the same patterns as quantize_ffn_to_i4() in C++.
+    """
+    return any(kw in name for kw in ('gate', 'down', 'up'))
+
 def create_atlas_from_config(safetensors_path, output_path):
     print(f"[ATLAS] Opening {safetensors_path}...")
     model_dir = os.path.dirname(safetensors_path)

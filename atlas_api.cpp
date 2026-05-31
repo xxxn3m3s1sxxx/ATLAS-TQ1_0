@@ -20,8 +20,14 @@
 #endif
 
 // VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
-extern "C" int atlas_matmul_block_vnni(const int8_t* act, const int8_t* row, int blk_end, int blk_start);
 extern "C" int atlas_vnni_available(void);
+extern "C" int atlas_matmul_block_vnni(const int8_t* act, const int8_t* row, int blk_end, int blk_start);
+extern "C" void atlas_matmul_i4_vnni(int rows, int cols,
+                                     const uint8_t* packed_weights,
+                                     const uint8_t* act_u8,
+                                     const int32_t* row_sums,
+                                     float* output,
+                                     int n_tokens);
 
 #ifdef _WIN32
   #define ATLAS_API __declspec(dllexport)
@@ -1389,6 +1395,253 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
     return replaced > 0 ? 1 : 0;
 }
 
+static void i4_cache_path(const char* atlas_path, char* out, int out_size) {
+    snprintf(out, out_size, "%s", atlas_path);
+    int len = (int)strlen(out);
+    const char* dot = strrchr(out, '.');
+    if (dot && STRICMP(dot, ".atlas") == 0) {
+        int prefix_len = (int)(dot - out);
+        out[prefix_len] = '.';
+        out[prefix_len+1] = 'i';
+        out[prefix_len+2] = '4';
+        out[prefix_len+3] = '\0';
+    } else {
+        strncat(out, ".i4", out_size - len - 1);
+    }
+}
+
+// ─── Save int4 (ttype=8) + int8 (ttype=3) tensors to .i4 cache ───────────
+// Saves the state after decompress_ffn + quantize_ffn_to_i4.
+// On next load, atlas_load_i4_cache restores this state directly —
+// skipping decompress + quantize entirely.
+ATLAS_API void atlas_save_i4_cache(AtlasModel* m, const char* atlas_path) {
+    char path[1024]; i4_cache_path(atlas_path, path, sizeof(path));
+
+    int n = (int)m->tensors.size();
+
+    // Get atlas file size to prevent stale cache loading
+    int64_t atlas_file_size = 0;
+#ifdef _WIN32
+    HANDLE hA = CreateFileA(atlas_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hA != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fs; if (GetFileSizeEx(hA, &fs)) atlas_file_size = fs.QuadPart;
+        CloseHandle(hA);
+    }
+#else
+    struct stat st;
+    if (stat(atlas_path, &st) == 0) atlas_file_size = (int64_t)st.st_size;
+#endif
+
+    // Compute total data size (ttype=3 or ttype=8 only)
+    int64_t total_data = 0;
+    for (int i = 0; i < n; i++) {
+        auto& t = m->tensors[i];
+        if ((t.ttype == 3 || t.ttype == 8) && t.data_size > 0 && t.data)
+            total_data += t.data_size;
+    }
+
+    int64_t header_size = 12 + (int64_t)n * 21;
+    int64_t cache_size = header_size + total_data;
+
+#ifdef _WIN32
+    char abs_path[MAX_PATH];
+    char root[4] = { 0 };
+    DWORD abs_len = GetFullPathNameA(path, MAX_PATH, abs_path, NULL);
+    if (abs_len >= 3 && abs_len < MAX_PATH) {
+        root[0] = abs_path[0]; root[1] = ':'; root[2] = '\\'; root[3] = 0;
+    }
+    ULARGE_INTEGER free_bytes;
+    if (root[0] && GetDiskFreeSpaceExA(root, &free_bytes, NULL, NULL)) {
+        if (cache_size > (int64_t)free_bytes.QuadPart) {
+            printf("[CACHE] i4: skip — need %.1f GB, only %.1f GB free on %s\n",
+                   cache_size / 1e9, (double)free_bytes.QuadPart / 1e9, root);
+            return;
+        }
+    }
+#endif
+
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[CACHE] i4: cannot write %s\n", path); return; }
+#ifdef _WIN32
+    setvbuf(f, NULL, _IONBF, 0);
+#endif
+
+    fwrite(&n, 4, 1, f);
+    fwrite(&atlas_file_size, 8, 1, f);
+
+    std::vector<int64_t> offsets(n, -1);
+    int64_t cur = 0;
+    for (int i = 0; i < n; i++) {
+        auto& t = m->tensors[i];
+        if ((t.ttype == 3 || t.ttype == 8) && t.data_size > 0 && t.data) {
+            offsets[i] = cur;
+            cur += t.data_size;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        uint8_t ttype = (uint8_t)m->tensors[i].ttype;
+        int row_dim = m->tensors[i].row_dim;
+        int pc = m->tensors[i].packed_cols;
+        int ds = m->tensors[i].data_size;
+        int64_t off = offsets[i] >= 0 ? offsets[i] : 0;
+        fwrite(&ttype, 1, 1, f);
+        fwrite(&row_dim, 4, 1, f);
+        fwrite(&pc, 4, 1, f);
+        fwrite(&ds, 4, 1, f);
+        fwrite(&off, 8, 1, f);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++) {
+        if (offsets[i] < 0) continue;
+        const uint8_t* ptr = m->tensors[i].data;
+        int remaining = m->tensors[i].data_size;
+        while (remaining > 0) {
+            size_t written = fwrite(ptr, 1, remaining, f);
+            if ((int)written <= 0) {
+                fprintf(stderr, "[CACHE] i4: tensor %d write failed\n", i);
+                ok = false; break;
+            }
+            ptr += written;
+            remaining -= (int)written;
+        }
+    }
+
+    fclose(f);
+
+    if (!ok) {
+        fprintf(stderr, "[CACHE] i4: write failed, deleting partial cache\n");
+        remove(path);
+    } else {
+        int n_saved = 0;
+        for (int i = 0; i < n; i++) if (offsets[i] >= 0) n_saved++;
+        printf("[CACHE] i4: saved %d/%d tensors (%.1f MB)\n", n_saved, n, cache_size / 1e6);
+    }
+}
+
+// ─── Load .i4 cache — restore int4 (ttype=8) + int8 (ttype=3) state ─────
+// Returns 1 if cache was loaded, 0 if not found or invalid.
+ATLAS_API int atlas_load_i4_cache(AtlasModel* m, const char* atlas_path) {
+    char path[1024]; i4_cache_path(atlas_path, path, sizeof(path));
+    uint8_t* base = nullptr;
+    void* hFile = nullptr;
+    void* hMap = nullptr;
+    size_t file_size = 0;
+
+#ifdef _WIN32
+    HANDLE hFileW = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFileW == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER fsize;
+    if (!GetFileSizeEx(hFileW, &fsize) || fsize.QuadPart < 4) {
+        CloseHandle(hFileW); return 0;
+    }
+    file_size = (size_t)fsize.QuadPart;
+    HANDLE hMapW = CreateFileMappingA(hFileW, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapW) { CloseHandle(hFileW); return 0; }
+    base = (uint8_t*)MapViewOfFile(hMapW, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { CloseHandle(hMapW); CloseHandle(hFileW); return 0; }
+    hFile = (void*)hFileW;
+    hMap = (void*)hMapW;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    off_t fsize = lseek(fd, 0, SEEK_END);
+    if (fsize <= 4) { close(fd); return 0; }
+    file_size = (size_t)fsize;
+    base = (uint8_t*)mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { close(fd); return 0; }
+    hFile = (void*)(intptr_t)fd;
+    hMap = (void*)(intptr_t)fsize;
+#endif
+
+    int n = *(int*)base;
+    int64_t current_atlas_size = 0;
+    {
+        if (file_size < 12) { goto fail; }
+        int64_t min_size = 12 + (int64_t)n * 21;
+        if (n != (int)m->tensors.size() || file_size < (size_t)min_size) { goto fail; }
+
+        int64_t cached_atlas_size;
+        memcpy(&cached_atlas_size, base + 4, 8);
+#ifdef _WIN32
+        HANDLE hA = CreateFileA(atlas_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hA != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER fs; if (GetFileSizeEx(hA, &fs)) current_atlas_size = fs.QuadPart;
+            CloseHandle(hA);
+        }
+#else
+        struct stat st;
+        if (stat(atlas_path, &st) == 0) current_atlas_size = (int64_t)st.st_size;
+#endif
+        if (cached_atlas_size != current_atlas_size || current_atlas_size == 0) {
+            printf("[CACHE] i4: atlas file size mismatch (%lld vs %lld), ignoring\n",
+                   (long long)cached_atlas_size, (long long)current_atlas_size);
+            goto fail;
+        }
+
+        uint8_t* hdr = base + 12;
+        int64_t data_start = min_size;
+        int replaced = 0;
+
+        for (int i = 0; i < n; i++) {
+            uint8_t* e = hdr + i * 21;
+            int cttype = (int)e[0];
+            int row_dim; memcpy(&row_dim, e+1, 4);
+            int cpc; memcpy(&cpc, e+5, 4);
+            int ds; memcpy(&ds, e+9, 4);
+            int64_t off; memcpy(&off, e+13, 8);
+
+            if ((cttype == 3 || cttype == 8) && ds > 0 && off >= 0) {
+                if ((size_t)(data_start + off + ds) > file_size) {
+                    printf("[CACHE] i4: truncated (tensor %d exceeds file), ignoring\n", i);
+                    goto fail;
+                }
+            }
+
+            auto& t = m->tensors[i];
+            int model_ttype = t.ttype;
+            bool can_replace = (model_ttype == 0 && (cttype == 3 || cttype == 8))
+                            || (model_ttype == 5 && cttype == 3)
+                            || (model_ttype == 7 && cttype == 3);
+            if (can_replace && ds > 0 && off >= 0) {
+                if (t.row_dim != row_dim || t.packed_cols != cpc) {
+                    printf("[CACHE] i4: tensor %d shape mismatch (model: %dx%d, cache: %dx%d), ignoring\n",
+                           i, t.row_dim, t.packed_cols, row_dim, cpc);
+                    goto fail;
+                }
+                if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+                t.ttype = cttype;
+                t.data_size = ds;
+                t.data = (uint8_t*)(base + data_start + off);
+                replaced++;
+            }
+        }
+
+        m->mmap_base = base;
+        m->mmap_handle = hMap;
+        m->mmap_file = hFile;
+        m->mmap_size = file_size;
+
+        printf("[CACHE] i4: loaded %d/%d tensors\n", replaced, n);
+        return replaced > 0 ? 1 : 0;
+    }
+
+fail:
+#ifdef _WIN32
+    if (base) UnmapViewOfFile(base);
+    if (hMap) CloseHandle((HANDLE)hMap);
+    if (hFile) CloseHandle((HANDLE)hFile);
+#else
+    if (base) munmap(base, file_size);
+    if (hFile) close((int)(intptr_t)hFile);
+#endif
+    return 0;
+}
+
 // ─── Decompress all TQ1 tensors to int8 in-place ──────────────────────
 // Handles ttype=0 (raw ternary) only.
 // ttype=5 (block-scaled) stays packed — fused kernel preserves per-block scales.
@@ -1913,6 +2166,12 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
                                     const int32_t* __restrict__ row_sums,
                                     float* __restrict__ output,
                                     int n_tokens) {
+    // v2.10.0: VNNI fast path — skips AVX2 nibble-unpack + vpmaddubsw chain
+    if (atlas_vnni_available()) {
+        atlas_matmul_i4_vnni(rows, cols, packed_weights, act_u8, row_sums, output, n_tokens);
+        return;
+    }
+
     // Sign-extension for 4-bit nibble: freq = (nibble ^ 8) - 8
     // Maps 0..15 → -8..+7 with signed overflow for val >= 8
     // __m256i version: _mm256_sub_epi8(_mm256_xor_si256(v, c8), c8)
