@@ -6,6 +6,7 @@ on:
     branches: [master]
     paths:
       - "atlas_api.cpp"
+      - "atlas_vnni.cpp"
       - "atlas_ffi.h"
       - "atlas_infer.py"
       - "compile.bat"
@@ -52,7 +53,7 @@ jobs:
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
-        run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
+        run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -60,7 +61,7 @@ jobs:
         run: |
           $llvmDir = "C:\Program Files\LLVM"
           if (-not (Test-Path $llvmDir)) { throw "LLVM not found at $llvmDir" }
-          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp "$llvmDir\lib\libomp.lib"
+          clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp atlas_vnni.cpp "$llvmDir\lib\libomp.lib"
           if ($LASTEXITCODE -ne 0) { throw "Build failed" }
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
           Write-Output "=== Copied $(@(Get-ChildItem *.dll).Count) DLLs ==="
@@ -96,7 +97,7 @@ jobs:
             apt-get install -y -qq llvm 2>/dev/null && GCOV_TOOL="llvm-cov gcov"
           fi
           echo "Using GCOV tool: $GCOV_TOOL"
-          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas_cov.so atlas_api.cpp -lgomp --coverage
+          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas_cov.so atlas_api.cpp atlas_vnni.cpp -lgomp --coverage
           cp libatlas_cov.so libatlas.so
           python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py -q --no-header
           python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
@@ -123,7 +124,7 @@ jobs:
           if (-not (Test-Path $llvmDir)) { throw "LLVM not found" }
           pip install --quiet gcovr
           Remove-Item -Force -Path *.gcda, *.gcno -ErrorAction SilentlyContinue
-          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas_cov.dll atlas_api.cpp "$llvmDir\lib\libomp.lib" --coverage
+          clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas_cov.dll atlas_api.cpp atlas_vnni.cpp "$llvmDir\lib\libomp.lib" --coverage
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
           $env:KMP_DUPLICATE_LIB_OK="TRUE"
           Move-Item atlas.dll atlas.dll.bak -Force
@@ -154,7 +155,7 @@ jobs:
       - name: Build
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
-          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -L$LLVM_PREFIX/lib -lomp
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -L$LLVM_PREFIX/lib -lomp
           echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
       - name: Install test deps
         run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn

@@ -19,6 +19,10 @@
   #define ATLAS_LOG(fmt, ...) do {} while (0)
 #endif
 
+// VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
+extern "C" int atlas_matmul_block_vnni(const int8_t* act, const int8_t* row, int blk_end, int blk_start);
+extern "C" int atlas_vnni_available(void);
+
 #ifdef _WIN32
   #define ATLAS_API __declspec(dllexport)
   #include <malloc.h>
@@ -93,6 +97,28 @@ static int check_avx2(void) {
     unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
         return (ebx >> 5) & 1;
+    return 0;
+}
+#endif
+
+#ifdef _WIN32
+static int check_avx512_vnni(void) {
+    int info[4] = {0};
+    __cpuidex(info, 7, 0);
+    int has_avx512f = (info[1] >> 16) & 1;
+    int has_avx512bw = (info[1] >> 30) & 1;
+    int has_avx512vnni = (info[2] >> 11) & 1;
+    return has_avx512f && has_avx512bw && has_avx512vnni && atlas_vnni_available();
+}
+#else
+static int check_avx512_vnni(void) {
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        int has_avx512f = (ebx >> 16) & 1;
+        int has_avx512bw = (ebx >> 30) & 1;
+        int has_avx512vnni = (ecx >> 11) & 1;
+        return has_avx512f && has_avx512bw && has_avx512vnni && atlas_vnni_available();
+    }
     return 0;
 }
 #endif
@@ -2738,6 +2764,9 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
     free(block_scales);
 }
 
+// VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
+static int g_has_avx512_vnni = -1;
+
 // ─── v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant ───
 // act_f32: [B, input_dim] raw float activations (no pre-quantization needed)
 // tensor_data: ttype=5 TQ1-packed weights + per-row per-block fp16 scales
@@ -2793,6 +2822,11 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
         tl_scale_x_cap = B;
     }
     float* scale_x = tl_scale_x;
+
+    // Initialize VNNI flag before OMP region (single-threaded)
+    if (g_has_avx512_vnni < 0) {
+        g_has_avx512_vnni = check_avx512_vnni() ? 1 : 0;
+    }
 
     // Step 2: TQ1 decode + ternary matmul via _mm256_sign_epi8
     // Scale decode (fp16→fp32) integrated into parallel region
@@ -2887,53 +2921,58 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
                         int blk_end = blk_start + block_size;
                         if (blk_end > input_dim) blk_end = input_dim;
 
-                        __m256i acc = _mm256_setzero_si256();
+                        int32_t dot = 0;
                         int j = blk_start;
-                        for (; j + 64 <= blk_end; j += 64) {
-                            __m256i av0 = _mm256_loadu_si256((const __m256i*)(act + j));
-                            __m256i wv0 = _mm256_loadu_si256((const __m256i*)(row + j));
-                            __m256i av1 = _mm256_loadu_si256((const __m256i*)(act + j + 32));
-                            __m256i wv1 = _mm256_loadu_si256((const __m256i*)(row + j + 32));
-                            __m256i prod0 = _mm256_sign_epi8(av0, wv0);
-                            __m256i prod1 = _mm256_sign_epi8(av1, wv1);
-                            __m128i lo0 = _mm256_castsi256_si128(prod0);
-                            __m128i hi0 = _mm256_extracti128_si256(prod0, 1);
-                            __m128i lo1 = _mm256_castsi256_si128(prod1);
-                            __m128i hi1 = _mm256_extracti128_si256(prod1, 1);
-                            __m256i lo16_0 = _mm256_cvtepi8_epi16(lo0);
-                            __m256i hi16_0 = _mm256_cvtepi8_epi16(hi0);
-                            __m256i lo16_1 = _mm256_cvtepi8_epi16(lo1);
-                            __m256i hi16_1 = _mm256_cvtepi8_epi16(hi1);
-                            __m256i sum32_0 = _mm256_add_epi32(
-                                _mm256_madd_epi16(lo16_0, _mm256_set1_epi16(1)),
-                                _mm256_madd_epi16(hi16_0, _mm256_set1_epi16(1)));
-                            __m256i sum32_1 = _mm256_add_epi32(
-                                _mm256_madd_epi16(lo16_1, _mm256_set1_epi16(1)),
-                                _mm256_madd_epi16(hi16_1, _mm256_set1_epi16(1)));
-                            acc = _mm256_add_epi32(acc, _mm256_add_epi32(sum32_0, sum32_1));
-                        }
-                        for (; j + 32 <= blk_end; j += 32) {
-                            __m256i av = _mm256_loadu_si256((const __m256i*)(act + j));
-                            __m256i wv = _mm256_loadu_si256((const __m256i*)(row + j));
-                            __m256i prod = _mm256_sign_epi8(av, wv);
-                            __m128i lo = _mm256_castsi256_si128(prod);
-                            __m128i hi = _mm256_extracti128_si256(prod, 1);
-                            __m256i lo16 = _mm256_cvtepi8_epi16(lo);
-                            __m256i hi16 = _mm256_cvtepi8_epi16(hi);
-                            __m256i sum32 = _mm256_add_epi32(
-                                _mm256_madd_epi16(lo16, _mm256_set1_epi16(1)),
-                                _mm256_madd_epi16(hi16, _mm256_set1_epi16(1)));
-                            acc = _mm256_add_epi32(acc, sum32);
-                        }
-
-                        int32_t dot;
-                        {
-                            __m128i l = _mm256_castsi256_si128(acc);
-                            __m128i h = _mm256_extracti128_si256(acc, 1);
-                            l = _mm_add_epi32(l, h);
-                            l = _mm_hadd_epi32(l, l);
-                            l = _mm_hadd_epi32(l, l);
-                            dot = _mm_cvtsi128_si32(l);
+                        if (g_has_avx512_vnni) {
+                            for (; j + 64 <= blk_end; j += 64) {
+                                dot += atlas_matmul_block_vnni(act, row, j + 64, j);
+                            }
+                        } else {
+                            __m256i acc_v = _mm256_setzero_si256();
+                            for (; j + 64 <= blk_end; j += 64) {
+                                __m256i av0 = _mm256_loadu_si256((const __m256i*)(act + j));
+                                __m256i wv0 = _mm256_loadu_si256((const __m256i*)(row + j));
+                                __m256i av1 = _mm256_loadu_si256((const __m256i*)(act + j + 32));
+                                __m256i wv1 = _mm256_loadu_si256((const __m256i*)(row + j + 32));
+                                __m256i prod0 = _mm256_sign_epi8(av0, wv0);
+                                __m256i prod1 = _mm256_sign_epi8(av1, wv1);
+                                __m128i lo0 = _mm256_castsi256_si128(prod0);
+                                __m128i hi0 = _mm256_extracti128_si256(prod0, 1);
+                                __m128i lo1 = _mm256_castsi256_si128(prod1);
+                                __m128i hi1 = _mm256_extracti128_si256(prod1, 1);
+                                __m256i lo16_0 = _mm256_cvtepi8_epi16(lo0);
+                                __m256i hi16_0 = _mm256_cvtepi8_epi16(hi0);
+                                __m256i lo16_1 = _mm256_cvtepi8_epi16(lo1);
+                                __m256i hi16_1 = _mm256_cvtepi8_epi16(hi1);
+                                __m256i sum32_0 = _mm256_add_epi32(
+                                    _mm256_madd_epi16(lo16_0, _mm256_set1_epi16(1)),
+                                    _mm256_madd_epi16(hi16_0, _mm256_set1_epi16(1)));
+                                __m256i sum32_1 = _mm256_add_epi32(
+                                    _mm256_madd_epi16(lo16_1, _mm256_set1_epi16(1)),
+                                    _mm256_madd_epi16(hi16_1, _mm256_set1_epi16(1)));
+                                acc_v = _mm256_add_epi32(acc_v, _mm256_add_epi32(sum32_0, sum32_1));
+                            }
+                            for (; j + 32 <= blk_end; j += 32) {
+                                __m256i av = _mm256_loadu_si256((const __m256i*)(act + j));
+                                __m256i wv = _mm256_loadu_si256((const __m256i*)(row + j));
+                                __m256i prod = _mm256_sign_epi8(av, wv);
+                                __m128i lo = _mm256_castsi256_si128(prod);
+                                __m128i hi = _mm256_extracti128_si256(prod, 1);
+                                __m256i lo16 = _mm256_cvtepi8_epi16(lo);
+                                __m256i hi16 = _mm256_cvtepi8_epi16(hi);
+                                __m256i sum32 = _mm256_add_epi32(
+                                    _mm256_madd_epi16(lo16, _mm256_set1_epi16(1)),
+                                    _mm256_madd_epi16(hi16, _mm256_set1_epi16(1)));
+                                acc_v = _mm256_add_epi32(acc_v, sum32);
+                            }
+                            {
+                                __m128i l = _mm256_castsi256_si128(acc_v);
+                                __m128i h = _mm256_extracti128_si256(acc_v, 1);
+                                l = _mm_add_epi32(l, h);
+                                l = _mm_hadd_epi32(l, l);
+                                l = _mm_hadd_epi32(l, l);
+                                dot = _mm_cvtsi128_si32(l);
+                            }
                         }
                         for (; j < blk_end; j++) {
                             dot += (int32_t)act[j] * (int32_t)row[j];

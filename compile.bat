@@ -19,7 +19,7 @@ if "%1"=="coverage" goto build_coverage
 
 :build_release
 echo [Atlas] Compiling atlas.dll (release)...
-%CC% -shared -o atlas.dll atlas_api.cpp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp
+%CC% -shared -o atlas.dll atlas_api.cpp atlas_vnni.cpp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp
 if %ERRORLEVEL% NEQ 0 (
     echo [Atlas] FAILED -- DLL build error
     exit /b 1
@@ -38,7 +38,7 @@ goto :eof
 
 :build_debug
 echo [Atlas] Compiling atlas_d.dll (debug)...
-%CC% -shared -o atlas_d.dll atlas_api.cpp -DATLAS_DEBUG_MODE -O0 -g -mavx2 -mfma -mf16c -std=c++17 -fopenmp
+%CC% -shared -o atlas_d.dll atlas_api.cpp atlas_vnni.cpp -DATLAS_DEBUG_MODE -O0 -g -mavx2 -mfma -mf16c -std=c++17 -fopenmp
 if %ERRORLEVEL% NEQ 0 (
     echo [Atlas] FAILED -- Debug DLL build error
     exit /b 1
@@ -51,7 +51,7 @@ echo [Atlas] Cleaning stale coverage data...
 if exist *.gcda del /Q *.gcda
 if exist *.gcno del /Q *.gcno
 echo [Atlas] Building coverage-instrumented DLL...
-%CC% -shared -o atlas_cov.dll atlas_api.cpp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp --coverage
+%CC% -shared -o atlas_cov.dll atlas_api.cpp atlas_vnni.cpp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fopenmp --coverage
 if %ERRORLEVEL% NEQ 0 (
     echo [Atlas] FAILED -- coverage DLL build error
     exit /b 1
