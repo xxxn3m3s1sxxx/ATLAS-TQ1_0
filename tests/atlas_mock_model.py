@@ -72,6 +72,25 @@ ARCHES = {
             "mlp.ffn_sub_norm.weight",
         ],
     ),
+    "falcon3-ttype0": dict(
+        n_layers=2, hidden=128, inter=512,
+        n_heads=4, n_kv_heads=2, head_dim=256,
+        vocab=256, rope_theta=1000042.0,
+        rope_interleaved=True, stride=9,
+        use_tq1="ttype0",
+        arch="falcon3",
+        layer_tensors=[
+            "input_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ],
+    ),
     "turboquant": dict(
         n_layers=2, hidden=256, inter=1024,
         n_heads=4, n_kv_heads=2, head_dim=128,
@@ -241,6 +260,31 @@ def pack_turboquant(weights_fp16, block_size=32):
     return header + out.tobytes(), packed_per_row, n_blocks, block_size
 
 
+def pack_tq1_per_tensor(weights_fp16):
+    """TQ1 per-tensor packed (ttype=0, Falcon3 I2_S style).
+
+    Stores fp16 scale + Base-3 packed ternary values.
+    Returns (data_bytes, packed_per_row).
+    """
+    w = weights_fp16.astype(np.float32)
+    nrows, ncols = w.shape
+    scale = max(np.abs(w).max(), 1e-10)
+    ternary = np.clip(np.round(w / scale).astype(np.int32), -1, 1).astype(np.int8)
+    packed_per_row = (ncols + 4) // 5
+    full_len = packed_per_row * 5
+    out = np.empty(nrows * packed_per_row, dtype=np.uint8)
+    for r in range(nrows):
+        row = (ternary[r, :].astype(np.int32) + 1)  # -1→0, 0→1, 1→2
+        if ncols < full_len:
+            row = np.pad(row, (0, full_len - ncols), constant_values=1)
+        t5 = row[:full_len].reshape(packed_per_row, 5)
+        out[r * packed_per_row: (r + 1) * packed_per_row] = (
+            (t5 * TQ1_MUL).sum(axis=1).astype(np.uint8)
+        )
+    header = struct.pack("<e", float(scale))
+    return header + out.tobytes(), packed_per_row
+
+
 def _is_qkv(name):
     return any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj"])
 
@@ -304,6 +348,13 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
             elif _is_ffn(name):
                 data = rng.randn(*shape).astype(np.float32) * 0.1
                 tensor_entries.append((name, data, 3))
+            else:
+                data = rng.randn(*shape).astype(np.float32) * 0.1
+                tensor_entries.append((name, data, 1))
+        elif use_tq1 == "ttype0":
+            if "proj" in name:
+                data = rng.randn(*shape).astype(np.float32) * 0.1
+                tensor_entries.append((name, data, 0))
             else:
                 data = rng.randn(*shape).astype(np.float32) * 0.1
                 tensor_entries.append((name, data, 1))
@@ -375,7 +426,10 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
 
             row_dim = data_f32.shape[0]
 
-            if ttype == 5:
+            if ttype == 0:
+                packed, ppr = pack_tq1_per_tensor(data_f32)
+                tens_ttype = 0
+            elif ttype == 5:
                 packed, ppr, nb, bs = pack_tq1_g128(data_f32)
                 tens_ttype = 5
             elif ttype == 7:

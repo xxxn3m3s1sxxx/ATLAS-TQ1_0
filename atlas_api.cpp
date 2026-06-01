@@ -3480,9 +3480,23 @@ ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
         int tq2_size = 0;
         t.block_size = 128;
         t.n_blocks = (cols + 127) / 128;
-        int ret = quantize_weights_to_tq2(i8_weights, scale, rows, cols,
+        // ttype=0 int8 values are already ternary {-1,0,+1}. Don't divide:
+        // pass scale=1.0, then multiply block scales by original weight_scale.
+        float tq2_scale = (t.ttype == 0) ? 1.0f : scale;
+        int ret = quantize_weights_to_tq2(i8_weights, tq2_scale, rows, cols,
                                           &tq2_buf, &tq2_size, 128);
         if (ret == 0 && tq2_buf) {
+            // For already-ternary weights, restore the original weight_scale
+            // into per-block fp16 scales.
+            if (t.ttype == 0 && scale > 0.0f) {
+                int nb = t.n_blocks;
+                uint16_t* sptr = (uint16_t*)(tq2_buf + 4);
+                for (int j = 0; j < rows * nb; j++) {
+                    float sf = fp16_to_fp32(sptr[j]) * scale;
+                    if (sf < 1e-10f) sf = 1e-10f;
+                    sptr[j] = fp32_to_fp16(sf);
+                }
+            }
             if (t.data && !m->is_mapped(t.data)) {
                 if (t.ttype == 0 || t.ttype == 8) {
                     free((void*)i8_weights);  // we allocated this

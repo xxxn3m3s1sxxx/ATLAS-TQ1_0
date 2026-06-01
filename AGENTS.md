@@ -138,6 +138,15 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
+### v2.10.0 ✅ — Unified Packer + BF16 Weight-Scale Fix (ABGESCHLOSSEN)
+- **Unified `pack_to_atlas.py`**: Single packer replaces all individual packers (`atlas_packer.py`, `atlas_packer_g128.py`, `atlas_packer_bitnet.py`). Architecture auto-detection via `config.json`. Single pipeline for Falcon3/Qwen3/BitNet/TriLM/Llama.
+- **BF16 weight_scale Fix**: `weight_scale`-Tensoren sind bfloat16 dtype → `get_tensor_np()` mit `framework="np"` wirft Exception → `scales.get(sname, 1.0)` liefert immer 1.0. Fix: Fallback auf `reader.get_bf16_manual(tname)` in `pack_to_atlas.py:510-519`. Betrifft Falcon3, BitNet und alle Modelle mit BF16 weight_scale.
+- **4 Falcon3 Modelle gepackt**: 1B (1.22 GB) ✅ "Paris." korrekt, 3B (1.97 GB) ✅ "Paris." korrekt, 7B (2.75 GB), 10B (3.28 GB).
+- **Scale-Formel Analyse**: `matmul_reorder_deq` und `matmul_f32_reorder` dividieren durch scale (`sum / scale`) statt zu multiplizieren (`scale * sum`). Da dies ein konstanter Faktor auf alle Logits ist, hebt er sich in argmax/softmax auf → kein Einfluss auf Output-Qualität. Fix wäre `deq_scale = scale / 127.0f` statt `1/(127 * scale)`, aber nicht notwendig für korrekte Generierung.
+- **TQ2-Pfad korrekt**: Multipliziert explizit mit `scale` in Zeile 3495 (`sf = fp16_to_fp32(sptr[j]) * scale`).
+- **18/18 Mock-Tests**: CI grün. Alle Architekturen (Falcon3/Qwen3/BitNet) funktionieren.
+- **DLL+CLI Build OK**: Release-Build kompiliert sauber.
+
 ### v2.9.3 ✅ — AKI-Bug-Fix + HF-Alignment-Check + CI-Hardening (ABGESCHLOSSEN)
 - **AKI-Bug fix**: `row_dim==vocab_size` Heuristik in `atlas_api.cpp:707-710` durch Name-Guard abgesichert (`embed_tokens`/`token_embd` substring check via `m->tensor_names[i]`). Schützt vor Fehlklassifikation von 1D-Norm-Tensoren (`model.norm.weight`) als 2D-Embedding bei `hidden_dim == vocab_size`. In keinem Produktionsmodell getriggert (8/8 HF-Modelle OK), aber defensiv notwendig.
 - **HF-Alignment-Verifikation**: `scripts/verify_hf_alignment.py` — Zero-Download-Check gegen HuggingFace Hub (config.json + model.safetensors.index.json). **18 Modelle: 16 PASS, 0 FAIL, 2 SKIP** (restricted). Coverage: 4 Falcon3 + 3 Bonsai + 10 TriLM (99M→3.9B) + 1 BitNet (restricted). Auto-Discovery via `--discover` scannt alle bekannten HF-Orgs.
@@ -231,10 +240,13 @@ See `atlas_ffi.h` for full API.
 - `atlas_cli.cpp` — Standalone C++ CLI (LoadLibrary/dlopen, Arg-Parsing, Chat-Template, Interactive)
 - `atlas_infer.py` — Python `AtlasModel` class with `generate_c()`
 - `atlas_ffi.h` — C API declarations (v6 header layout)
-- `atlas_packer.py` — v5/v6 format writer for Falcon3 models
-- `atlas_packer_bonsai.py` — Block-scaled g128 packer for Bonsai/Qwen3 models
-- `atlas_packer_bitnet.py` — BF16→TQ1.0 packer (per-tensor absmean, matching Microsoft QAT) AND U8→TQ1.0 packer (use `--packed` for Microsoft pre-quantized weights)
+- `pack_to_atlas.py` — **Unified packer** (v2.10.0): auto-detects architecture from config.json, single pipeline for Falcon3/Qwen3/BitNet/TriLM/Llama. Deprecates individual packers.
+- `atlas_packer_mappings.py` — Architecture definitions used by `pack_to_atlas.py` (tensor name patterns, quantization rules, flags per arch).
+- `atlas_packer.py` — [DEPRECATED] v5/v6 format writer for Falcon3 models. Use `pack_to_atlas.py`.
+- `atlas_packer_g128.py` — [DEPRECATED] Block-scaled g128 packer for Bonsai/Qwen3. Use `pack_to_atlas.py`.
+- `atlas_packer_bitnet.py` — [DEPRECATED] BitNet b1.58 packer. Use `pack_to_atlas.py`.
 - `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
+- `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Keine Netzwerk-Abhängigkeit im Kern-Packer.
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `compile.bat` — Windows Build-Script (DLL + optional CLI)
 - `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (3 Architekturen, TQ1-Packing)

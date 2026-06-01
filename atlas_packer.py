@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Atlas Packer v2/v6 - Streaming TQ1.0 packer for Falcon3 BitNet"""
+"""Atlas Packer v2/v6 - Streaming TQ1.0 packer for Falcon3 BitNet
+
+DEPRECATED: Use `pack_to_atlas.py` instead — the unified packer handles
+all architectures (Falcon3, Qwen3/Bonsai, BitNet, TriLM, Llama, etc.)
+automatically. This file is kept for reference and backward compatibility.
+"""
 import struct, torch, numpy as np, json, os, sys
 from safetensors import safe_open
 

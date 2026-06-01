@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Atlas Packer for Qwen3/Bonsai/BitNet — FP16 → TQ1.0"""
+"""Atlas Packer for Qwen3/Bonsai/BitNet — FP16 → TQ1.0
+
+DEPRECATED: Use `pack_to_atlas.py` instead — the unified packer handles
+all architectures (Falcon3, Qwen3/Bonsai, BitNet, TriLM, Llama, etc.)
+automatically. This file is kept for reference and backward compatibility.
+"""
 import struct, numpy as np, json, os, sys
 from safetensors import safe_open
 import torch

@@ -59,6 +59,19 @@ def test_turboquant_decompress():
     assert not np.any(np.isinf(logits))
 
 
+def test_falcon3_ttype0_decompress():
+    """Verify ttype=0 tensors are decompressed to ttype=3 in-C++ (real Falcon3 path)."""
+    path = os.path.join(MOCK_DIR, "ci-falcon3-ttype0.atlas")
+    if not os.path.exists(path):
+        make(path, "falcon3-ttype0")
+    m = AtlasModel(path)
+    ids = np.array([[1, 2]], dtype=np.int32)
+    logits = m.forward(ids)
+    assert logits.shape == (1, 2, m.vocab_size)
+    assert not np.any(np.isnan(logits))
+    assert not np.any(np.isinf(logits))
+
+
 def test_sampling_coverage():
     """Cover xoshiro RNG, gumbel_sample, top-k/top-p/argmax paths."""
     path = os.path.join(MOCK_DIR, "ci-falcon3.atlas")

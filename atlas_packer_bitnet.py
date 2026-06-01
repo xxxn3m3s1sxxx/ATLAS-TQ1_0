@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Atlas Packer for BitNet b1.58 — BF16 → TQ1.0 g128 block-scaled ternary.
+
+DEPRECATED: Use `pack_to_atlas.py` instead — the unified packer handles
+all architectures (Falcon3, Qwen3/Bonsai, BitNet, TriLM, Llama, etc.)
+automatically. This file is kept for reference and backward compatibility.
+
 BitNet models from Microsoft: ab initio QAT ternary LLMs with LLaMA-style
 architecture + SubLN (attn_sub_norm, ffn_sub_norm) + ReLU² activation.
 Stride=11: (ln1, q, k, v, o, ln2, gate, up, down, attn_sub_norm, ffn_sub_norm)
