@@ -605,6 +605,18 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     if (fread(hdr, 1, 64, f) != 64) { fclose(f); return nullptr; }
     if (memcmp(hdr, "ATLAS", 5) != 0) { fclose(f); return nullptr; }
 
+    // Bytes 54-55: format_version (v2.10.0+). 0 = legacy, 2 = v2.10.0 baseline.
+    uint16_t fmt_ver;
+    memcpy(&fmt_ver, hdr+54, 2);
+    if (fmt_ver > 2) {
+        fprintf(stderr, "[ATLAS] Error: Model format version %u requires Atlas Engine "
+                        "v2.11+.\n"
+                        "  Download: https://github.com/anomalyco/atlas/releases\n",
+                (unsigned)fmt_ver);
+        fclose(f);
+        return nullptr;
+    }
+
     AtlasModel* m = new AtlasModel();
     uint16_t tmp; memcpy(&tmp, hdr+7, 2); m->n_layers = tmp;
     memcpy(&tmp, hdr+9, 2); m->hidden_dim = tmp;

@@ -16,6 +16,10 @@
 //   [33:4]  uint32 tokenizer_offset (v5+), absolute file offset
 //   [37:4]  uint32 tokenizer_binary_size (v6+), 0 if no binary block
 //   [41:4]  uint32 tokenizer_binary_offset (v6+), absolute file offset
+//   [45:4]  uint32 eos_id (v5+)
+//   [49:4]  uint32 pad_id (v5+)
+//   [53:1]  uint8  model_flags (bit0=is_qwen3, bit1=tie_emb, bit2=thinking, bit3=relu2)
+//   [54:2]  uint16 format_version (0=legacy, 2=v2.10.0 baseline)
 //   [56:4]  int32  name_block_size (v4+)
 //   [60:4]  int32  n_tensors
 //   [64:]   tensor directory: n × [ttype:1][file_offset:4][row_dim:4][packed_cols:3]

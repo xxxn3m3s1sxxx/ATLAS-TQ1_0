@@ -435,6 +435,9 @@ def create_atlas_qwen(model_dir, output_path, ttype=5):
         model_flags = (is_qwen << 0) | (tie_emb << 1) | (thinking << 2) | (gate_act << 3)
         struct.pack_into('<B', header, 53, model_flags)
 
+        # Bytes 54-55: format_version (v2.10.0+), 2 = TQ1.0 baseline
+        struct.pack_into('<H', header, 54, 2)
+
         # Name block
         name_bytes = b''.join(n.encode() + b'\0' for n in tensor_names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes

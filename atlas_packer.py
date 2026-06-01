@@ -399,6 +399,9 @@ def create_atlas_from_config(safetensors_path, output_path):
         model_flags = 0  # Falcon3
         struct.pack_into('<B', header, 53, model_flags)
 
+        # Bytes 54-55: format_version (v2.10.0+), 2 = TQ1.0 baseline (no persistent int4 on disk)
+        struct.pack_into('<H', header, 54, 2)
+
         # Build name block: [name_block_size:4] [name_0\0] [name_1\0] ...
         name_bytes = b''.join(n.encode() + b'\0' for n in names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes

@@ -294,6 +294,9 @@ def create_atlas_bitnet(model_dir, output_path):
         # Byte 53: model_flags — BitNet b1.58 uses ReLU² (hidden_act: "relu2" per Microsoft config)
         struct.pack_into('<B', header, 53, 1 << 3)
 
+        # Bytes 54-55: format_version (v2.10.0+), 2 = TQ1.0 baseline
+        struct.pack_into('<H', header, 54, 2)
+
         name_bytes = b''.join(n.encode() + b'\0' for n in tensor_names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes
         struct.pack_into('<I', header, 56, len(name_block))
@@ -522,6 +525,9 @@ def create_atlas_bitnet_from_packed(model_dir, output_path):
         if pad_id is not None: struct.pack_into('<I', header, 49, pad_id)
         # Byte 53: model_flags — BitNet b1.58 uses ReLU² (hidden_act: "relu2" per Microsoft config)
         struct.pack_into('<B', header, 53, 1 << 3)
+
+        # Bytes 54-55: format_version (v2.10.0+), 2 = TQ1.0 baseline
+        struct.pack_into('<H', header, 54, 2)
 
         name_bytes = b''.join(n.encode() + b'\0' for n in tensor_names)
         name_block = struct.pack('<I', 4 + len(name_bytes)) + name_bytes
