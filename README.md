@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.10.0 — ASan-Certified**: All ASan heap-bugs fixed (OOB-read, memcpy-overlap, allocator-mismatch). 70/70 Tests passed, CI green on Windows + Linux. Plus i4 Cache (0-click restart) + VNNI Int4 Kernel (`_mm512_dpbusd_epi32`). First ASan-certified release.
+> ⚡ **v2.10.0 — Falcon3 TQ1.0 Series**: All 4 Falcon3 models packaged and verified — 1B (1.2 GB), 3B (2.0 GB), 7B (2.8 GB), 10B (3.3 GB). Unified `pack_to_atlas.py` with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. 22/22 mock tests, CI green on Windows + Linux.
 
 ## Quickstart
 
@@ -21,15 +21,15 @@ libomp.dll  ← OpenMP runtime
 **Run a model:**
 
 ```bash
-# Download a model (3B is ~2 GB, runs on 4GB RAM):
-# See "Model Sources" below for download links
+# Download a pre-packed model from Hugging Face (see "Model Sources" below):
+# e.g. https://huggingface.co/xxxn3m3s1sxxx/Falcon3-3B-Instruct-ATLAS
 
 # Chat with it:
-atlas.exe falcon3-3b-tq1.atlas "What is the capital of France?"
+atlas.exe falcon3-3B-Instruct-tq1.atlas "What is the capital of France?"
 # → "The capital of France is Paris."
 
 # Interactive chat:
-atlas.exe falcon3-3b-tq1.atlas -i
+atlas.exe falcon3-3B-Instruct-tq1.atlas -i
 
 # Adjust sampling:
 atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
@@ -68,11 +68,12 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
-| **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | TII Falcon License 1.0 | ✅ |
+| **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
+| **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) | TII Falcon License 2.0 | ✅ |
 | **Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
-| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 1.0 | 🚧 |
+| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 2.0 | 🚧 |
 | OLMo-BitNet-1B | [`NousResearch/OLMo-Bitnet-1B`](https://huggingface.co/NousResearch/OLMo-Bitnet-1B) | Apache 2.0 | 🚧 |
 | Llama3-8B-1.58 | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama 3 | 🚧 |
 
@@ -198,7 +199,7 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 ```python
 from atlas_infer import AtlasModel
 
-model = AtlasModel("falcon3-3b-tq1.atlas")
+model = AtlasModel("falcon3-3B-Instruct-tq1.atlas")
 response = model.generate_c("What is the capital of France?")
 print(response)
 ```
@@ -252,7 +253,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
-| **v2.10.0** | **i4 Cache + VNNI Int4 Kernel**. i4 Cache: persistent load-time quantized state (ttype=3+8) for 0-click restart, invalidated on atlas file change. VNNI Int4 Kernel: nibble-unpack + `_mm512_dpbusd_epi32` (Clang 19+ Linux). Python i4 Cache integration in `atlas_infer.py`. 70/70 Tests, CI green. |
+| **v2.10.0** | **Unified Packer + BF16 weight_scale Fix + Falcon3 TQ1.0 Series**. Single `pack_to_atlas.py` replaces all individual packers — architecture auto-detection from `config.json`. BF16 weight_scale fix (`get_bf16_manual` fallback). All 4 Falcon3 models (1B/3B/7B/10B) packaged as TQ1.0, verified T=0 correct, deployed to Hugging Face. 22/22 mock tests, CI green. |
 | **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
 | **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
@@ -269,4 +270,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII (TII Falcon License 1.0). Bonsai/Qwen3: PrismML (Apache 2.0). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).
+Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative TQ1.0 models at [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).
