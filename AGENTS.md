@@ -144,8 +144,11 @@ See `atlas_ffi.h` for full API.
 - **4 Falcon3 Modelle gepackt**: 1B (1.22 GB) ✅ "Paris." korrekt, 3B (1.97 GB) ✅ "Paris." korrekt, 7B (2.75 GB), 10B (3.28 GB).
 - **Scale-Formel Analyse**: `matmul_reorder_deq` und `matmul_f32_reorder` dividieren durch scale (`sum / scale`) statt zu multiplizieren (`scale * sum`). Da dies ein konstanter Faktor auf alle Logits ist, hebt er sich in argmax/softmax auf → kein Einfluss auf Output-Qualität. Fix wäre `deq_scale = scale / 127.0f` statt `1/(127 * scale)`, aber nicht notwendig für korrekte Generierung.
 - **TQ2-Pfad korrekt**: Multipliziert explizit mit `scale` in Zeile 3495 (`sf = fp16_to_fp32(sptr[j]) * scale`).
-- **18/18 Mock-Tests**: CI grün. Alle Architekturen (Falcon3/Qwen3/BitNet) funktionieren.
+- **22/22 Mock-Tests**: CI grün. 5 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant).
+- **Realistischer ttype=0 Mock**: `atlas_mock_model.py` mit `falcon3-ttype0` Arch, `pack_tq1_per_tensor()` für echten TQ1-Dispatch-Pfad.
+- **release_to_hf.py** unterstützt jetzt `--atlas-path` für Pre-Packed Files.
 - **DLL+CLI Build OK**: Release-Build kompiliert sauber.
+- **v2.10.0 getaggt und gepusht** ✅.
 
 ### v2.9.3 ✅ — AKI-Bug-Fix + HF-Alignment-Check + CI-Hardening (ABGESCHLOSSEN)
 - **AKI-Bug fix**: `row_dim==vocab_size` Heuristik in `atlas_api.cpp:707-710` durch Name-Guard abgesichert (`embed_tokens`/`token_embd` substring check via `m->tensor_names[i]`). Schützt vor Fehlklassifikation von 1D-Norm-Tensoren (`model.norm.weight`) als 2D-Embedding bei `hidden_dim == vocab_size`. In keinem Produktionsmodell getriggert (8/8 HF-Modelle OK), aber defensiv notwendig.
