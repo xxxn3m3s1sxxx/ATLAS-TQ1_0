@@ -19,6 +19,7 @@ ARCHES = {
         n_heads=4, n_kv_heads=2, head_dim=256,
         vocab=256, rope_theta=1000042.0,
         rope_interleaved=True, stride=9,
+        use_tq1="ttype0",
         arch="falcon3",
         layer_tensors=[
             "input_layernorm.weight",
@@ -72,25 +73,7 @@ ARCHES = {
             "mlp.ffn_sub_norm.weight",
         ],
     ),
-    "falcon3-ttype0": dict(
-        n_layers=2, hidden=128, inter=512,
-        n_heads=4, n_kv_heads=2, head_dim=256,
-        vocab=256, rope_theta=1000042.0,
-        rope_interleaved=True, stride=9,
-        use_tq1="ttype0",
-        arch="falcon3",
-        layer_tensors=[
-            "input_layernorm.weight",
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.o_proj.weight",
-            "post_attention_layernorm.weight",
-            "mlp.gate_proj.weight",
-            "mlp.up_proj.weight",
-            "mlp.down_proj.weight",
-        ],
-    ),
+
     "turboquant": dict(
         n_layers=2, hidden=256, inter=1024,
         n_heads=4, n_kv_heads=2, head_dim=128,
@@ -479,7 +462,7 @@ def main():
 
     for arch in ARCHES:
         path = f"{base}-{arch}.atlas"
-        make(path, arch, use_tq1=True)
+        make(path, arch, use_tq1=ARCHES[arch].get("use_tq1", True))
         make(path.replace(".atlas", "-fp16.atlas"), arch, use_tq1=False)
         print(f"    $ python -c \"import atlas_infer; m = atlas_infer.AtlasModel('{path}')\"")
 

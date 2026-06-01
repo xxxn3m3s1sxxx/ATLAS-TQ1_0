@@ -677,7 +677,14 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         m->tensors[i].ttype = e[0];
         memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
         memcpy(&m->tensors[i].row_dim, e+5, 4);
-        m->tensors[i].packed_cols = e[9] | (e[10]<<8) | (e[11]<<16);
+        {
+            uint32_t ppr_val = e[9] | (e[10]<<8) | (e[11]<<16);
+            if (m->tensors[i].ttype == 5 || m->tensors[i].ttype == 7) {
+                m->tensors[i].packed_cols = ppr_val & 0x1FFFFF;
+            } else {
+                m->tensors[i].packed_cols = ppr_val;
+            }
+        }
     }
 
     // Load tensor names (v4+)
@@ -1709,7 +1716,6 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
     for (auto& t : m->tensors) {
         if (t.ttype != 5) continue;
         total++;
-
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
         int bs = t.block_size;
@@ -1725,7 +1731,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         }
 
         float global_max = 1e-10f;
-        float* f32_row = (float*)alloca(input_dim * sizeof(float));
+        float* f32_row = (float*)malloc(input_dim * sizeof(float));
         for (int r = 0; r < t.row_dim; r++) {
             for (int c = 0; c < t.packed_cols; c++) {
                 const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
@@ -1773,6 +1779,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         }
 
         free(decoded_scales);
+        free(f32_row);
         if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
         t.data = new_data;
         t.data_size = 2 + n_vals + t.row_dim * 4;
