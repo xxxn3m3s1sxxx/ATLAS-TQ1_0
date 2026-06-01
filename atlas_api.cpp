@@ -611,7 +611,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     if (fmt_ver > 2) {
         fprintf(stderr, "[ATLAS] Error: Model format version %u requires Atlas Engine "
                         "v2.11+.\n"
-                        "  Download: https://github.com/anomalyco/atlas/releases\n",
+                        "  Download: https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0/releases\n",
                 (unsigned)fmt_ver);
         fclose(f);
         return nullptr;
