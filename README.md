@@ -68,11 +68,11 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
-| **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | Falcon 1.0 | ✅ |
+| **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | TII Falcon License 1.0 | ✅ |
 | **Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
-| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | Falcon 1.0 | 🚧 |
+| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 1.0 | 🚧 |
 | OLMo-BitNet-1B | [`NousResearch/OLMo-Bitnet-1B`](https://huggingface.co/NousResearch/OLMo-Bitnet-1B) | Apache 2.0 | 🚧 |
 | Llama3-8B-1.58 | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama 3 | 🚧 |
 
@@ -269,4 +269,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. BitNet b1.58: Microsoft Research. Falcon3: TII (TII Falcon License 1.0). Ternary-Bonsai: PrismML (Apache 2.0).
+Code: Apache 2.0. Falcon3: TII (TII Falcon License 1.0). Bonsai/Qwen3: PrismML (Apache 2.0). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).
