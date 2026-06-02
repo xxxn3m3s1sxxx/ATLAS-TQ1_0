@@ -162,7 +162,7 @@ This is a **quantized derivative work** based on the **BitNet b1.58** architectu
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
     else:
-        base_model_hf = f"tiiuae/Falcon3-{size}-Instruct"
+        base_model_hf = f"tiiuae/Falcon3-{size}-Instruct-1.58bit"
         ctx_window = "4096 (NTK-scalable up to 8192)"
         prompt_template = """```
 <|role|>
