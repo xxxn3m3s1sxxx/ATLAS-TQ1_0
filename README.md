@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.10.0 — Falcon3 TQ1.0 Series**: All 4 Falcon3 models packaged and verified — 1B (1.2 GB), 3B (2.0 GB), 7B (2.8 GB), 10B (3.3 GB). Unified `pack_to_atlas.py` with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. 22/22 mock tests, CI green on Windows + Linux.
+> ⚡ **v2.10.0 — Falcon3 + Bonsai TQ1.0 Series**: All 4 Falcon3 models (1B/3B/7B/10B) and 3 Bonsai models (1.7B/4B/8B) packaged, verified T=0 correct, and deployed to HuggingFace. Unified `pack_to_atlas.py` with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. 22/22 mock tests, CI green on Windows + Linux.
 
 ## Quickstart
 
@@ -23,6 +23,7 @@ libomp.dll  ← OpenMP runtime
 ```bash
 # Download a pre-packed model from Hugging Face (see "Model Sources" below):
 # e.g. https://huggingface.co/xxxn3m3s1sxxx/Falcon3-3B-Instruct-ATLAS
+#      https://huggingface.co/xxxn3m3s1sxxx/Ternary-Bonsai-4B-ATLAS
 
 # Chat with it:
 atlas.exe falcon3-3B-Instruct-tq1.atlas "What is the capital of France?"
@@ -69,8 +70,9 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
 | **Falcon3** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
-| **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) | TII Falcon License 2.0 | ✅ |
+| **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
 | **Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
+| **Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
 | Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 2.0 | 🚧 |
@@ -87,17 +89,8 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 # Requires Python + transformers:
 pip install safetensors transformers numpy
 
-# Falcon3:
-python atlas_packer.py path/to/falcon3-3b-instruct
-
-# Bonsai/Qwen3:
-python atlas_packer_bonsai.py path/to/ternary-bonsai-4b
-
-# BitNet (use --packed for Microsoft pre-quantized U8 weights):
-python atlas_packer_bitnet.py path/to/bitnet-b1.58-2B-4T --packed
-
-# TriLM:
-python atlas_packer.py path/to/trilm-1.1b
+# All architectures auto-detected (Falcon3, Bonsai, Qwen3, BitNet, TriLM, Llama):
+python pack_to_atlas.py path/to/model-directory
 ```
 
 The packer autodetects the model and generates a `.atlas` file ready for the CLI.
@@ -270,4 +263,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative TQ1.0 models at [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).
+Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative TQ1.0 models at [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).

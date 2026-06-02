@@ -63,7 +63,7 @@ MODEL_SIZES = {
 
 
 def _detect_size(name):
-    for sz in ["10B", "8B", "7B", "4B", "3B", "1.7B", "1B"]:
+    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "1B"]:
         if sz in name:
             return sz
     return None
@@ -104,7 +104,7 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
 
     if is_bonsai:
-        base_model_hf = f"xxxn3m3s1sxxx/{model_name}"
+        base_model_hf = f"prism-ml/Ternary-Bonsai-{size}-unpacked"
         ctx_window = "8192 (YaRN-scalable up to 16384)"
         prompt_template = """```
 <|im_start|>system
@@ -117,9 +117,9 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
         license_section = """\
 ## License
 
-This is a **quantized derivative work** based on the **Qwen3/Bonsai** architecture, originally released under the **Apache 2.0 License**.
+This is a **quantized derivative work** based on the **Ternary-Bonsai** architecture (original model by **Prism ML**), originally released under **Apache 2.0**.
 
-The ATLAS engine itself is **Apache 2.0 licensed**.
+The ATLAS engine itself is also **Apache 2.0 licensed** — a clean, permissive, fully open-source stack.
 """
     else:
         base_model_hf = f"tiiuae/Falcon3-{size}-Instruct"
@@ -157,6 +157,11 @@ By downloading or utilizing this file, you agree to be bound by the **TII Falcon
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
 
+    extra_tags = ""
+    if is_bonsai:
+        extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
+    if is_falcon3:
+        extra_tags = "- cpu-inference\n- bitnet"
     frontmatter = f"""---
 {license_yaml}
 language:
@@ -168,8 +173,8 @@ tags:
 - tq1
 - cpu-optimized
 - {"bonsai" if is_bonsai else "falcon3"}
-- cpu-inference
-- bitnet
+- llm
+{extra_tags}
 base_model: {base_model_hf}
 pipeline_tag: text-generation
 library_name: atlas
@@ -243,7 +248,7 @@ To prevent token degradation and alignment shifting, use the standard chat templ
 ### Python
 
 ```bash
-git clone https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0.git
+git clone https://github.com/xxxn3m3s1sxxx/ATLAS.git
 ```
 
 ```python
@@ -292,7 +297,7 @@ curl http://localhost:8080/v1/chat/completions \\
 
 ### Links
 
-- **Engine source code**: [github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0](https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0)
+- **Engine source code**: [github.com/xxxn3m3s1sxxx/ATLAS](https://github.com/xxxn3m3s1sxxx/ATLAS)
 - **Original model**: [`{base_model_hf}`](https://huggingface.co/{base_model_hf})
 
 ---

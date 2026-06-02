@@ -148,7 +148,8 @@ See `atlas_ffi.h` for full API.
 - **TQ2-Pfad korrekt**: Multipliziert explizit mit `scale` in Zeile 3495 (`sf = fp16_to_fp32(sptr[j]) * scale`).
 - **22/22 Mock-Tests**: CI grün. 5 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant).
 - **Realistischer ttype=0 Mock**: `atlas_mock_model.py` mit `falcon3-ttype0` Arch, `pack_tq1_per_tensor()` für echten TQ1-Dispatch-Pfad.
-- **release_to_hf.py** unterstützt jetzt `--atlas-path` für Pre-Packed Files.
+- **release_to_hf.py** unterstützt jetzt `--atlas-path` für Pre-Packed Files + HF-Upload mit korrektem YAML-Frontmatter.
+- **Bonsai HF-Deployment**: Alle 3 Bonsai-Modelle (1.7B/4B/8B) auf [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) deployed — `base_model: prism-ml/Ternary-Bonsai-*-unpacked`, `license: apache-2.0`, Tags: `ternary`, `quantized`, `atlas`, `tq1`, `cpu-optimized`, `bonsai`, `llm`, `cpu-llm`, `edge-ai`, `no-gpu`, `efficient-inference`.
 - **DLL+CLI Build OK**: Release-Build kompiliert sauber.
 - **v2.10.0 getaggt und gepusht** ✅.
 
@@ -251,7 +252,7 @@ See `atlas_ffi.h` for full API.
 - `atlas_packer_g128.py` — [DEPRECATED] Block-scaled g128 packer for Bonsai/Qwen3. Use `pack_to_atlas.py`.
 - `atlas_packer_bitnet.py` — [DEPRECATED] BitNet b1.58 packer. Use `pack_to_atlas.py`.
 - `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
-- `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Keine Netzwerk-Abhängigkeit im Kern-Packer.
+- `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Generiert YAML-Frontmatter (base_model, license, tags per Architektur-Familie). Keine Netzwerk-Abhängigkeit im Kern-Packer.
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `compile.bat` — Windows Build-Script (DLL + optional CLI)
 - `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (3 Architekturen, TQ1-Packing)
