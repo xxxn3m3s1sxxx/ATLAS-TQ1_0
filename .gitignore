@@ -36,6 +36,7 @@ atlas.dll.release
 *.diff
 *.patch
 _*.py
+*.bak
 
 tests/mock.atlas
 mock/
@@ -44,3 +45,7 @@ scripts/
 !scripts/check_api_parity.py
 !scripts/verify_hf_alignment.py
 !scripts/check_coverage_thresholds.py
+!scripts/release_to_hf.py
+!scripts/validate_scales.py
+!scripts/verify_tq1.py
+!scripts/check_tensors.py
