@@ -73,6 +73,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
 | **Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
+| **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | PASS |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
 | Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 2.0 | 🚧 |
