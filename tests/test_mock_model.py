@@ -128,3 +128,29 @@ def test_corridor_load(key):
     assert logits.shape == (1, 3, m.vocab_size)
     assert not np.any(np.isnan(logits))
     assert not np.any(np.isinf(logits))
+
+
+BONSAI_CORRIDORS = {
+    "bonsai_1_7b": "f32_bypass",
+    "bonsai_4b": "production_int8",
+    "bonsai_8b": "f32_bypass",
+}
+
+
+@pytest.mark.parametrize("arch,corridor", list(BONSAI_CORRIDORS.items()))
+def test_bonsai_corridor_load(arch, corridor):
+    """Bonsai dimension mocks with realistic dispatch corridors."""
+    core = CORRIDORS[corridor]
+    path = os.path.join(MOCK_DIR, f"bonsai-{arch}.atlas")
+    if not os.path.exists(path):
+        make(path, arch, corridor=corridor)
+    m = AtlasModel(path)
+    for func_name, args in core["post_init"]:
+        fn = getattr(dll, func_name)
+        fn(m.model_ptr, *args)
+    assert m.n_layers == 2
+    ids = np.array([[1, 2, 3]], dtype=np.int32)
+    logits = m.forward(ids)
+    assert logits.shape == (1, 3, m.vocab_size)
+    assert not np.any(np.isnan(logits))
+    assert not np.any(np.isinf(logits))

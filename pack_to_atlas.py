@@ -72,9 +72,9 @@ class SafetensorsReader:
         if not sp:
             raise KeyError(f"Tensor {tname} not found in weight map")
         shard = os.path.join(self.model_dir, sp)
-        if shard not in self._shards_np:
-            self._shards_np[shard] = safe_open(shard, framework="np")
-        return self._shards_np[shard].get_tensor(tname)
+        with safe_open(shard, framework="np") as sf:
+            arr = sf.get_tensor(tname)
+        return np.array(arr)
 
     def get_tensor_pt(self, tname):
         """Read tensor via PyTorch safe_open (returns torch.Tensor)."""

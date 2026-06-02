@@ -86,6 +86,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 - **3B**: Correct answer + newline collapse after completion (model-inherent, 22L insufficient calibration).  
 - **1B**: Pure newline collapse (18L/2048H too small for stable argmax path).  
 - **2B (BitNet)**: Real English words (U8 path) but degenerates into repetition after 3-5 tokens (30L/2560H ternary-quantized, model-inherent). T=0.7 yields diverse token salad.  
+- **8B (Bonsai)**: "The capital of France is Paris." at T=0, degenerates into repetition after 50+ tokens. T=0.7 yields coherent short answers.  
 
 🚀 **Default recommendation**: Always use `T=0.7, top_k=40` for any model below 7B. T=0 is only reliable for 7B+.
 
@@ -95,9 +96,9 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 |-------|-------------|:-----:|:--------------:|---------------|
 | **Bonsai-1.7B** | f32 bypass | **13.0** | 4K (f32) / 8K (NTK) | "The capital of France is Paris." |
 | **Bonsai-4B** | hybrid+int8 | **17.4** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
-| **Bonsai-8B** | f32 bypass | **1.8** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent reasoning |
+| **Bonsai-8B** | f32 bypass | **2.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent |
 
-Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B f32 bypass forced (rope_theta≥3M detection). Quantized hybrid mode yields 19.2 tok/s.
+Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B rope_theta=1M (<3M threshold, f32 not auto-triggered), use `AtlasModel(..., use_f32_matmul=True)`. Hybrid path degenerates to garbage — needs f32_bypass despite hidden=4096. Quantized hybrid mode yields 19.2 tok/s (1.7B only).
 
 ### Architecture Notes
 
@@ -105,6 +106,7 @@ Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B f32 bypass forced (
 - **3B vs 7B/10B**: Same hidden (3072) but intermediate scales from 9216 (3B) to 23040 (7B/10B). FFN matmul is 2.5× wider on 7B/10B, dominating the per-token cost.
 - **10B**: 40 layers mean 1.8× more memory traffic per token than 7B (28 layers), despite same per-layer weight size.
 - **Bonsai-4B vs -1.7B**: Same 36 layers (4B) vs 28 layers (1.7B). 4B has wider hidden (2560→2048) and intermediate (9728→6144). Bonsai-4B achieves higher tok/s due to better int8/AVX2 utilization per layer.
+- **Bonsai-8B**: 36L/4096H/12288I, rope_theta=1M with YaRN 4.0. Requires `use_f32_matmul=True`. The i8 cache (6.9 GB) reduces load time from decompression (TTFP from 40s to 1s). Generation is memory-bandwidth bound at 2.2 tok/s on DDR4.
 
 ## Sampling
 

@@ -243,7 +243,7 @@ class AtlasModel:
     def __init__(self, atlas_path, safetensors_path=None, model_dir=None,
                  use_packed_matmul=False, use_hybrid_matmul=False,
                  max_seq_len=4096, base_seq_len=None,
-                 convert_to_tq2=False):
+                 convert_to_tq2=False, use_f32_matmul=False):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
@@ -365,13 +365,13 @@ class AtlasModel:
                 # f32_bypass: for small, block-scaled, or BitNet models
                 # MUST be set before int4 conversion (guard checks use_f32_matmul)
                 is_bitnet = any('attn_sub_norm' in name for name in self.idx)
-                if is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
+                if use_f32_matmul or is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
                     dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
                 # Convert FFN int8 to int4 (halves weight bandwidth). Skips if f32_bypass.
                 if _HAS_FFN_I4:
                     dll.atlas_quantize_ffn_to_i4(self.model_ptr)
-                # Save i4 cache for next reload
-                if _HAS_I4_CACHE:
+                # Save i4 cache only if actual int4 conversion occurred (not f32_bypass)
+                if _HAS_I4_CACHE and not (use_f32_matmul or is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0):
                     dll.atlas_save_i4_cache(self.model_ptr, self._atlas_path.encode())
             # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
             dll.atlas_prefetch_int8(self.model_ptr)

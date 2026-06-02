@@ -1783,7 +1783,6 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
         t.data = new_data;
         t.data_size = 2 + n_vals + t.row_dim * 4;
-        t.packed_cols = input_dim;
         t.ttype = 3;
     }
     if (total > 0) printf("[ATLAS] Decompressed %d ttype=5 tensors to int8\n", total);
@@ -3705,7 +3704,6 @@ static void forward_layer_internal(
                (max_qkv_dim - H) * sizeof(float));
     }
 
-
     float* max_abs = (float*)alloca(B * sizeof(float));
 
     auto& tv = m->tensors[idx_v];
@@ -4796,12 +4794,10 @@ static void ensure_layer_idx(AtlasModel* m) {
             if (names[i] == n) return i;
         return -1;
     };
-    // Detect architecture from tensor names (fallback when no v8 meta-block)
-    int stride = m->layer_stride;
-    int model_arch = m->model_arch;
-    if (!m->has_meta) {
-        stride = 9;
-        model_arch = ARCH_LLAMA;
+
+    int stride = 9;
+    int model_arch = ARCH_LLAMA;
+    {
         char test_name[128];
         snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.attn_sub_norm.weight");
         if (find(test_name) >= 0) { stride = 11; model_arch = ARCH_BITNET; }
@@ -4809,12 +4805,17 @@ static void ensure_layer_idx(AtlasModel* m) {
             snprintf(test_name, sizeof(test_name), "model.layers.0.self_attn.q_norm.weight");
             if (find(test_name) >= 0) { stride = 11; model_arch = ARCH_QWEN3; }
         }
-        m->layer_stride = stride;
-        m->model_arch = model_arch;
-        // RoPE format: interleaved for Qwen3 and Falcon3 (head_dim>=256), half-split for Llama/BitNet
-        m->rope_interleaved = (model_arch == ARCH_QWEN3) || (m->head_dim >= 256);
-        if (model_arch == ARCH_BITNET) m->use_f32_matmul = 1;
     }
+    // If meta set a stride, prefer it (known arch was recognized)
+    if (m->has_meta && m->layer_stride > 9) {
+        stride = m->layer_stride;
+        model_arch = m->model_arch;
+    }
+    m->layer_stride = stride;
+    m->model_arch = model_arch;
+    // RoPE format: interleaved for Qwen3 and Falcon3 (head_dim>=256), half-split for Llama/BitNet
+    m->rope_interleaved = (model_arch == ARCH_QWEN3) || (m->head_dim >= 256);
+    if (model_arch == ARCH_BITNET) m->use_f32_matmul = 1;
     m->layer_idx_cache.clear();
     m->layer_idx_cache.reserve(m->n_layers * stride);
     for (int L = 0; L < m->n_layers; L++) {
