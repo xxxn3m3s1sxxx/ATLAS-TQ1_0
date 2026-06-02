@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> ⚡ **v2.10.0 — Falcon3 + Bonsai TQ1.0 Series**: All 4 Falcon3 models (1B/3B/7B/10B) and 3 Bonsai models (1.7B/4B/8B) packaged, verified T=0 correct, and deployed to HuggingFace. Unified `pack_to_atlas.py` with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. 22/22 mock tests, CI green on Windows + Linux.
+> 🚀 **v2.10.0 — Falcon3 + Bonsai + BitNet TQ1.0 Series**: All 4 Falcon3 models (1B/3B/7B/10B), 3 Bonsai models (1.7B/4B/8B), and **BitNet b1.58-2B-4T** packaged, verified T=0 correct, and deployed to HuggingFace. Unified pack_to_atlas.py with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. BitNet EOS token fix (128009 <|eot_id|>). 35/35 mock tests, CI green on Windows + Linux.
 
 ## Quickstart
 

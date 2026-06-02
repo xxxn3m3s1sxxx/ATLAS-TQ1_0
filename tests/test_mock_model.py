@@ -134,6 +134,7 @@ BONSAI_CORRIDORS = {
     "bonsai_1_7b": "f32_bypass",
     "bonsai_4b": "production_int8",
     "bonsai_8b": "f32_bypass",
+    "bitnet_2b4t": "f32_bypass",
 }
 
 

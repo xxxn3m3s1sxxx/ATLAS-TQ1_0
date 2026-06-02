@@ -395,9 +395,8 @@ def build_tokenizer_binary(model_dir):
             if val and isinstance(val, dict) and "id" in val:
                 special_ids[key.split("_")[0]] = val["id"]
     for token_str, tid in vocab.items():
-        if tid == 0 and special_ids["eos"] == 0xFFFFFFFF:
-            special_ids["eos"] = tid
         for pattern, idx_key in [("<|endoftext|>", "eos"), ("<|im_end|>", "eos"),
+                                  ("<|eot_id|>", "eos"),
                                   ("<|pad|>", "pad"), ("<unk>", "unk")]:
             if token_str == pattern and special_ids[idx_key] == 0xFFFFFFFF:
                 special_ids[idx_key] = tid
@@ -610,16 +609,23 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             struct.pack_into("<I", header, 45, eos_id)
         if pad_id is not None:
             struct.pack_into("<I", header, 49, pad_id)
-        # Fallback: from tokenizer_config.json if not in config.json
-        if eos_id is None or pad_id is None:
-            tcfg_path = os.path.join(model_dir, "tokenizer_config.json")
-            if os.path.exists(tcfg_path):
-                with open(tcfg_path) as tcf:
-                    tcfg = json.load(tcf)
-                if eos_id is None:
-                    ec = tcfg.get("eos_token")
-                    if isinstance(ec, dict) and "id" in ec:
-                        struct.pack_into("<I", header, 45, ec["id"])
+        # Prefer tokenizer_config.json eos over config.json (handles Llama-3/BitNet
+        # where eos_token_id in config.json is wrong/points to BOS instead of EOT)
+        tcfg_path = os.path.join(model_dir, "tokenizer_config.json")
+        if os.path.exists(tcfg_path):
+            with open(tcfg_path) as tcf:
+                tcfg = json.load(tcf)
+            ec = tcfg.get("eos_token")
+            if isinstance(ec, dict) and "id" in ec:
+                struct.pack_into("<I", header, 45, ec["id"])
+            elif isinstance(ec, str):
+                tok_json_path = os.path.join(model_dir, "tokenizer.json")
+                if os.path.exists(tok_json_path):
+                    from tokenizers import Tokenizer as Tk
+                    tk = Tk.from_file(tok_json_path)
+                    tvid = tk.token_to_id(ec)
+                    if tvid is not None and tvid != 0:
+                        struct.pack_into("<I", header, 45, tvid)
 
         # Byte 53: model_flags
         model_flags = arch["flags_fn"](cfg)

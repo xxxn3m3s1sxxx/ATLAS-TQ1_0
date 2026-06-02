@@ -149,7 +149,11 @@ See `atlas_ffi.h` for full API.
 - **22/22 Mock-Tests**: CI grün. 5 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant).
 - **Realistischer ttype=0 Mock**: `atlas_mock_model.py` mit `falcon3-ttype0` Arch, `pack_tq1_per_tensor()` für echten TQ1-Dispatch-Pfad.
 - **release_to_hf.py** unterstützt jetzt `--atlas-path` für Pre-Packed Files + HF-Upload mit korrektem YAML-Frontmatter.
+- **BitNet EOS Token Fix**: `build_tokenizer_binary` in `pack_to_atlas.py` hatte zwei Bugs: (1) `tid == 0` Fallback vor Pattern-Matching setzte `eos=0` zu früh, (2) config.json `eos_token_id=128001` (BOS) statt korrektem 128009 (`<|eot_id|>`). Fix: Pattern-Matching zuerst, `tid == 0` Fallback entfernt, Header-EOS bevorzugt `tokenizer_config.json` String-Lookup via `tokenizer.token_to_id()`. BitNet generiert jetzt `"The capital of France is Paris.<|eot_id|>"` — korrektes Stoppen.
+- **BitNet HF-Deployment**: [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) — 1.04 GB, `base_model: microsoft/bitnet-b1.58-2B-4T`, `license: mit`, Tags: `ternary`, `quantized`, `atlas`, `tq1`, `cpu-optimized`, `bitnet`, `cpu-inference`.
 - **Bonsai HF-Deployment**: Alle 3 Bonsai-Modelle (1.7B/4B/8B) auf [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) deployed — `base_model: prism-ml/Ternary-Bonsai-*-unpacked`, `license: apache-2.0`, Tags: `ternary`, `quantized`, `atlas`, `tq1`, `cpu-optimized`, `bonsai`, `llm`, `cpu-llm`, `edge-ai`, `no-gpu`, `efficient-inference`.
+- **bitnet_2b4t Mock-Modell**: `tests/atlas_mock_model.py` mit 2L/2560H/6912I/20/5 heads/128256 vocab, SubLN arch="bitnet", `f32_bypass`-Corridor-Test. 655 MB Datei, load/forward korrekt.
+- **`release_to_hf.py` BitNet-Unterstützung**: `_read_atlas_arch()`, `"2B"` Size-Detection, `is_bitnet`-Branch in README-Gen (MIT license, korrektes Prompt-Template).
 - **DLL+CLI Build OK**: Release-Build kompiliert sauber.
 - **v2.10.0 getaggt und gepusht** ✅.
 
@@ -255,8 +259,8 @@ See `atlas_ffi.h` for full API.
 - `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Generiert YAML-Frontmatter (base_model, license, tags per Architektur-Familie). Keine Netzwerk-Abhängigkeit im Kern-Packer.
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `compile.bat` — Windows Build-Script (DLL + optional CLI)
-- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (3 Architekturen, TQ1-Packing)
-- `tests/test_mock_model.py` — CI Smoke-Test (9 parametrisierte parametrisierte Tests, 1.14s)
+- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (6 Architekturen, TQ1-Packing)
+- `tests/test_mock_model.py` — CI Smoke-Test (35 parametrisierte Tests)
 - `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
 - `.github/workflows/release.yml` — Auto-Release bei v*-Tag (Windows/Linux Zip/Tar)
 

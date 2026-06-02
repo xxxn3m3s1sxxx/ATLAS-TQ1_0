@@ -154,6 +154,26 @@ ARCHES = {
             "self_attn.k_norm.weight",
         ],
     ),
+    "bitnet_2b4t": dict(
+        n_layers=2, hidden=2560, inter=6912,
+        n_heads=20, n_kv_heads=5, head_dim=128,
+        vocab=128256, rope_theta=500000.0,
+        rope_interleaved=False, stride=11,
+        arch="bitnet",
+        layer_tensors=[
+            "input_layernorm.weight",
+            "self_attn.attn_sub_norm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "mlp.ffn_sub_norm.weight",
+        ],
+    ),
 }
 
 GLOBAL_TENSORS = ["model.embed_tokens.weight", "model.norm.weight"]

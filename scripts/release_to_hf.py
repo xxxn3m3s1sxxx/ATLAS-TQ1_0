@@ -48,6 +48,10 @@ KNOWN_CONFIGS = {
            "intermediate_size": 12288, "num_attention_heads": 32,
            "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 1000000.0,
            "vocab_size": 151669},
+    "2B": {"model_type": "bitnet", "num_hidden_layers": 30, "hidden_size": 2560,
+           "intermediate_size": 6912, "num_attention_heads": 20,
+           "num_key_value_heads": 5, "head_dim": 128, "rope_theta": 500000.0,
+           "vocab_size": 128256, "tie_word_embeddings": True},
 }
 
 # Per-model perf & size description
@@ -62,8 +66,22 @@ MODEL_SIZES = {
 }
 
 
+def _read_atlas_arch(atlas_path):
+    """Read architecture type from v8 atlas file metadata."""
+    try:
+        import struct, json
+        with open(atlas_path, "rb") as f:
+            hdr = f.read(64)
+            meta_size = struct.unpack_from("<I", hdr, 64)[0]
+            meta_bytes = f.read(meta_size)
+            meta = json.loads(meta_bytes.decode("utf-8"))
+            return meta.get("arch", "unknown")
+    except Exception:
+        return None
+
+
 def _detect_size(name):
-    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "1B"]:
+    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B"]:
         if sz in name:
             return sz
     return None
@@ -102,6 +120,7 @@ def pack_model(model_dir, output_dir=None):
 def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, desc):
     is_bonsai = "Bonsai" in model_name or cfg.get("model_type") in ("qwen3",)
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
+    is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
 
     if is_bonsai:
         base_model_hf = f"prism-ml/Ternary-Bonsai-{size}-unpacked"
@@ -120,6 +139,27 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
 This is a **quantized derivative work** based on the **Ternary-Bonsai** architecture (original model by **Prism ML**), originally released under **Apache 2.0**.
 
 The ATLAS engine itself is also **Apache 2.0 licensed** — a clean, permissive, fully open-source stack.
+"""
+    elif is_bitnet:
+        base_model_hf = "microsoft/bitnet-b1.58-2B-4T"
+        ctx_window = "2048 (NTK-scalable up to 4096)"
+        prompt_template = """```
+{role}: {content}<|eot_id|>
+```
+
+### Example Sequence
+
+```
+User: What is 2+2?
+Assistant: 4
+```"""
+        license_yaml = "license: mit"
+        license_section = """\
+## License
+
+This is a **quantized derivative work** based on the **BitNet b1.58** architecture (original model by **Microsoft**), originally released under **MIT License**.
+
+The ATLAS engine itself is **Apache 2.0 licensed**.
 """
     else:
         base_model_hf = f"tiiuae/Falcon3-{size}-Instruct"
@@ -160,7 +200,9 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
     extra_tags = ""
     if is_bonsai:
         extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
-    if is_falcon3:
+    elif is_bitnet:
+        extra_tags = "- cpu-inference\n- bitnet"
+    elif is_falcon3:
         extra_tags = "- cpu-inference\n- bitnet"
     frontmatter = f"""---
 {license_yaml}
@@ -172,7 +214,7 @@ tags:
 - atlas
 - tq1
 - cpu-optimized
-- {"bonsai" if is_bonsai else "falcon3"}
+- {"bonsai" if is_bonsai else "bitnet" if is_bitnet else "falcon3"}
 - llm
 {extra_tags}
 base_model: {base_model_hf}
@@ -400,12 +442,17 @@ def main():
             else:
                 cfg = {"model_type": "unknown"}
         else:
-            sz = _detect_size(fname)
-            if sz and sz in KNOWN_CONFIGS:
-                cfg = dict(KNOWN_CONFIGS[sz])
+            # Try reading arch from v8 metadata block
+            arch = _read_atlas_arch(atlas_path)
+            if arch:
+                cfg = {"model_type": arch}
             else:
-                clean = fname.replace("-tq1.atlas", "").replace(".atlas", "")
-                cfg = {"model_type": clean}
+                sz = _detect_size(fname)
+                if sz and sz in KNOWN_CONFIGS:
+                    cfg = dict(KNOWN_CONFIGS[sz])
+                else:
+                    clean = fname.replace("-tq1.atlas", "").replace(".atlas", "")
+                    cfg = {"model_type": clean}
         print(f"[release] Using pre-packed: {atlas_path} ({os.path.getsize(atlas_path) / 1024 ** 3:.2f} GB)")
     elif args.model_dir:
         atlas_path, cfg = pack_model(args.model_dir, args.output_dir)
