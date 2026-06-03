@@ -11,6 +11,8 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
 - **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN architectures where weights are ~0.01× and u8+128 activation quant destroys signal.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
+- **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
+- **`rope_interleaved_set` flag** (v2.10.3): Tracks whether config.json set `rope_interleaved`. If yes, Heuristik in `ensure_layer_idx` überschreibt nicht. Default: `true` (interleaved). Config override möglich (Llama/BitNet: half-split, `false`).
 - **128*row_sum correction**: Required for all uint8×int8 matmuls (activation quantization adds +128 bias).
 
 ## Supported Models
@@ -28,12 +30,14 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 | SubLN (head_dim=64) |
 | TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
 | TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
+| Llama3-8B-1.58-100B-tokens | 4.11 GB | 32 | 4096 | 14336 | 32 | 8 | 131072 | Llama3 (GQA, QK-Norm) |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
 Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
 TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
 TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO SubLN** — different arch than smaller TriLMs!
+Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
 
 ### HF Alignment Check — 22 Models Verified
 
@@ -140,6 +144,24 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
+### v2.10.3 🔥 — Bug Hunt Round 2 + Llama3-Support (AKTIV)
+- **5 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff `v < 128000`), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json). Bug #6 identifiziert (xoshiro_state global, deferred).
+- **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=131072. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Base Model (no chat template). T=0 argmax: Prompt repetition. T=0.7: coherent.
+- **v6 added_tokens Support**: C++ preencode scannt longest-first via sortierte `added_specs`. Decode per ID-Nachschlag. Preencode integriert in `tokenize_to_ids()`.
+- **`rope_interleaved_set` Flag**: Neues Struct-Feld. Config-JSON setzt es → Heuristik in `ensure_layer_idx` feuert nicht. Default `true` (interleaved). Qwen3/Bonsai setzen auf `false` (half-split).
+- **39/39 Mock-Tests grün**: 7 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant, Llama3, Bonsai). E2E v6 tokenizer roundtrip mit added_tokens.
+- **8/8 HF-Modelle regression-getestet**: Falcon3 (1B/3B/7B/10B), Bonsai (1.7B/4B/8B), BitNet-2B4T — alle heruntergeladen, inferiert, gelöscht. Keine Regression.
+
+### v2.10.2 ✅ — Consistent Naming + HF-Repos + Bugfixes (ABGESCHLOSSEN)
+- **HF-Repos konsistent**: Falcon3 Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. Bonsai-8B in Performance-Tabelle ergänzt.
+- **`matmul_reorder_deq` pre-divide**: Scale-Division (÷127) zur Pack-Zeit, runtime nur noch Mul — minimale Optimierung.
+- **v2.10.2 getaggt und gepusht** ✅.
+
+### v2.10.1 ✅ — BitNet EOS Fix + HF-Deployment (ABGESCHLOSSEN)
+- **BitNet EOS Token Fix**: `build_tokenizer_binary` Pattern-Matching priority fix. `eos_token_id=128001` (BOS) → `128009` (`<|eot_id|>`). Generiert `"Paris.<|eot_id|>"`.
+- **HF-Deployment**: [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) (1.04 GB, MIT). [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) (3 Größen, Apache-2.0).
+- **v2.10.1 getaggt und gepusht** ✅.
+
 ### v2.10.0 ✅ — Unified Packer + BF16 Weight-Scale Fix (ABGESCHLOSSEN)
 - **Unified `pack_to_atlas.py`**: Single packer replaces all individual packers (`atlas_packer.py`, `atlas_packer_g128.py`, `atlas_packer_bitnet.py`). Architecture auto-detection via `config.json`. Single pipeline for Falcon3/Qwen3/BitNet/TriLM/Llama.
 - **BF16 weight_scale Fix**: `weight_scale`-Tensoren sind bfloat16 dtype → `get_tensor_np()` mit `framework="np"` wirft Exception → `scales.get(sname, 1.0)` liefert immer 1.0. Fix: Fallback auf `reader.get_bf16_manual(tname)` in `pack_to_atlas.py:510-519`. Betrifft Falcon3, BitNet und alle Modelle mit BF16 weight_scale.
@@ -178,7 +200,7 @@ See `atlas_ffi.h` for full API.
 - **Python reorder**: `set_use_f32_matmul()` called before `quantize_ffn_to_i4()` to ensure f32_bypass models skip int4 conversion.
 - **Target erreicht**: 7B +26% (2.5→3.15 tok/s), 10B +18% (1.9→2.25 tok/s). Alle 6 Modelle (3B/7B/10B/Bonsai-1.7B/Bonsai-4B/BitNet) korrekt.
 
-### v2.4.0 — Qwen3/Bonsai-Okosystem-Upgrade (AKTIV)
+### v2.4.0 ✅ — Qwen3/Bonsai-Okosystem-Upgrade (ABGESCHLOSSEN)
 - **Packer (`atlas_packer_bonsai.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
 - **head_dim=128**: Alle Attention-Pfade (RoPE, Scores, Weighted Sum, KV-Cache) auf variablen head_dim umstellen.
 - **QK-Norm**: Zwei neue RMSNorm-Tensoren pro Layer (`q_norm`, `k_norm`) im Attention-Hotpath.
@@ -196,7 +218,7 @@ See `atlas_ffi.h` for full API.
 - **Kein RAM-Wachstum**: Cache bleibt `n_layers × n_kv_heads × max_seq_len × head_dim` — keine lineare Skalierung mit `seq_now`.
 - **Target erreicht**: 8K Kontext auf Falcon3-3B getestet, 16K auf Bonsai-4B getestet. Ring Buffer für 128→200+ Token Wrapping validiert.
 
-### v2.6.0 — Pipeline: SSE Web-Server + Prompt-Caching
+### v2.6.0 ✅ — Pipeline: SSE Web-Server + Prompt-Caching (ABGESCHLOSSEN)
 - **SSE Web-Server**: `atlas_server.py` — FastAPI/SSE-Wrapper für HTTP-Streaming. `/v1/chat/completions` Endpoint, `StreamingResponse` für token-by-token SSE.
 - **Prompt-Caching**: KV-Cache persistiert über `generate_c`-Aufrufe hinweg. `asyncio.Lock()` serialisiert Zugriff. `POST /reset` zum manuellen Cache-Leeren.
 - **`atlas_reset_cache()` C-API**: Neue C-Funktion + Python `AtlasModel.reset_cache()`. Zeros KV-Cache-Daten, Allokation bleibt erhalten.
@@ -210,6 +232,10 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.10.3** | **Bug Hunt Round 2 + Llama3-Support**: 5 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
+| **v2.10.2** | **Consistent Naming + HF-Repos**: Falcon3 HF-Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. `matmul_reorder_deq` pre-divide Optimierung. Bonsai-8B in Performance-Tabelle. |
+| **v2.10.1** | **BitNet EOS Fix + HF-Push**: `build_tokenizer_binary` Pattern-Matching priority fix. BitNet-2B4T + Bonsai (3 Größen) auf HF Hub deployed. `eos_token_id=128001→128009`. |
+| **v2.10.0** | **Unified Packer + BF16 Weight_Scale Fix**: `pack_to_atlas.py` ersetzt alle Einzel-Packer. BF16 weight_scale Fallback. 4 Falcon3 Modelle gepackt. BitNet EOS Token Fix. CLI Build OK. 22/22 Mock-Tests. |
 | **v2.9.2** | **Mock-CI-Infrastruktur + Bugfixes**: 3 Bugs gekillt (ttype=1 data_size heuristic, ensure_buffers Q-buffer overflow, _cache_indices BitNet stride). 2 neue C-APIs (atlas_set_rope_interleaved, atlas_set_rope_theta). `tests/atlas_mock_model.py` generiert synthetische v8-Modelle (200-300 KB) für 3 Architekturen (Falcon3/Qwen3/BitNet) mit echtem TQ1-Packing. `tests/test_mock_model.py`: 9 parametrisierte pytest-Tests (load/forward/batch) in 1.14s. EOS-fix aus tokenizer special[0] statt header-guess. Regression: Falcon3-3B/Bonsai-8B/TriLM-1.5B — 3/3 pass. |
 | **v2.9.1** | **Hardening-Release**: Windows UTF-8 argv über `CommandLineToArgvW`+`WideCharToMultiByte` — Umlaute/Akzente korrekt. 6 Argument-Guards (NaN/Overflow/Sektor 2). CI/CD Smoke-Test (`tests/test_mock_model.py`). Proaktiver CPUID-AVX2-Check (`check_avx2()`) mit Fehlermeldung statt SIGILL. cross-platform release.yml mit shell32. |
 | **v2.9.0** | **Standalone C++ CLI** (`atlas_cli.cpp`): 575 Zeilen, `LoadLibrary`/`dlopen` dynamisches DLL-Binding, interaktiver `/reset`-Modus, Chat-Template-Detection (Falcon3/BitNet/Qwen3), vollständiges Arg-Parsing. `compile.bat` baut jetzt `atlas.dll` + `atlas.exe`. GitHub Auto-Release (`release.yml`) mit Windows/Linux Zip/Tar + LLVM-Runtime-DLLs. README komplett umgeschrieben — Community-Framing. |
@@ -259,8 +285,8 @@ See `atlas_ffi.h` for full API.
 - `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Generiert YAML-Frontmatter (base_model, license, tags per Architektur-Familie). Keine Netzwerk-Abhängigkeit im Kern-Packer.
 - `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
 - `compile.bat` — Windows Build-Script (DLL + optional CLI)
-- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (6 Architekturen, TQ1-Packing)
-- `tests/test_mock_model.py` — CI Smoke-Test (35 parametrisierte Tests)
+- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (7 Architekturen, TQ1-Packing)
+- `tests/test_mock_model.py` — CI Smoke-Test (39 parametrisierte Tests)
 - `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
 - `.github/workflows/release.yml` — Auto-Release bei v*-Tag (Windows/Linux Zip/Tar)
 
@@ -268,8 +294,10 @@ See `atlas_ffi.h` for full API.
 
 - **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
 - **v6 format**: v5 + binary tokenizer block (128-byte header, offsets/lengths/pool, BPE merges, byte_encoder, special tokens).
+- **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
 - **Chat template**: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation prompt: `<|assistant|>\n`.
   BitNet: `{Role}: {content}<|eot_id|>\n` — generation prompt: `Assistant: `. EOS token `<|eot_id|>` = 128009.
+  Llama3 (Base Model): No chat template. Generation: `{prompt}`. Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
 - **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
 - **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).
 - **Cache**: `.i8` cache auto-generated on first full int8 decompress, mmap'd on reload.

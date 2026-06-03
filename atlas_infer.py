@@ -397,7 +397,7 @@ class AtlasModel:
         # Load tokenizer — prefer v6 binary (C++), fallback to v5 JSON (Python)
         self._tok = None
         self._use_cpp_tokenizer = False
-        self._eos_id = 0
+        self._eos_id = None
         self._chat_template = None
 
         # Phi-3: instruct model, head_dim=96, small vocab, <|role|> format with <|end|>
@@ -406,6 +406,7 @@ class AtlasModel:
         self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
         # Qwen3/Bonsai detection: not TriLM, and head_dim<=128 or large vocab (>131k)
         self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and not self._is_bitnet and (self.head_dim <= 128 or self.vocab_size > 131072))
+        self._is_llama3 = False  # may be set below from embedded chat_template
         self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
 
         # Read chat_template from embedded config JSON (present in both v5 and v6)
@@ -421,6 +422,10 @@ class AtlasModel:
                 if cfg_size > 0:
                     cfg = json.loads(raw[pos:pos+cfg_size].decode('utf-8'))
                     self._chat_template = cfg.get('chat_template')
+                    # Detect Llama3 from embedded chat_template (<|start_header_id|>)
+                    if self._chat_template and '<|start_header_id|>' in self._chat_template:
+                        self._is_llama3 = True
+                        self._is_qwen3 = False
                     # Bonsai has no embedded template → no thinking support
                     if not self._chat_template and self._is_qwen3:
                         self._enable_thinking = False
@@ -430,12 +435,14 @@ class AtlasModel:
                         self._eos_id = eos_cfg['id']
                     elif eos_cfg and isinstance(eos_cfg, str):
                         if self._tok is not None:
-                            self._eos_id = self._tok.token_to_id(eos_cfg) or 0
+                            tid = self._tok.token_to_id(eos_cfg)
+                            if tid is not None:
+                                self._eos_id = tid
             except Exception:
-                pass
+                print(f"[Atlas] Warning: failed to parse embedded tokenizer config")
 
         # Fallback: read EOS/PAD from file header bytes 45-52
-        if self._eos_id == 0:
+        if self._eos_id is None:
             try:
                 with open(self._atlas_path, 'rb') as f:
                     f.seek(45)
@@ -443,7 +450,7 @@ class AtlasModel:
                     if len(hdr) == 8:
                         self._eos_id = struct.unpack('<I', hdr[:4])[0]
             except Exception:
-                pass
+                print(f"[Atlas] Warning: failed to read EOS from file header")
 
         # Check for v6 binary tokenizer (C++ decode)
         if dll.atlas_has_binary_tokenizer(self.model_ptr):
@@ -880,7 +887,11 @@ class AtlasModel:
         except Exception as e:
             return f"[TOKENIZER ERROR: {e}]"
 
-        stop_tokens = ['<|user|>', '<|system|>', '<|end|>']
+        stop_tokens = ['<|user|>', '<|system|>', '<|end|>', '<|im_end|>']
+        if getattr(self, '_is_llama3', False):
+            stop_tokens += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
+        if getattr(self, '_is_bitnet', False):
+            stop_tokens += ['<|eot_id|>']
 
         full_logits = self.forward(np.array([input_ids], dtype=np.int32))
         logits = full_logits[0, -1, :]
@@ -973,6 +984,10 @@ class AtlasModel:
         output = list(out_arr[:n_gen])
         decoded = self._cpp_decode(output)
         stops = ['<|user|>', '<|system|>', '<|end|>', '<|im_end|>']
+        if getattr(self, '_is_llama3', False):
+            stops += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
+        if getattr(self, '_is_bitnet', False):
+            stops += ['<|eot_id|>']
         for stop in stops:
             idx = decoded.find(stop)
             if idx >= 0:
@@ -1119,6 +1134,10 @@ class AtlasModel:
         text = result_bytes.decode('utf-8', errors='replace')
         if skip_special:
             stops = ['<|endoftext|>', '<|im_end|>', '<|pad|>']
+            if getattr(self, '_is_llama3', False):
+                stops += ['<|eot_id|>', '<|begin_of_text|>', '<|start_header_id|>', '<|end_header_id|>']
+            if getattr(self, '_is_bitnet', False):
+                stops += ['<|eot_id|>', '<|begin_of_text|>']
             for s in stops:
                 text = text.replace(s, '')
         return text
@@ -1144,6 +1163,18 @@ class AtlasModel:
                 enable = getattr(self, '_enable_thinking', True)
                 if not enable:
                     result += '<think>\n\n</think>\n\n'
+            return result
+
+        # Llama3: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
+        if self._is_llama3:
+            eos = '<|eot_id|>'
+            result = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg.get('content', '')
+                result += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}{eos}\n"
+            if add_generation_prompt:
+                result += '<|start_header_id|>assistant<|end_header_id|>\n\n'
             return result
 
         # BitNet: Role: content<|eot_id|> (per tokenizer_config.json Jinja2 template)

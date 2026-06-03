@@ -1,5 +1,47 @@
 # Known Issues & Limitations
 
+## ✅ Recently Fixed (v2.10.3 — Bug Hunt Round 2)
+
+### Bug #1: Falcon3 BPE Vocab Cutoff (Critical)
+- **Fixed**: `pack_to_atlas.py:334` hatte hardcodiertes `v < 128000` als BPE-Vocab-Filter — köpft Falcon3 (V=131072 → 3072 BPE-Tokens verloren).
+- **Fix**: `raw_vocab` aus JSON `model.vocab` direkt genutzt. Fallback `tok.get_vocab()` bleibt als Safety-Net.
+- **Note**: Wurde nie committed; alle HF-Modelle mit `tok.get_vocab()` gepackt → unbeschädigt.
+
+### Bug #2: Fehlende Llama3-Stops in `generate_c()`
+- **Fixed**: `atlas_infer.py:980` fehlten `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>` als Stopp-Token.
+- **Fix**: Diese Tokens unter `_is_llama3` Guard hinzugefügt.
+
+### Bug #3: Fehlende Llama3-Special-Suppression in `_cpp_decode()`
+- **Fixed**: `atlas_infer.py:1126` fehlten dieselben Tokens in der Decode-Skip-Liste.
+- **Fix**: `<|eot_id|>`, `<|begin_of_text|>`, `<|start_header_id|>`, `<|end_header_id|>` hinzugefügt — nur bei `_is_llama3`.
+
+### Bug #4: Unaligned Pointer Access
+- **Fixed**: `atlas_api.cpp:859` hatte `*(const uint32_t*)ap` auf potentiell unaligned Addressen → UB auf ARM/RISC.
+- **Fix**: `memcpy(&val, ap, 4)` — portabel, kein Performance-Verlust auf x86.
+
+### Bug #5: `rope_interleaved` Heuristik überschreibt Config
+- **Fixed**: `atlas_api.cpp:4874` in `ensure_layer_idx()` setzte `rope_interleaved` unabhängig von config.json.
+- **Fix**: `rope_interleaved_set` Flag — Config-JSON setzt es; Heuristik feuert nur wenn Config keinen Wert hatte.
+
+### Bug #6: `xoshiro_state` global → thread_local
+- **Identified**: `atlas_api.cpp:133` — `static uint64_t xoshiro_state[4]` global, nicht `thread_local`.
+- **Fix**: `static thread_local` — jeder Thread bekommt eigenen Xoshiro-Zustand. Kein Data Race mehr.
+- **Note**: Bug #6 in v2.10.3 gefixt (vorher für v2.10.4 geplant).
+
+### Bug #7: `g_has_avx512_vnni` Init-Race
+- **Identified**: `atlas_api.cpp:3105` — `static int g_has_avx512_vnni = -1` ohne Thread-Safe-Init. Zwei Threads sehen gleichzeitig `-1` und schreiben beide denselben Wert.
+- **Fix**: C++11 function-local `static const int`, initialisiert beim ersten Funktionsaufruf (garantiert Thread-safe via Standard).
+
+### Bug #8: `_eos_id = 0` Sentinel konfligiert mit EOS-Token-ID 0
+- **Identified**: `atlas_infer.py:400` — Sentinalwert `0` ist nicht von echtem EOS-Token `0` unterscheidbar.
+- **Fix**: Sentinal auf `None` geändert. Fallback-Check `if self._eos_id is None` statt `if self._eos_id == 0`. `token_to_id()` nutzt `if tid is not None`.
+
+### Bug #9: Fehlende BitNet-Stops in `generate_c()` und `_cpp_decode()`
+- **Identified**: `atlas_infer.py:980` — `generate_c()` fügt Llama3-Stops hinzu, aber nicht BitNet (`<|eot_id|>`). Gleiches Problem in `_cpp_decode()` (Zeile 1128) und `generate()` (Zeile 888).
+- **Fix**: `_is_bitnet`-Guards in allen drei Funktionen.
+
+---
+
 ## Hybrid CPU (Intel Alder Lake+) Thread Oversubscription
 - **Symptoms**: Lower tok/s than expected on Intel 12th gen+ CPUs. P-cores idle while waiting for E-cores at OpenMP barriers.
 - **Workaround**: Set `--threads` to your physical P-core count (not logical threads). Example: i7-12700H (6P+8E) → `--threads 6`.

@@ -177,11 +177,15 @@ def pre_shuffle_rows(tensor):
     return out
 
 
-def quantize_tq1_repack(tensor_uint8, scale_val=1.0):
-    """Falcon3: uint8 [OUT/4, IN] → TQ1 Base-3 with fp16 scale.
+def quantize_tq1_repack(tensor_uint8, scale_val=1.0, sub_row_bit_invert=False):
+    """I2_S uint8 [OUT/4, IN] → TQ1 Base-3 with fp16 scale.
 
     Each uint8 byte packs 4 consecutive output rows at one input column.
     De-interleave → clamp → repack as TQ1.
+
+    TII Falcon3 format (default): sub-row 0 in low bits [0-1].
+    Microsoft format (invert=True): sub-row 0 in high bits [6-7].
+
     Returns (data_bytes, packed_per_row, row_dim).
     """
     arr = tensor_uint8.astype(np.uint32)
@@ -192,10 +196,18 @@ def quantize_tq1_repack(tensor_uint8, scale_val=1.0):
 
     for ur in range(u8_rows):
         row = arr[ur]
-        t0 = np.minimum(row & 3, 2)
-        t1 = np.minimum((row >> 2) & 3, 2)
-        t2 = np.minimum((row >> 4) & 3, 2)
-        t3 = np.minimum((row >> 6) & 3, 2)
+        if sub_row_bit_invert:
+            # Microsoft I2_S: sub-row 0 in high bits
+            t0 = np.minimum((row >> 6) & 3, 2)
+            t1 = np.minimum((row >> 4) & 3, 2)
+            t2 = np.minimum((row >> 2) & 3, 2)
+            t3 = np.minimum(row & 3, 2)
+        else:
+            # TII Falcon3: sub-row 0 in low bits
+            t0 = np.minimum(row & 3, 2)
+            t1 = np.minimum((row >> 2) & 3, 2)
+            t2 = np.minimum((row >> 4) & 3, 2)
+            t3 = np.minimum((row >> 6) & 3, 2)
         for sub, src in enumerate([t0, t1, t2, t3]):
             wt = src.astype(np.int32)
             full_len = packed_per_row * 5
@@ -313,7 +325,16 @@ def build_tokenizer_binary(model_dir):
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(tok_path)
 
-    vocab = tok.get_vocab()
+    # Get raw vocab from JSON to exclude added tokens (IDs >= 128000).
+    # Tokenizer.get_vocab() includes added tokens, which would inflate V
+    # and cause merge_lookup to mis-handle out-of-vocab IDs.
+    with open(tok_path, "r", encoding="utf-8") as jf:
+        tok_json_data = json.load(jf)
+    raw_vocab = tok_json_data.get("model", {}).get("vocab", {})
+    # raw_vocab contains only BPE tokens (model.vocab), NOT added tokens.
+    # Using it directly ensures V matches the true BPE vocab size — no filter needed.
+    # This correctly handles Falcon3 (V=131072), Llama3 (V=128000), and all other models.
+    vocab = raw_vocab if raw_vocab else {k: v for k, v in tok.get_vocab().items() if v < 128000}
     V = len(vocab)
     sorted_items = sorted(vocab.items(), key=lambda kv: kv[1])
 
@@ -333,8 +354,6 @@ def build_tokenizer_binary(model_dir):
     merge_left = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
     merge_right = np.full(V, 0xFFFFFFFF, dtype=np.uint32)
     merge_rank = np.zeros(V, dtype=np.uint32)
-    with open(tok_path, "r", encoding="utf-8") as jf:
-        tok_json_data = json.load(jf)
     merges_list = tok_json_data.get("model", {}).get("merges", [])
     for i, merge_pair in enumerate(merges_list):
         if isinstance(merge_pair, list) and len(merge_pair) == 2:
@@ -392,13 +411,21 @@ def build_tokenizer_binary(model_dir):
             tcfg = json.load(cf)
         for key in ["eos_token", "bos_token", "pad_token", "unk_token", "mask_token", "sep_token", "cls_token"]:
             val = tcfg.get(key)
-            if val and isinstance(val, dict) and "id" in val:
-                special_ids[key.split("_")[0]] = val["id"]
-    for token_str, tid in vocab.items():
-        for pattern, idx_key in [("<|endoftext|>", "eos"), ("<|im_end|>", "eos"),
-                                  ("<|eot_id|>", "eos"),
-                                  ("<|pad|>", "pad"), ("<unk>", "unk")]:
-            if token_str == pattern and special_ids[idx_key] == 0xFFFFFFFF:
+            idx_key = key.split("_")[0]
+            if val:
+                if isinstance(val, dict) and "id" in val:
+                    special_ids[idx_key] = val["id"]
+                elif isinstance(val, str):
+                    tid = tok.token_to_id(val)
+                    if tid is not None:
+                        special_ids[idx_key] = tid
+    # Fallback: pattern matching in BPE vocab + full tokenizer
+    for pattern, idx_key in [("<|endoftext|>", "eos"), ("<|im_end|>", "eos"),
+                              ("<|eot_id|>", "eos"),
+                              ("<|pad|>", "pad"), ("<unk>", "unk")]:
+        if special_ids[idx_key] == 0xFFFFFFFF:
+            tid = tok.token_to_id(pattern)
+            if tid is not None:
                 special_ids[idx_key] = tid
     if special_ids["eos"] == 0xFFFFFFFF:
         special_ids["eos"] = 0
@@ -410,6 +437,22 @@ def build_tokenizer_binary(model_dir):
         special_ids["eos"], special_ids["bos"], special_ids["pad"],
         special_ids["unk"], special_ids["mask"], special_ids["sep"], special_ids["cls"],
     ], dtype=np.uint32)
+
+    # Extract out-of-vocab added tokens (IDs >= V, not in BPE vocab).
+    # These cannot be produced by BPE merges and must be handled as atomic units
+    # by the pre-encode step (e.g. Llama3 special tokens 128000-128255).
+    # Include ALL out-of-vocab tokens — even EOS/BOS — since the C++ preencode
+    # only scans added_specs, not the special array.
+    added_tokens_sorted = []
+    added_tok_json = tok_json_data.get("added_tokens", [])
+    # Only include tokens whose ID >= V (out of BPE vocab range)
+    out_of_vocab = [a for a in added_tok_json if a["id"] >= V]
+    # Sort by length descending for longest-match-first scanning in C++
+    out_of_vocab.sort(key=lambda a: -len(a["content"]))
+    for a in out_of_vocab:
+        tbytes = a["content"].encode("utf-8")
+        added_tokens_sorted.append((tbytes, a["id"]))
+    num_added = len(added_tokens_sorted)
 
     off = 128
     off_offsets = off
@@ -432,6 +475,19 @@ def build_tokenizer_binary(model_dir):
     off += 512
     off_special = off
     off += 28
+    off_added_tokens = off if num_added > 0 else 0
+    added_data = b""
+    if num_added > 0:
+        added_data += struct.pack("<I", num_added)
+        for tbytes, tid in added_tokens_sorted:
+            slen = len(tbytes)
+            added_data += struct.pack("<I", slen)
+            added_data += tbytes
+            pad_len = (4 - slen % 4) % 4
+            if pad_len:
+                added_data += b"\x00" * pad_len
+            added_data += struct.pack("<I", tid)
+        off += len(added_data)
     total_size = off
 
     buf = bytearray(total_size)
@@ -439,10 +495,12 @@ def build_tokenizer_binary(model_dir):
     struct.pack_into("<I", buf, 4, 1)
     struct.pack_into("<I", buf, 8, V)
     struct.pack_into("<I", buf, 12, max_token_length)
+    struct.pack_into("<I", buf, 16, num_added)  # h[4] = num_added_tokens
     struct.pack_into("<I", buf, 20, 0)
     offs_list = [off_offsets, off_lengths, off_pool, len(pool),
                  off_merge_left, off_merge_right, off_merge_rank,
-                 off_byte_enc, off_byte_dec, off_special]
+                 off_byte_enc, off_byte_dec, off_special,
+                 off_added_tokens]  # offs[10] at byte 104
     for i, val in enumerate(offs_list):
         struct.pack_into("<Q", buf, 24 + i * 8, val)
     buf[off_offsets:off_offsets + V * 4] = offsets.tobytes()
@@ -454,6 +512,8 @@ def build_tokenizer_binary(model_dir):
     buf[off_byte_enc:off_byte_enc + 512] = byte_encoder.tobytes()
     buf[off_byte_dec:off_byte_dec + 512] = byte_decoder.tobytes()
     buf[off_special:off_special + 28] = special_arr.tobytes()
+    if num_added > 0 and off_added_tokens:
+        buf[off_added_tokens:off_added_tokens + len(added_data)] = added_data
 
     return bytes(buf)
 
@@ -661,7 +721,8 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 sname = name.replace(".weight", ".weight_scale")
                 scale_val = scales.get(sname, 1.0)
                 data_bytes, packed_per_row, row_dim = quantize_tq1_repack(
-                    tensor.numpy(), scale_val)
+                    tensor.numpy(), scale_val,
+                    sub_row_bit_invert=arch.get("sub_row_bit_invert", False))
                 tens_ttype = 0
                 n_blocks = 0
 

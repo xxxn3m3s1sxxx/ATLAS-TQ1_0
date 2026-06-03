@@ -149,8 +149,20 @@ def detect_arch(config, available_tensors=()):
         print(f"  (detected Falcon3 variant via head_dim=256, rope_theta=1000042)")
         return FALCON3
 
+    # Llama models with uint8 I2_S weights (e.g. HF1BitLLM/Llama3-8B-1.58-100B-tokens)
+    # have weight_scale tensors and U8 weight dtype. Route to Falcon3 uint8 repack path.
+    # TII Falcon3 (head_dim=256) is caught by the check above; remaining Llama I2_S models
+    # use Microsoft bit order (sub-row 0 in high bits) — set invert flag.
     if mt in ARCH_REGISTRY:
-        return ARCH_REGISTRY[mt]
+        entry = ARCH_REGISTRY[mt]
+        # Standard Llama expects BF16; if weight_scale tensors exist, this is I2_S format
+        if entry.get("input_format") == "bf16" and not entry.get("has_weight_scale"):
+            has_ws = any(t.endswith("weight_scale") for t in available_tensors)
+            if has_ws:
+                invert = config.get("is_bitnet_config", False)
+                print(f"  (detected I2_S variant: {mt} with weight_scale tensors, using uint8 repack, invert_subrows={invert})")
+                return {**FALCON3, "sub_row_bit_invert": invert}
+        return entry
 
     # Heuristic fallback: check for SubLN tensors
     has_sub_ln = any("attn_sub_norm" in t or "ffn_sub_norm" in t for t in available_tensors)

@@ -129,8 +129,8 @@ static int check_avx512_vnni(void) {
 }
 #endif
 
-// ─── Xoshiro256** PRNG (thread-safe, 64-bit) ──────────────────────────
-static uint64_t xoshiro_state[4] = {0};
+// ─── Xoshiro256** PRNG (thread-safe via thread_local, 64-bit) ──────────
+static thread_local uint64_t xoshiro_state[4] = {0};
 
 static void xoshiro_seed(uint64_t seed) {
     auto sm64 = [](uint64_t& s) {
@@ -366,6 +366,7 @@ struct AtlasModel {
     bool use_hybrid_matmul = false; // v1.3.2: FFN int8 cache, QKV packed
     bool use_relu2 = false;         // v2.8.0: ReLU² activation (BitNet b1.58)
     bool rope_interleaved = true;   // true=interleaved (Falcon3/Qwen3), false=half-split (Llama/BitNet)
+    int rope_interleaved_set = 0;   // was explicitly set from config (v6+ meta-block)
     int has_meta = 0;               // v8: meta-block was parsed
     std::vector<TensorInfo> tensors;
     // Tensor names (loaded from v4+ atlas files, eliminates safetensors dependency)
@@ -418,6 +419,11 @@ struct AtlasModel {
     int tokenizer_binary_size = 0;
     uint32_t tokenizer_binary_offset = 0;
     const uint8_t* binary_tok_base = nullptr;  // pointer into mmap'd atlas file
+    struct AddedTokenSpec {
+        const char* str;
+        uint16_t str_len;
+        uint32_t token_id;
+    };
     struct {
         uint32_t magic;
         uint32_t version;
@@ -436,6 +442,8 @@ struct AtlasModel {
         const uint16_t* byte_decoder;  // [256]
         const uint32_t* special;       // [7] eos/bos/pad/unk/mask/sep/cls
         int* merge_lookup;             // hash table: (left<<12)|right → merged_id, size = vocab_size*2
+        uint32_t num_added_tokens;     // out-of-vocab added tokens (e.g. Llama3 128000+)
+        AddedTokenSpec* added_specs;   // allocated array, sorted by str_len descending
     } tok = {};
     // Int8 quantized lm_head (per-row symmetric, ~403 MB instead of 1.5 GB fp32)
     int8_t* lm_head_i8 = nullptr;
@@ -454,6 +462,7 @@ struct AtlasModel {
         if (lm_head_offsets) atlas_vfree((uint8_t*)lm_head_offsets);
         if (lm_head_scales) atlas_vfree((uint8_t*)lm_head_scales);
         delete[] tok.merge_lookup;
+        delete[] tok.added_specs;
     }
 
     bool is_mapped(const uint8_t* ptr) const {
@@ -559,7 +568,7 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     }
 
     v = find_after(json, "\"rope_interleaved\"");
-    if (v) m->rope_interleaved = (*v == 't' || *v == '1');
+    if (v) { m->rope_interleaved = (*v == 't' || *v == '1'); m->rope_interleaved_set = 1; }
 
     v = find_after(json, "\"use_f32_bypass\"");
     if (v) m->use_f32_matmul = (*v == 't' || *v == '1');
@@ -832,6 +841,27 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             m->tok.byte_decoder = (const uint16_t*)(base + offs[8]); // offset_byte_dec
             m->tok.special = (const uint32_t*)(base + offs[9]);     // offset_special
 
+            // Parse out-of-vocab added tokens (offs[10], byte 104)
+            m->tok.num_added_tokens = h[4];  // stored at byte 16
+            uint64_t added_off = (m->tok.num_added_tokens > 0) ? offs[10] : 0;
+            if (added_off > 0 && (ptrdiff_t)added_off < m->tokenizer_binary_size - 8) {
+                const uint8_t* ap = base + (ptrdiff_t)added_off;
+                uint32_t count; memcpy(&count, ap, 4); ap += 4;
+                if (count > 0 && count <= 4096) {
+                    m->tok.num_added_tokens = count;
+                    m->tok.added_specs = new AtlasModel::AddedTokenSpec[count];
+                    for (uint32_t i = 0; i < count; i++) {
+                        uint32_t slen; memcpy(&slen, ap, 4); ap += 4;
+                        m->tok.added_specs[i].str = (const char*)ap;
+                        m->tok.added_specs[i].str_len = (uint16_t)(slen < 65536 ? slen : 0);
+                        ap += slen;
+                        uint32_t pad = (4 - slen % 4) % 4;
+                        ap += pad;
+                        memcpy(&m->tok.added_specs[i].token_id, ap, 4); ap += 4;
+                    }
+                }
+            }
+
             // Build merge lookup hash table for O(1) pair → merged_id
             // Open-addressing, table size = 2 * vocab_size (power of 2)
             int V = (int)m->tok.vocab_size;
@@ -980,7 +1010,8 @@ ATLAS_API int atlas_has_binary_tokenizer(AtlasModel* m) {
     return (m->tok.magic == 0x544F4B42) ? 1 : 0;
 }
 
-// Pre-encode UTF-8 text → byte-level token IDs (raw byte_encoder lookup, no BPE).
+// Pre-encode UTF-8 text → token IDs. First scans for out-of-vocab added tokens
+// (e.g. Llama3 special tokens 128000-128255), then falls back to byte_encoder + BPE.
 // Returns number of tokens, or -1 on error.
 ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
     const char* text, int text_len,
@@ -990,15 +1021,31 @@ ATLAS_API int atlas_tokenizer_preencode(AtlasModel* m,
     if (text_len <= 0 || max_ids <= 0) return 0;
 
     const uint16_t* byte_enc = m->tok.byte_encoder;
+    uint32_t unk = m->tok.special ? m->tok.special[3] : 0;
+    const uint32_t num_added = m->tok.num_added_tokens;
+    const AtlasModel::AddedTokenSpec* specs = m->tok.added_specs;
     int n = 0;
-    for (int i = 0; i < text_len && n < max_ids; i++) {
-        uint8_t b = (uint8_t)text[i];
-        uint16_t tid = byte_enc[b];
-        if (tid == 0xFFFF) {
-            uint32_t unk = m->tok.special ? m->tok.special[3] : 0;
-            out_ids[n++] = (int)unk;
-        } else {
-            out_ids[n++] = (int)tid;
+    int i = 0;
+    while (i < text_len && n < max_ids) {
+        // Scan for out-of-vocab added tokens first (longest match, sorted desc)
+        int matched = 0;
+        for (uint32_t j = 0; j < num_added; j++) {
+            uint16_t slen = specs[j].str_len;
+            if (i + slen <= text_len) {
+                if (memcmp(text + i, specs[j].str, slen) == 0) {
+                    int id = (int)specs[j].token_id;
+                    out_ids[n++] = id;
+                    i += slen;
+                    matched = 1;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            uint8_t b = (uint8_t)text[i];
+            uint16_t tid = byte_enc[b];
+            out_ids[n++] = (tid != 0xFFFF) ? (int)tid : (int)unk;
+            i++;
         }
     }
     return n;
@@ -1117,21 +1164,32 @@ ATLAS_API int atlas_tokenizer_decode(AtlasModel* m,
     int pos = 0;
     for (int i = 0; i < n_ids; i++) {
         int tid = ids[i];
-        if (tid < 0 || tid >= (int)m->tok.vocab_size) continue;
-        uint32_t off = offsets[tid];
-        uint16_t len = lengths[tid];
-        if (off + len > m->tok.pool_size) continue;
-        if (pos + (int)len > max_out - 1) {
-            // Truncate, but don't overflow
+        const char* str = nullptr;
+        uint32_t slen = 0;
+        if (tid >= 0 && tid < (int)m->tok.vocab_size) {
+            str = pool + offsets[tid];
+            slen = lengths[tid];
+        } else if (m->tok.num_added_tokens > 0 && m->tok.added_specs) {
+            // Look up out-of-vocab added token by ID
+            for (uint32_t j = 0; j < m->tok.num_added_tokens; j++) {
+                if ((int)m->tok.added_specs[j].token_id == tid) {
+                    str = m->tok.added_specs[j].str;
+                    slen = m->tok.added_specs[j].str_len;
+                    break;
+                }
+            }
+        }
+        if (!str) continue;
+        if (pos + (int)slen > max_out - 1) {
             int copy = max_out - 1 - pos;
             if (copy > 0) {
-                memcpy(out_text + pos, pool + off, copy);
+                memcpy(out_text + pos, str, copy);
                 pos += copy;
             }
             break;
         }
-        memcpy(out_text + pos, pool + off, len);
-        pos += len;
+        memcpy(out_text + pos, str, slen);
+        pos += slen;
     }
     out_text[pos] = '\0';
     return pos;
@@ -3044,7 +3102,6 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
 }
 
 // VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
-static int g_has_avx512_vnni = -1;
 
 // ─── v2.7.0: Fused symmetric int8 quant + ternary matmul + per-block dequant ───
 // act_f32: [B, input_dim] raw float activations (no pre-quantization needed)
@@ -3102,10 +3159,8 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     }
     float* scale_x = tl_scale_x;
 
-    // Initialize VNNI flag before OMP region (single-threaded)
-    if (g_has_avx512_vnni < 0) {
-        g_has_avx512_vnni = check_avx512_vnni() ? 1 : 0;
-    }
+    // C++11 function-local static const = thread-safe one-time init
+    static const int g_has_avx512_vnni = check_avx512_vnni() ? 1 : 0;
 
     // Step 2: TQ1 decode + ternary matmul via _mm256_sign_epi8
     // Scale decode (fp16→fp32) integrated into parallel region
@@ -4814,7 +4869,11 @@ static void ensure_layer_idx(AtlasModel* m) {
     m->layer_stride = stride;
     m->model_arch = model_arch;
     // RoPE format: interleaved for Qwen3 and Falcon3 (head_dim>=256), half-split for Llama/BitNet
-    m->rope_interleaved = (model_arch == ARCH_QWEN3) || (m->head_dim >= 256);
+    // Respect config.json override (v6+ meta-block): if rope_interleaved was explicitly set,
+    // the heuristic cannot override it.
+    if (!m->rope_interleaved_set) {
+        m->rope_interleaved = (model_arch == ARCH_QWEN3) || (m->head_dim >= 256);
+    }
     if (model_arch == ARCH_BITNET) m->use_f32_matmul = 1;
     m->layer_idx_cache.clear();
     m->layer_idx_cache.reserve(m->n_layers * stride);
