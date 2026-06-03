@@ -64,6 +64,8 @@ CUSTOM_PYTHON_NAMES = {
     "atlas_tokenizer_decode": "_cpp_decode",
     "atlas_lmhead_gemv": "_lmhead_gemv",
     "atlas_quantize_lmhead": "_quantize_lmhead",
+    "atlas_get_scale_emb": "scale_emb",
+    "atlas_set_scale_depth_factor": "set_scale_depth",
 }
 
 
