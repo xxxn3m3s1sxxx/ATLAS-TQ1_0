@@ -46,6 +46,7 @@ scripts/
 !scripts/verify_hf_alignment.py
 !scripts/check_coverage_thresholds.py
 !scripts/release_to_hf.py
+!scripts/update_hf_readme.py
 !scripts/validate_scales.py
 !scripts/verify_tq1.py
 !scripts/check_tensors.py

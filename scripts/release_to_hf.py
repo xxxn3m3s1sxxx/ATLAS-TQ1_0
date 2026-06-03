@@ -359,7 +359,7 @@ To prevent token degradation and alignment shifting, use the standard chat templ
 ### Python
 
 ```bash
-git clone https://github.com/xxxn3m3s1sxxx/ATLAS.git
+git clone https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0.git
 ```
 
 ```python
@@ -408,7 +408,7 @@ curl http://localhost:8080/v1/chat/completions \\
 
 ### Links
 
-- **Engine source code**: [github.com/xxxn3m3s1sxxx/ATLAS](https://github.com/xxxn3m3s1sxxx/ATLAS)
+- **Engine source code**: [github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0](https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0)
 - **Original model**: [`{base_model_hf}`](https://huggingface.co/{base_model_hf})
 
 ---
