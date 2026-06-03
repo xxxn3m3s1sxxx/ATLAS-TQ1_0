@@ -113,6 +113,20 @@ TRILM_NOSUBLN = {
     "flags_fn": lambda cfg: 0,
 }
 
+# ─── MiniCPM (stride=9, Llama-like, scale_emb/scale_depth) ─────────────
+MINICPM = {
+    "model_types": {"minicpm"},
+    "layer_tensors": list(FALCON3["layer_tensors"]),
+    "stride": 9,
+    "global_tensors": ["model.embed_tokens.weight", "model.norm.weight"],
+    "conditional_layer": ["lm_head.weight"],
+    "input_format": "bf16",
+    "requires_pre_shuffle": True,
+    "quant_weight": "tq1_block_scaled",
+    "has_weight_scale": False,
+    "flags_fn": lambda cfg: 0,
+}
+
 # ─── Generic Llama (stride=9, no extras) ────────────────────────────────
 LLAMA = {
     "model_types": {"llama", "mistral", "gemma", "gemma2", "starcoder2", "phi3", "phi4"},
@@ -129,7 +143,7 @@ LLAMA = {
 
 # ─── Registry: model_type → arch entry ──────────────────────────────────
 ARCH_REGISTRY = {}
-for _entry in [FALCON3, QWEN3, BITNET, TRILM, TRILM_NOSUBLN, LLAMA]:
+for _entry in [FALCON3, QWEN3, BITNET, TRILM, TRILM_NOSUBLN, MINICPM, LLAMA]:
     for _mt in _entry["model_types"]:
         ARCH_REGISTRY[_mt] = _entry
 
@@ -155,6 +169,12 @@ def detect_arch(config, available_tensors=()):
     # use Microsoft bit order (sub-row 0 in high bits) — set invert flag.
     if mt in ARCH_REGISTRY:
         entry = ARCH_REGISTRY[mt]
+        # Llama models with SubLN tensors (attn_sub_norm, ffn_sub_norm) → TriLM
+        if mt == "llama" and available_tensors:
+            has_sub_ln = any("attn_sub_norm" in t or "ffn_sub_norm" in t for t in available_tensors)
+            if has_sub_ln:
+                print(f"  (detected TriLM SubLN variant via attn_sub_norm/ffn_sub_norm tensors)")
+                return TRILM
         # Standard Llama expects BF16; if weight_scale tensors exist, this is I2_S format
         if entry.get("input_format") == "bf16" and not entry.get("has_weight_scale"):
             has_ws = any(t.endswith("weight_scale") for t in available_tensors)
@@ -163,6 +183,12 @@ def detect_arch(config, available_tensors=()):
                 print(f"  (detected I2_S variant: {mt} with weight_scale tensors, using uint8 repack, invert_subrows={invert})")
                 return {**FALCON3, "sub_row_bit_invert": invert}
         return entry
+
+    # MiniCPM detection: scale_depth/scale_emb/dim_model_base in config, or architectures
+    if ("scale_depth" in config or "scale_emb" in config or "dim_model_base" in config
+            or any("MiniCPMForCausalLM" in a for a in config.get("architectures", []))):
+        print(f"  (detected MiniCPM via scale_depth/scale_emb/dim_model_base/architectures)")
+        return MINICPM
 
     # Heuristic fallback: check for SubLN tensors
     has_sub_ln = any("attn_sub_norm" in t or "ffn_sub_norm" in t for t in available_tensors)

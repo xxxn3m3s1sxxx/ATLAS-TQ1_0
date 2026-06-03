@@ -99,6 +99,9 @@ ATLAS_API void atlas_get_info(void* model, int* n_layers, int* hidden_dim,
                               int* inter_dim, int* n_heads, int* n_kv_heads,
                               int* head_dim, int* vocab_size);
 
+// v2.11.0: Get MiniCPM scale_emb embedding multiplier (default 1.0 = no-op).
+ATLAS_API float atlas_get_scale_emb(void* model);
+
 // ─── Tensor name API (v4+, no safetensors dependency) ─────────────────
 // Get number of tensors in the model. Returns 0 if names not loaded (v3).
 ATLAS_API int atlas_get_tensor_count(void* model);
@@ -205,6 +208,10 @@ ATLAS_API void atlas_set_rope_scale(void* model, float scale);
 // Default 4096. Set to model's trained context length (e.g., 2048 for Bonsai-1.7B).
 // When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied.
 ATLAS_API void atlas_set_base_seq_len(void* model, int seq_len);
+
+// v2.11.0: Set MiniCPM scale_depth factor for residual scaling.
+// factor = scale_depth / sqrt(n_layers). Default 1.0 (standard transformer = no-op).
+ATLAS_API void atlas_set_scale_depth_factor(void* model, float factor);
 
 // v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
 // Call between conversations to prevent context leakage across sessions.

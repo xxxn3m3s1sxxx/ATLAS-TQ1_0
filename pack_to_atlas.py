@@ -12,6 +12,7 @@ Supports: Falcon3, Qwen3/Bonsai, BitNet b1.58, TriLM, Llama, Mistral, Gemma, Phi
 """
 import argparse, json, os, struct, sys
 import numpy as np
+import torch
 from safetensors import safe_open
 
 from atlas_packer_mappings import detect_arch
@@ -43,12 +44,13 @@ def _clean_embed_rows(fp32, name):
 
 
 class SafetensorsReader:
-    """Read tensors from single or sharded safetensors files."""
+    """Read tensors from safetensors or PyTorch .bin files."""
 
     def __init__(self, model_dir):
         self.model_dir = model_dir
         self._shards_np = {}  # path → numpy safe_open handle
         self._shards_pt = {}  # path → torch safe_open handle
+        self._torch_state = None  # torch full state_dict (for .bin fallback)
 
         # Build weight map
         idx_path = os.path.join(model_dir, "model.safetensors.index.json")
@@ -56,18 +58,31 @@ class SafetensorsReader:
             with open(idx_path) as f:
                 idx = json.load(f)
             self.weight_map = idx["weight_map"]
-        else:
+            return
+
+        sf_path = os.path.join(model_dir, "model.safetensors")
+        if os.path.exists(sf_path):
             self.weight_map = {}
-            sf_path = os.path.join(model_dir, "model.safetensors")
-            if os.path.exists(sf_path):
-                with safe_open(sf_path, framework="np") as sf:
-                    for k in sf.keys():
-                        self.weight_map[k] = "model.safetensors"
-            else:
-                raise FileNotFoundError(f"No safetensors found in {model_dir}")
+            with safe_open(sf_path, framework="np") as sf:
+                for k in sf.keys():
+                    self.weight_map[k] = "model.safetensors"
+            return
+
+        # Fallback: PyTorch .bin file (MiniCPM, etc.)
+        bin_path = os.path.join(model_dir, "pytorch_model.bin")
+        if os.path.exists(bin_path):
+            import torch
+            print(f"  Loading PyTorch .bin: {bin_path}")
+            self._torch_state = torch.load(bin_path, map_location="cpu", weights_only=True)
+            self.weight_map = {k: "pytorch_model.bin" for k in self._torch_state.keys()}
+            return
+
+        raise FileNotFoundError(f"No safetensors or pytorch_model.bin found in {model_dir}")
 
     def get_tensor_np(self, tname):
-        """Read tensor via NumPy safe_open (returns numpy array)."""
+        """Read tensor as numpy array."""
+        if self._torch_state is not None:
+            return self._torch_state[tname].cpu().numpy()
         sp = self.weight_map.get(tname)
         if not sp:
             raise KeyError(f"Tensor {tname} not found in weight map")
@@ -77,7 +92,9 @@ class SafetensorsReader:
         return np.array(arr)
 
     def get_tensor_pt(self, tname):
-        """Read tensor via PyTorch safe_open (returns torch.Tensor)."""
+        """Read tensor via PyTorch."""
+        if self._torch_state is not None:
+            return self._torch_state[tname]
         sp = self.weight_map.get(tname)
         if not sp:
             raise KeyError(f"Tensor {tname} not found in weight map")
@@ -87,11 +104,16 @@ class SafetensorsReader:
         return self._shards_pt[shard].get_tensor(tname)
 
     def get_bf16_manual(self, tname):
-        """Manually parse BF16 tensor from raw safetensors bytes.
+        """Manually parse BF16 tensor from raw data.
 
-        Needed for BitNet models where safe_open may not handle BF16 correctly.
-        Falls back to safe_open for non-BF16 dtypes.
+        Handles safetensors (BitNet) and torch .bin (MiniCPM) formats.
         """
+        if self._torch_state is not None:
+            t = self._torch_state[tname]
+            arr = t.cpu().to(torch.float32).numpy()
+            arr = _clean_embed_rows(arr, tname)
+            arr = np.clip(arr, -65504.0, 65504.0)
+            return arr
         sp = self.weight_map.get(tname)
         if not sp:
             raise KeyError(f"Tensor {tname} not found")
@@ -129,6 +151,7 @@ class SafetensorsReader:
     def close(self):
         self._shards_np.clear()
         self._shards_pt.clear()
+        self._torch_state = None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -331,6 +354,11 @@ def build_tokenizer_binary(model_dir):
     with open(tok_path, "r", encoding="utf-8") as jf:
         tok_json_data = json.load(jf)
     raw_vocab = tok_json_data.get("model", {}).get("vocab", {})
+    # Detect SentencePiece-style tokenizer (pre_tokenizer is null)
+    pre_tok = tok_json_data.get("pre_tokenizer")
+    if pre_tok is None or pre_tok.get("type") is None:
+        print("  SentencePiece tokenizer detected — v6 binary block not supported, using v5 JSON fallback")
+        return b""
     # raw_vocab contains only BPE tokens (model.vocab), NOT added tokens.
     # Using it directly ensures V matches the true BPE vocab size — no filter needed.
     # This correctly handles Falcon3 (V=131072), Llama3 (V=128000), and all other models.
@@ -559,7 +587,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
     available = list(reader.weight_map.keys())
     arch = detect_arch(cfg, available)
     mt = cfg.get("model_type", "unknown")
-    print(f"  Arch: {mt} (stride={arch['stride']})")
+    print(f"  Stride: {arch['stride']} tensors/layer")
 
     is_uint8_input = any(reader.weight_map.get(n, "") and
                          os.path.exists(os.path.join(model_dir, reader.weight_map[n]))
@@ -696,18 +724,36 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         # Bytes 54-55: format_version (v2.10.0+)
         struct.pack_into("<H", header, 54, 2)
 
+        # v8 meta block (for MiniCPM scale_emb/scale_depth)
+        meta_bytes = b""
+        is_minicpm = cfg.get("scale_emb") is not None or cfg.get("scale_depth") is not None
+        if is_minicpm:
+            meta = {
+                "arch": "minicpm",
+                "scale_emb": cfg.get("scale_emb", 1.0),
+                "scale_depth": cfg.get("scale_depth", 1.0),
+                "rope_interleaved": False,
+                "use_f32_bypass": False,
+                "rope_theta": rope_theta,
+            }
+            meta_json = json.dumps(meta).encode("utf-8")
+            meta_bytes = struct.pack("<I", 4 + len(meta_json)) + meta_json
+            struct.pack_into("<H", header, 5, 8)  # upgrade to v8
+
         # Name block
         name_bytes = b"".join(n.encode() + b"\0" for n in tensor_names)
         name_block = struct.pack("<I", 4 + len(name_bytes)) + name_bytes
         struct.pack_into("<I", header, 56, len(name_block))
 
         out.write(header)
+        out.write(meta_bytes)
 
-        data_start = 64 + len(tensor_names) * 12 + len(name_block)
+        dir_offset = 64 + len(meta_bytes)
+        data_start = dir_offset + len(tensor_names) * 12 + len(name_block)
         directory = bytearray(len(tensor_names) * 12)
         current_offset = data_start
 
-        out.seek(64 + len(tensor_names) * 12)
+        out.seek(dir_offset + len(tensor_names) * 12)
         out.write(name_block)
         out.seek(data_start)
 
@@ -776,7 +822,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 if "embed" in name:
                     tensor_fp32 = _clean_embed_rows(
                         tensor.astype(np.float32), name)
-                    tensor_fp32 = np.clip(tensor_fp32, -65504.0, 65504.0)
+                    np.clip(tensor_fp32, -65504.0, 65504.0, out=tensor_fp32)
                     tensor = tensor_fp32.astype(np.float16)
                 elif tensor.dtype in (np.float32, np.float64):
                     tensor = tensor.astype(np.float16)
@@ -848,7 +894,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
         # ── Finalize header + directory ─────────────────────────────
         out.flush()
-        out.seek(64)
+        out.seek(dir_offset)
         out.write(directory)
         out.seek(0)
         out.write(header)

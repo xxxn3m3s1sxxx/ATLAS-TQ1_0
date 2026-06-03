@@ -76,11 +76,10 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
-| Falcon-Edge (1B/3B) | [`tiiuae`](https://huggingface.co/collections/tiiuae/falcon-edge-series-6804fd13344d6d8a8fa71130) | TII Falcon License 2.0 | 🚧 |
-| OLMo-BitNet-1B | [`NousResearch/OLMo-Bitnet-1B`](https://huggingface.co/NousResearch/OLMo-Bitnet-1B) | Apache 2.0 | 🚧 |
-| Llama3-8B-1.58 | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama 3 | 🚧 |
+| **BitCPM-CANN** (1B/3B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb/BitCPM-CANN-1B-unpacked) | Apache 2.0 | ✅ |
+| **BitCPM-CANN** (0.5B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb/BitCPM-CANN-0.5B-unpacked) | Apache 2.0 | ✅ |
 
-✅ — Supported and tested. 🚧 — Experimental, needs packer work.
+✅ — Supported and tested.
 
 **TriLM ⚠️**: TriLM 3.9B uses **standard Llama** (head_dim=128, no SubLN). Smaller TriLMs (≤2.4B) use SubLN (head_dim=64). Auto-detected by `derive_arch`.
 

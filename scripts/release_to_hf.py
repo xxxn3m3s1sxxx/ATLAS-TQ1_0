@@ -52,6 +52,23 @@ KNOWN_CONFIGS = {
            "intermediate_size": 6912, "num_attention_heads": 20,
            "num_key_value_heads": 5, "head_dim": 128, "rope_theta": 500000.0,
            "vocab_size": 128256, "tie_word_embeddings": True},
+    "0.5B": {"model_type": "minicpm", "num_hidden_layers": 24, "hidden_size": 1024,
+             "intermediate_size": 4096, "num_attention_heads": 16,
+             "num_key_value_heads": 2, "head_dim": 64, "rope_theta": 10000.0,
+             "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "1B": {"model_type": "minicpm", "num_hidden_layers": 28, "hidden_size": 2048,
+           "intermediate_size": 6144, "num_attention_heads": 16,
+           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "3B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 2560,
+           "intermediate_size": 10240, "num_attention_heads": 32,
+           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "8B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 4096,
+           "intermediate_size": 16384, "num_attention_heads": 32,
+           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4,
+           "tie_word_embeddings": False},
 }
 
 # Per-model perf & size description
@@ -63,6 +80,10 @@ MODEL_SIZES = {
     "4B":  ("17.4 tok/s (hybrid)",   "1.49 GB", "36 layers, 2560 hidden, 9728 intermediate \u2014 fast Bonsai"),
     "1.7B":("13.0 tok/s (f32 bypass)","0.86 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 light Bonsai"),
     "8B":  ("1.8 tok/s (f32 bypass)", "3.72 GB", "36 layers, 4096 hidden, 12288 intermediate \u2014 max Bonsai quality"),
+    "0.5B": ("30 tok/s (f32 bypass)",   "0.22 GB", "24 layers, 1024 hidden, 4096 intermediate \u2014 tiny CANN"),
+    "1B":  ("9.7 tok/s (hybrid)",      "0.83 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 CANN balanced"),
+    "3B":  ("7.1 tok/s (hybrid)",      "1.35 GB", "32 layers, 2560 hidden, 10240 intermediate \u2014 CANN quality"),
+    "8B":  ("1.5 tok/s (f32 bypass)",  "2.65 GB", "32 layers, 4096 hidden, 16384 intermediate \u2014 CANN max quality"),
 }
 
 
@@ -81,7 +102,7 @@ def _read_atlas_arch(atlas_path):
 
 
 def _detect_size(name):
-    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B"]:
+    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B", "0.5B"]:
         if sz in name:
             return sz
     return None
@@ -121,6 +142,7 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_bonsai = "Bonsai" in model_name or cfg.get("model_type") in ("qwen3",)
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
     is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
+    is_cann = "CANN" in model_name or cfg.get("model_type") == "minicpm"
 
     if is_bonsai:
         base_model_hf = f"prism-ml/Ternary-Bonsai-{size}-unpacked"
@@ -158,6 +180,30 @@ Assistant: 4
 ## License
 
 This is a **quantized derivative work** based on the **BitNet b1.58** architecture (original model by **Microsoft**), originally released under **MIT License**.
+
+The ATLAS engine itself is **Apache 2.0 licensed**.
+"""
+    elif is_cann:
+        base_model_hf = f"openbmb/BitCPM-CANN-{size}"
+        ctx_window = "32768 (LongRoPE, NTK-scalable)"
+        prompt_template = """```
+<|role|>
+{content}
+<|endoftext|>
+```
+
+### Example Sequence
+
+```
+<|user|>
+Explain quantum computing in one sentence.
+<|assistant|>
+```"""
+        license_yaml = "license: apache-2.0"
+        license_section = """\
+## License
+
+This is a **quantized derivative work** based on the **BitCPM-CANN** architecture (original model by **OpenBMB**), originally released under **Apache 2.0**.
 
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
@@ -204,6 +250,9 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
         extra_tags = "- cpu-inference\n- bitnet"
     elif is_falcon3:
         extra_tags = "- cpu-inference\n- bitnet"
+    elif is_cann:
+        extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
+    arch_tag = "bonsai" if is_bonsai else "bitnet" if is_bitnet else "falcon3" if is_falcon3 else "minicpm"
     frontmatter = f"""---
 {license_yaml}
 language:
@@ -214,7 +263,7 @@ tags:
 - atlas
 - tq1
 - cpu-optimized
-- {"bonsai" if is_bonsai else "bitnet" if is_bitnet else "falcon3"}
+- {arch_tag}
 - llm
 {extra_tags}
 base_model: {base_model_hf}

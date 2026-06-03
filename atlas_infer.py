@@ -9,8 +9,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 _dll_name = "atlas.dll" if sys.platform == "win32" else "libatlas.so"
 _dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _dll_name)
-if not os.path.exists(_dll_path):
-    _dll_path = os.environ.get("ATLAS_DLL", _dll_path)
+if "ATLAS_DLL" in os.environ:
+    _dll_path = os.environ["ATLAS_DLL"]
 dll = ctypes.CDLL(_dll_path)
 
 dll.atlas_load.restype = ctypes.c_void_p
@@ -110,6 +110,12 @@ dll.atlas_set_rope_scale.argtypes = [ctypes.c_void_p, ctypes.c_float]
 
 dll.atlas_set_base_seq_len.restype = None
 dll.atlas_set_base_seq_len.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+dll.atlas_set_scale_depth_factor.restype = None
+dll.atlas_set_scale_depth_factor.argtypes = [ctypes.c_void_p, ctypes.c_float]
+
+dll.atlas_get_scale_emb.restype = ctypes.c_float
+dll.atlas_get_scale_emb.argtypes = [ctypes.c_void_p]
 
 dll.atlas_reset_cache.restype = None
 dll.atlas_reset_cache.argtypes = [ctypes.c_void_p]
@@ -243,7 +249,8 @@ class AtlasModel:
     def __init__(self, atlas_path, safetensors_path=None, model_dir=None,
                  use_packed_matmul=False, use_hybrid_matmul=False,
                  max_seq_len=4096, base_seq_len=None,
-                 convert_to_tq2=False, use_f32_matmul=False):
+                 convert_to_tq2=False, use_f32_matmul=False,
+                 force_tq1_native=False):
         self._safe_path = safetensors_path
         self._model_dir = model_dir
         self._atlas_path = atlas_path
@@ -296,6 +303,10 @@ class AtlasModel:
         # Cache tensor indices for fast lookup
         self._cache_indices()
         self._is_bitnet = any('attn_sub_norm' in name for name in self.idx)
+        # v2.11.0: f32 bypass needed (decompresses ttype=5 -> int8). When false,
+        # ttype=5 tensors stay packed — LUT path handles prefill (B>=16) and
+        # fused_s8 handles decode (B<16), both on native TQ1 format.
+        self._needs_f32_bypass = (use_f32_matmul or self._is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0) and not force_tq1_native
 
         # v2.8.0: Persistent KV cache tracking for multi-turn
         self._cached_input_ids = []
@@ -343,38 +354,35 @@ class AtlasModel:
             if i4_loaded:
                 print("[Atlas] i4 cache loaded — skip decompress + quantize")
             else:
-                # Try loading int8 cache (mmap'd, instant). If not found, decompress + save.
-                # Always decompress ttype=5 to int8 (no-op if none exist). Enables fast int8
-                # matmul + f32_bypass to avoid uint8+128 signal collapse on block-scaled models.
-                cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
-                if cache_loaded:
-                    print("[Atlas] Loaded int8 weights from cache (mmap)")
-                else:
+                if self._needs_f32_bypass:
+                    # f32_bypass path: decompress block-scaled to int8 for full precision
+                    cache_loaded = dll.atlas_load_cache(self.model_ptr, self._atlas_path.encode())
+                    if cache_loaded:
+                        print("[Atlas] Loaded int8 weights from cache (mmap)")
+                    else:
+                        dll.atlas_decompress_all(self.model_ptr)
+                        if _HAS_TTYPE5_DECOMPRESS:
+                            dll.atlas_decompress_ttype5(self.model_ptr)
+                        if _HAS_TTYPE7_DECOMPRESS:
+                            dll.atlas_decompress_ttype7(self.model_ptr)
+                        dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
                     dll.atlas_decompress_all(self.model_ptr)
                     if _HAS_TTYPE5_DECOMPRESS:
                         dll.atlas_decompress_ttype5(self.model_ptr)
                     if _HAS_TTYPE7_DECOMPRESS:
                         dll.atlas_decompress_ttype7(self.model_ptr)
-                    dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
-                # Always decompress packed→int8 even on cache loads (FFN tensors not in cache)
-                dll.atlas_decompress_all(self.model_ptr)
-                if _HAS_TTYPE5_DECOMPRESS:
-                    dll.atlas_decompress_ttype5(self.model_ptr)
-                if _HAS_TTYPE7_DECOMPRESS:
-                    dll.atlas_decompress_ttype7(self.model_ptr)
-                # f32_bypass: for small, block-scaled, or BitNet models
-                # MUST be set before int4 conversion (guard checks use_f32_matmul)
-                is_bitnet = any('attn_sub_norm' in name for name in self.idx)
-                if use_f32_matmul or is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0:
                     dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
-                # Convert FFN int8 to int4 (halves weight bandwidth). Skips if f32_bypass.
-                if _HAS_FFN_I4:
-                    dll.atlas_quantize_ffn_to_i4(self.model_ptr)
-                # Save i4 cache only if actual int4 conversion occurred (not f32_bypass)
-                if _HAS_I4_CACHE and not (use_f32_matmul or is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0):
-                    dll.atlas_save_i4_cache(self.model_ptr, self._atlas_path.encode())
-            # Prefetch int8 data into physical RAM (page-in mmap or fresh decompress)
-            dll.atlas_prefetch_int8(self.model_ptr)
+                    if _HAS_FFN_I4:
+                        dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                    dll.atlas_prefetch_int8(self.model_ptr)
+                else:
+                    # TQ1 native path: FFN->int4 for decode speed (ttype=0 only),
+                    # QKV/O decompressed to int8 (Falcon3). Bonsai uses f32_bypass.
+                    dll.atlas_decompress_ffn(self.model_ptr)
+                    if _HAS_FFN_I4:
+                        dll.atlas_quantize_ffn_to_i4(self.model_ptr)
+                    dll.atlas_decompress_all(self.model_ptr)
+                    dll.atlas_prefetch_int8(self.model_ptr)
 
         # Max sequence length for KV cache ring buffer (v2.5.0: configurable)
         self.max_seq_len = max_seq_len
@@ -511,6 +519,19 @@ class AtlasModel:
         When max_seq_len > base_seq_len, NTK-aware frequency scaling is applied."""
         dll.atlas_set_base_seq_len(self.model_ptr, seq_len)
         self._base_seq_len = seq_len
+
+    def set_scale_depth(self, scale_depth, n_layers):
+        """v2.11.0: Set MiniCPM scale_depth factor for residual scaling.
+        factor = scale_depth / sqrt(n_layers). Default 1.0 = standard transformer."""
+        import math
+        factor = scale_depth / math.sqrt(n_layers)
+        dll.atlas_set_scale_depth_factor(self.model_ptr, ctypes.c_float(factor))
+        self._scale_depth_factor = factor
+
+    @property
+    def scale_emb(self):
+        """v2.11.0: Get MiniCPM scale_emb embedding multiplier from meta block."""
+        return dll.atlas_get_scale_emb(self.model_ptr)
 
     def reset_cache(self):
         """v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
@@ -824,6 +845,9 @@ class AtlasModel:
         """Full forward pass — all layers fused in C++, final RMSNorm + LM head in Python."""
         B, seq_len = tokens.shape
         h = self._embed_w[tokens].astype(np.float32)
+        se = self.scale_emb
+        if se != 1.0:
+            h *= se
         h = h.reshape(-1, self.hidden)  # [B*seq_len, H]
         n = B * seq_len
 

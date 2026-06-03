@@ -31,6 +31,8 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
 | TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
 | Llama3-8B-1.58-100B-tokens | 4.11 GB | 32 | 4096 | 14336 | 32 | 8 | 131072 | Llama3 (GQA, QK-Norm) |
+| BitCPM-CANN-1B | 0.83 GB | 28 | 2048 | 6144 | 16 | 2 | 73448 | Llama (LongRoPE) |
+| BitCPM-CANN-3B | 1.35 GB | 32 | 2560 | 10240 | 32 | 2 | 73448 | Llama (LongRoPE) |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
@@ -38,6 +40,8 @@ Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B),
 TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
 TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO SubLN** — different arch than smaller TriLMs!
 Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
+BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Chat template: `<|role|>\n{content}\n`. 9.7 tok/s on i7-7700T (28L/2048H).
+BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Hybrid path. T=0: "Paris." coherent, T=0.7: coherent.
 
 ### HF Alignment Check — 22 Models Verified
 
@@ -144,6 +148,16 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
+### v2.10.4 ✅ — BitCPM-CANN-1B/3B Support + Debug Print Fixes (ABGESCHLOSSEN)
+- **BitCPM-CANN-1B TQ1.0**: 28L/2048H/6144I/16:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 0.83 GB, MiniCPM v5 Tokenizer eingebettet. Chat template: `<|role|>\n{content}\n`.
+- **BitCPM-CANN-3B TQ1.0**: 32L/2560H/10240I/32:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 1.35 GB, MiniCPM v5 Tokenizer. Hybrid path. T=0/T=0.7 beide kohärent ("The capital of France is Paris. Paris is the most populous city in France...").
+- **Bug fix: Unconditional `logits[96944]` OOB Read**: Debug-Print in `atlas_generate` (Prefill top-5) las `logits[V-1]` mit V=73448. Der Print `logits[96944]` lag 586 Bytes über der Allokation → sporadischer Crash bei `0x...EAE0` je nach Heap-Layout. Fix: Alle unconditional Debug-Prints entfernt (attn_raw/attn_sft, DECLM/PRELM, LMHEAD, Prefill top-5, Decode top-5, before/after barriers).
+- **`[ACTDBG] max_val=` Spam entfernt**: Debug-Print in `matmul_tq2_f32` (lines 3490-3501) produziert >1000 Zeilen pro Forward. Entfernt.
+- **`ATLAS_DLL` env var fix**: `atlas_infer.py` prüfte `ATLAS_DLL`-Umgebungsvariable nur wenn `atlas.dll` nicht existierte. Fix: `ATLAS_DLL` überschreibt immer. Erleichtert Debug-DLL-Switching via `$env:ATLAS_DLL="C:\atlas\atlas_d.dll"`.
+- **Packing fix: ZIP-based pytorch_model.bin**: CANN-3B uses modern PyTorch ZIP serialization (not safetensors). Packer loads lazily via `torch.load` — no OOM.
+- **Performance**: 9.7 tok/s auf i7-7700T (CANN-1B, T=0.7, top_k=40, 30 Tokens).
+- **43/43 Mock-Tests grün**: 4 zusätzliche BitCPM-Tests. Keine Regression auf 7 Architekturen.
+
 ### v2.10.3 ✅ — Bug Hunt Round 2+3 + Llama3-Support (ABGESCHLOSSEN)
 - **12 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json), Bug #6 (xoshiro_state global → thread_local), Bug #7 (g_has_avx512_vnni Init-Race), Bug #8 (EOS sentinel=0 konfligiert mit Token-ID 0), Bug #9 (fehlende BitNet-Stops in generate_c/_cpp_decode/generate), Bug #10 (silent except:pass → warn).
 - **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=131072. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Base Model (no chat template). T=0 argmax: Prompt repetition. T=0.7: coherent.
@@ -232,6 +246,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.10.4** | **BitCPM-CANN-1B Support + Debug Print Crash Fix**: 28L/2048H/6144I/16:2 heads/73448vocab, Llama-Architektur (LongRoPE), MiniCPM v5 Tokenizer. Unconditional `logits[96944]` OOB Read in Debug-Print gefixt (586 Bytes über Allokation bei V=73448). Alle unconditional Debug-Prints entfernt. `ATLAS_DLL` env var fix (überschreibt jetzt immer). 9.7 tok/s auf i7-7700T. |
 | **v2.10.3** | **Bug Hunt Round 2+3 + Llama3-Support**: 12 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik, xoshiro_state thread_local, VNNI Init-Race, EOS sentinel=0→None, BitNet-Stops, silent except→warn). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
 | **v2.10.2** | **Consistent Naming + HF-Repos**: Falcon3 HF-Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. `matmul_reorder_deq` pre-divide Optimierung. Bonsai-8B in Performance-Tabelle. |
 | **v2.10.1** | **BitNet EOS Fix + HF-Push**: `build_tokenizer_binary` Pattern-Matching priority fix. BitNet-2B4T + Bonsai (3 Größen) auf HF Hub deployed. `eos_token_id=128001→128009`. |

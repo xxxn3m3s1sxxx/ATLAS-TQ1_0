@@ -106,6 +106,7 @@ BONSAI_CORRIDORS = {
     "bonsai_4b": "production_int8",
     "bonsai_8b": "f32_bypass",
     "bitnet_2b4t": "f32_bypass",
+    "bitcpm": "f32_bypass",
 }
 
 @pytest.mark.parametrize("arch,corridor", list(BONSAI_CORRIDORS.items()))
