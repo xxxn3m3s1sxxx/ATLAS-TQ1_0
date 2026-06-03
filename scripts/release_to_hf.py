@@ -20,70 +20,71 @@ import argparse, json, os, sys
 
 # Known configs for README completeness when model_dir unavailable
 KNOWN_CONFIGS = {
-    "1B": {"model_type": "falcon3", "num_hidden_layers": 18, "hidden_size": 2048,
-           "intermediate_size": 8192, "num_attention_heads": 8,
-           "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
-           "vocab_size": 131072},
-    "3B": {"model_type": "falcon3", "num_hidden_layers": 22, "hidden_size": 3072,
-           "intermediate_size": 9216, "num_attention_heads": 12,
-           "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
-           "vocab_size": 131072},
-    "7B": {"model_type": "falcon3", "num_hidden_layers": 28, "hidden_size": 3072,
-           "intermediate_size": 23040, "num_attention_heads": 12,
-           "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
-           "vocab_size": 131080},
-    "10B": {"model_type": "falcon3", "num_hidden_layers": 40, "hidden_size": 3072,
-            "intermediate_size": 23040, "num_attention_heads": 12,
-            "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
-            "vocab_size": 131072},
-    "1.7B": {"model_type": "qwen3", "num_hidden_layers": 28, "hidden_size": 2048,
-             "intermediate_size": 6144, "num_attention_heads": 16,
-             "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 1000000.0,
-             "vocab_size": 151669},
-    "4B": {"model_type": "qwen3", "num_hidden_layers": 36, "hidden_size": 2560,
-           "intermediate_size": 9728, "num_attention_heads": 32,
-           "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 5000000.0,
-           "vocab_size": 151669},
-    "8B": {"model_type": "qwen3", "num_hidden_layers": 36, "hidden_size": 4096,
-           "intermediate_size": 12288, "num_attention_heads": 32,
-           "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 1000000.0,
-           "vocab_size": 151669},
-    "2B": {"model_type": "bitnet", "num_hidden_layers": 30, "hidden_size": 2560,
-           "intermediate_size": 6912, "num_attention_heads": 20,
-           "num_key_value_heads": 5, "head_dim": 128, "rope_theta": 500000.0,
-           "vocab_size": 128256, "tie_word_embeddings": True},
-    "0.5B": {"model_type": "minicpm", "num_hidden_layers": 24, "hidden_size": 1024,
-             "intermediate_size": 4096, "num_attention_heads": 16,
-             "num_key_value_heads": 2, "head_dim": 64, "rope_theta": 10000.0,
-             "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
-    "1B": {"model_type": "minicpm", "num_hidden_layers": 28, "hidden_size": 2048,
-           "intermediate_size": 6144, "num_attention_heads": 16,
-           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
-           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
-    "3B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 2560,
-           "intermediate_size": 10240, "num_attention_heads": 32,
-           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
-           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
-    "8B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 4096,
-           "intermediate_size": 16384, "num_attention_heads": 32,
-           "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
-           "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4,
-           "tie_word_embeddings": False},
+    "falcon3-1B": {"model_type": "falcon3", "num_hidden_layers": 18, "hidden_size": 2048,
+                   "intermediate_size": 8192, "num_attention_heads": 8,
+                   "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
+                   "vocab_size": 131072},
+    "falcon3-3B": {"model_type": "falcon3", "num_hidden_layers": 22, "hidden_size": 3072,
+                   "intermediate_size": 9216, "num_attention_heads": 12,
+                   "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
+                   "vocab_size": 131072},
+    "falcon3-7B": {"model_type": "falcon3", "num_hidden_layers": 28, "hidden_size": 3072,
+                   "intermediate_size": 23040, "num_attention_heads": 12,
+                   "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
+                   "vocab_size": 131080},
+    "falcon3-10B": {"model_type": "falcon3", "num_hidden_layers": 40, "hidden_size": 3072,
+                    "intermediate_size": 23040, "num_attention_heads": 12,
+                    "num_key_value_heads": 4, "head_dim": 256, "rope_theta": 1000042.0,
+                    "vocab_size": 131072},
+    "bonsai-1.7B": {"model_type": "qwen3", "num_hidden_layers": 28, "hidden_size": 2048,
+                    "intermediate_size": 6144, "num_attention_heads": 16,
+                    "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 1000000.0,
+                    "vocab_size": 151669},
+    "bonsai-4B": {"model_type": "qwen3", "num_hidden_layers": 36, "hidden_size": 2560,
+                  "intermediate_size": 9728, "num_attention_heads": 32,
+                  "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 5000000.0,
+                  "vocab_size": 151669},
+    "bonsai-8B": {"model_type": "qwen3", "num_hidden_layers": 36, "hidden_size": 4096,
+                  "intermediate_size": 12288, "num_attention_heads": 32,
+                  "num_key_value_heads": 8, "head_dim": 128, "rope_theta": 1000000.0,
+                  "vocab_size": 151669},
+    "bitnet-2B": {"model_type": "bitnet", "num_hidden_layers": 30, "hidden_size": 2560,
+                  "intermediate_size": 6912, "num_attention_heads": 20,
+                  "num_key_value_heads": 5, "head_dim": 128, "rope_theta": 500000.0,
+                  "vocab_size": 128256, "tie_word_embeddings": True},
+    "cann-0.5B": {"model_type": "minicpm", "num_hidden_layers": 24, "hidden_size": 1024,
+                  "intermediate_size": 4096, "num_attention_heads": 16,
+                  "num_key_value_heads": 2, "head_dim": 64, "rope_theta": 10000.0,
+                  "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "cann-1B": {"model_type": "minicpm", "num_hidden_layers": 28, "hidden_size": 2048,
+                "intermediate_size": 6144, "num_attention_heads": 16,
+                "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+                "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "cann-3B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 2560,
+                "intermediate_size": 10240, "num_attention_heads": 32,
+                "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+                "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4},
+    "cann-8B": {"model_type": "minicpm", "num_hidden_layers": 32, "hidden_size": 4096,
+                "intermediate_size": 16384, "num_attention_heads": 32,
+                "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
+                "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4,
+                "tie_word_embeddings": False},
 }
 
-# Per-model perf & size description
+# Per-model perf & size description — keys must match KNOWN_CONFIGS
 MODEL_SIZES = {
-    "10B": ("2.3 tok/s (int4 FFN)",  "3.28 GB", "40 layers, 3072 hidden, 23040 intermediate \u2014 maximum quality"),
-    "7B":  ("3.2 tok/s (int4 FFN)",  "2.75 GB", "28 layers, 3072 hidden, 23040 intermediate \u2014 quality output"),
-    "3B":  ("7.1 tok/s (hybrid)",    "1.97 GB", "22 layers, 3072 hidden, 9216 intermediate \u2014 best balance"),
-    "1B":  ("10.1 tok/s (f32 bypass)", "1.22 GB", "18 layers, 2048 hidden, 8192 intermediate \u2014 light & fast"),
-    "4B":  ("17.4 tok/s (hybrid)",   "1.49 GB", "36 layers, 2560 hidden, 9728 intermediate \u2014 fast Bonsai"),
-    "1.7B":("13.0 tok/s (f32 bypass)","0.86 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 light Bonsai"),
-    "8B":  ("1.8 tok/s (f32 bypass)", "3.72 GB", "36 layers, 4096 hidden, 12288 intermediate \u2014 max Bonsai quality"),
-    "0.5B": ("30 tok/s (f32 bypass)",   "0.22 GB", "24 layers, 1024 hidden, 4096 intermediate \u2014 tiny CANN"),
-    "1B":  ("9.7 tok/s (hybrid)",      "0.83 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 CANN balanced"),
-    "3B":  ("7.1 tok/s (hybrid)",      "1.35 GB", "32 layers, 2560 hidden, 10240 intermediate \u2014 CANN quality"),
-    "8B":  ("1.5 tok/s (f32 bypass)",  "2.65 GB", "32 layers, 4096 hidden, 16384 intermediate \u2014 CANN max quality"),
+    "falcon3-10B": ("2.3 tok/s (int4 FFN)",  "3.28 GB", "40 layers, 3072 hidden, 23040 intermediate \u2014 maximum quality"),
+    "falcon3-7B":  ("3.2 tok/s (int4 FFN)",  "2.75 GB", "28 layers, 3072 hidden, 23040 intermediate \u2014 quality output"),
+    "falcon3-3B":  ("7.1 tok/s (hybrid)",    "1.97 GB", "22 layers, 3072 hidden, 9216 intermediate \u2014 best balance"),
+    "falcon3-1B":  ("10.1 tok/s (f32 bypass)", "1.22 GB", "18 layers, 2048 hidden, 8192 intermediate \u2014 light & fast"),
+    "bonsai-4B":   ("17.4 tok/s (hybrid)",   "1.49 GB", "36 layers, 2560 hidden, 9728 intermediate \u2014 fast Bonsai"),
+    "bonsai-1.7B": ("13.0 tok/s (f32 bypass)","0.86 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 light Bonsai"),
+    "bonsai-8B":   ("1.8 tok/s (f32 bypass)", "3.72 GB", "36 layers, 4096 hidden, 12288 intermediate \u2014 max Bonsai quality"),
+    "bitnet-2B":   ("2.8 tok/s (f32 bypass)", "1.04 GB", "30 layers, 2560 hidden, 6912 intermediate \u2014 BitNet b1.58"),
+    "cann-0.5B":   ("30 tok/s (f32 bypass)",  "0.22 GB", "24 layers, 1024 hidden, 4096 intermediate \u2014 tiny CANN"),
+    "cann-1B":     ("9.7 tok/s (hybrid)",     "0.83 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 CANN balanced"),
+    "cann-3B":     ("7.1 tok/s (hybrid)",     "1.35 GB", "32 layers, 2560 hidden, 10240 intermediate \u2014 CANN quality"),
+    "cann-8B":     ("1.5 tok/s (f32 bypass)", "2.65 GB", "32 layers, 4096 hidden, 16384 intermediate \u2014 CANN max quality"),
 }
 
 
@@ -102,10 +103,23 @@ def _read_atlas_arch(atlas_path):
 
 
 def _detect_size(name):
-    for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B", "0.5B"]:
-        if sz in name:
-            return sz
+    """Extract model family+size from filename (e.g. 'Ternary-BitCPM-CANN-1B' -> 'cann-1B')."""
+    family_map = {"Falcon3": "falcon3", "Bonsai": "bonsai", "BitNet": "bitnet",
+                  "CANN": "cann", "Llama3": "llama3", "TriLM": "trilm"}
+    for fam, key in family_map.items():
+        if fam in name:
+            for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B", "0.5B"]:
+                if sz in name:
+                    return f"{key}-{sz}"
     return None
+
+
+def _bare_size(size_key):
+    """Extract bare size from family-prefixed key (e.g. 'cann-1B' -> '1B')."""
+    for sz in ["0.5B", "1.7B", "10B", "8B", "7B", "4B", "3B", "2B", "1B"]:
+        if sz in size_key:
+            return sz
+    return size_key
 
 
 def pack_model(model_dir, output_dir=None):
@@ -143,10 +157,11 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
     is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
     is_cann = "CANN" in model_name or cfg.get("model_type") == "minicpm"
+    bsz = _bare_size(size)  # bare size for base model HF names
     engine_note = ""
 
     if is_bonsai:
-        base_model_hf = f"prism-ml/Ternary-Bonsai-{size}-unpacked"
+        base_model_hf = f"prism-ml/Ternary-Bonsai-{bsz}-unpacked"
         ctx_window = "8192 (YaRN-scalable up to 16384)"
         prompt_template = """```
 <|im_start|>system
@@ -185,7 +200,7 @@ This is a **quantized derivative work** based on the **BitNet b1.58** architectu
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
     elif is_cann:
-        base_model_hf = f"openbmb/BitCPM-CANN-{size}"
+        base_model_hf = f"openbmb/BitCPM-CANN-{bsz}"
         ctx_window = "32768 (LongRoPE, NTK-scalable)"
         prompt_template = """```
 <|im_start|>user
@@ -212,7 +227,7 @@ This is a **quantized derivative work** based on the **BitCPM-CANN** architectur
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
     else:
-        base_model_hf = f"tiiuae/Falcon3-{size}-Instruct-1.58bit"
+        base_model_hf = f"tiiuae/Falcon3-{bsz}-Instruct-1.58bit"
         ctx_window = "4096 (NTK-scalable up to 8192)"
         prompt_template = """```
 <|role|>
