@@ -1,6 +1,22 @@
 # Known Issues & Limitations
 
-## ✅ Recently Fixed (v2.10.3 — Bug Hunt Round 2)
+## ✅ Recently Fixed
+
+### v2.10.4 — OOB Logits Read + Debug Print Spam
+
+### Bug #10: Unconditional `logits[96944]` OOB Read in Debug Print (Critical)
+- **Fixed**: `atlas_api.cpp` Debug-Print in `atlas_generate` (Prefill top-5) las `logits[V-1]` mit V=73448. Der Print `logits[96944]` lag 586 Bytes über der Allokation → sporadischer Crash bei `0x...EAE0` je nach Heap-Layout.
+- **Fix**: Alle unconditional Debug-Prints entfernt (attn_raw/attn_sft, DECLM/PRELM, LMHEAD, Prefill top-5, Decode top-5, before/after barriers).
+
+### Bug #11: `[ACTDBG] max_val=` >1000 Lines per Forward
+- **Fixed**: `matmul_tq2_f32` produziert >1000 Zeilen `[ACTDBG] max_val=` pro Forward.
+- **Fix**: Entfernt.
+
+### Bug #12: `ATLAS_DLL` Env Var Does Not Override
+- **Fixed**: `atlas_infer.py` prüfte `ATLAS_DLL`-Umgebungsvariable nur wenn `atlas.dll` nicht existierte.
+- **Fix**: `ATLAS_DLL` überschreibt immer.
+
+### v2.10.3 — Bug Hunt Round 2 (9 bugs)
 
 ### Bug #1: Falcon3 BPE Vocab Cutoff (Critical)
 - **Fixed**: `pack_to_atlas.py:334` hatte hardcodiertes `v < 128000` als BPE-Vocab-Filter — köpft Falcon3 (V=131072 → 3072 BPE-Tokens verloren).

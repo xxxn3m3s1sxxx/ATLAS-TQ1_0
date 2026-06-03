@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> 🚀 **v2.10.0 — Falcon3 + Bonsai + BitNet TQ1.0 Series**: All 4 Falcon3 models (1B/3B/7B/10B), 3 Bonsai models (1.7B/4B/8B), and **BitNet b1.58-2B-4T** packaged, verified T=0 correct, and deployed to HuggingFace. Unified pack_to_atlas.py with architecture auto-detection replaces all individual packers. BF16 weight_scale fix. BitNet EOS token fix (128009 <|eot_id|>). 35/35 mock tests, CI green on Windows + Linux.
+> 🚀 **v2.10.4 — BitCPM-CANN Series + Bug Hunt**: 4 CANN models (0.5B/1B/3B/8B) — MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm. All 4 deployed to HuggingFace. 12 bugs fixed in v2.10.3 (BPE cutoff, unaligned access, RoPE heuristic, thread safety, EOS sentinel). 66 mock tests, CI green on Windows + Linux.
 
 ## Quickstart
 
@@ -42,6 +42,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 
 | Model | Download Size | RAM Needed | Layers | Heads | Best tok/s |
 |-------|:------------:|:----------:|:------:|:-----:|:----------:|
+| **Falcon3** |||||
 | Falcon3-3B-Instruct | **2.0 GB** | **4 GB** | 22 | 12 | **7.1** |
 | Falcon3-1B-Instruct | 1.2 GB | 3 GB | 18 | 8 | **10.1** |
 | Falcon3-7B-Instruct | 2.8 GB | 6 GB | 28 | 12 | **3.15** |
@@ -50,6 +51,11 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Bonsai-1.7B | 0.9 GB | 3 GB | 28 | 16 | **13.0** |
 | Bonsai-4B | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
 | Bonsai-8B | 2.5 GB | 8 GB | 36 | 32 | **1.8** |
+| **BitCPM-CANN** (v2.10.4) |||||
+| CANN-0.5B | 0.22 GB | 1 GB | 24 | 16 | **30** |
+| CANN-1B | 0.83 GB | 3 GB | 28 | 16 | **9.7** |
+| CANN-3B | 1.35 GB | 5 GB | 32 | 32 | **7.1** |
+| CANN-8B | 2.65 GB | 8 GB | 32 | 32 | **1.5** |
 | **TriLM** |||||
 | TriLM-830M | 0.4 GB | 2 GB | 24 | 28 | — |
 | TriLM-1.1B | 0.5 GB | 3 GB | 24 | 28 | — |
@@ -63,6 +69,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 - **3B+ models** work well on 4-8 GB RAM laptops
 - **7B/10B models** need 6-8 GB RAM (faster with int4 FFN mode)
 - **1B models** are fast but less capable
+- **CANN models**: MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Chat template: `<|role|>\n{content}\n`.
 - **TriLM 3.9B ⚠️**: Uses **standard Llama** architecture (head_dim=128, no SubLN) — different from smaller TriLMs (SubLN, head_dim=64). Auto-detected.
 
 ### Model Sources
@@ -70,14 +77,14 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
 | **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
-| **Falcon3 ATLAS (1.58bit)** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
+| **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
 | **Ternary Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **Ternary Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | ✅ |
+| **BitCPM-CANN** (0.5B/1B/3B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb) | Apache 2.0 | ✅ |
+| **BitCPM-CANN ATLAS** (0.5B/1B/3B/8B) | [`xxxn3m3s1sxxx/Ternary-BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-BitCPM-CANN) | Apache 2.0 | ✅ |
 | **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
-| **BitCPM-CANN** (1B/3B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb/BitCPM-CANN-1B-unpacked) | Apache 2.0 | ✅ |
-| **BitCPM-CANN** (0.5B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb/BitCPM-CANN-0.5B-unpacked) | Apache 2.0 | ✅ |
 
 ✅ — Supported and tested.
 
@@ -164,6 +171,11 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 | Falcon3-10B (int4) | hybrid+int8 | **2.25** | 18% faster than int8 |
 | Bonsai-8B | f32 bypass | **1.8** | Most capable, slowest |
 | BitNet-2B4T | f32 bypass | **2.8** | Experimental |
+| **BitCPM-CANN** (v2.10.4) ||||
+| CANN-0.5B | f32 bypass | **30** | Tiny, MiniCPM v5 tok, DeepNorm |
+| CANN-1B | hybrid+int8 | **9.7** | Llama arch, LongRoPE 32K ctx |
+| CANN-3B | hybrid+int8 | **7.1** | Balanced quality/speed |
+| CANN-8B | f32 bypass | **1.5** | Max quality, 16384 intermediate |
 | TriLM-830M | f32 bypass | — | SubLN, head_dim=64 |
 | TriLM-1.1B | f32 bypass | — | SubLN, head_dim=64 |
 | TriLM-1.5B | f32 bypass | — | SubLN, head_dim=64 |
@@ -246,6 +258,10 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.10.4** | **BitCPM-CANN Series (0.5B/1B/3B/8B) + Bug Hunt**. MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Debug print crash fix (unconditional OOB logits read). 43/43 mock tests, 4 CANN models deployed to HF. |
+| **v2.10.3** | **Bug Hunt Round 2+3 (12 bugs) + Llama3**. Falcon3 BPE cutoff, unaligned memcpy, RoPE heuristic override, xoshiro thread safety, VNNI init race, EOS sentinel, Llama3 stops/specials, v6 added_tokens. 39/39 tests. |
+| **v2.10.2** | **Consistent naming + HF repos**. Falcon3 HF models renamed, Bonsai-8B perf table. |
+| **v2.10.1** | BitNet EOS fix + HF push (BitNet + all 3 Bonsai). |
 | **v2.10.0** | **Unified Packer + BF16 weight_scale Fix + Falcon3 TQ1.0 Series**. Single `pack_to_atlas.py` replaces all individual packers — architecture auto-detection from `config.json`. BF16 weight_scale fix (`get_bf16_manual` fallback). All 4 Falcon3 models (1B/3B/7B/10B) packaged as TQ1.0, verified T=0 correct, deployed to Hugging Face. 22/22 mock tests, CI green. |
 | **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
 | **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
@@ -263,4 +279,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative TQ1.0 models at [`xxxn3m3s1sxxx/Falcon3-*-Instruct-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). TriLM: SpectraSuite (Apache 2.0).
+Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0).

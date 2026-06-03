@@ -31,8 +31,10 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
 | TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
 | Llama3-8B-1.58-100B-tokens | 4.11 GB | 32 | 4096 | 14336 | 32 | 8 | 131072 | Llama3 (GQA, QK-Norm) |
+| BitCPM-CANN-0.5B | 0.22 GB | 24 | 1024 | 4096 | 16 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
 | BitCPM-CANN-1B | 0.83 GB | 28 | 2048 | 6144 | 16 | 2 | 73448 | Llama (LongRoPE) |
 | BitCPM-CANN-3B | 1.35 GB | 32 | 2560 | 10240 | 32 | 2 | 73448 | Llama (LongRoPE) |
+| BitCPM-CANN-8B | 2.65 GB | 32 | 4096 | 16384 | 32 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
 
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
@@ -42,6 +44,8 @@ TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO Su
 Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
 BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Chat template: `<|role|>\n{content}\n`. 9.7 tok/s on i7-7700T (28L/2048H).
 BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Hybrid path. T=0: "Paris." coherent, T=0.7: coherent.
+BitCPM-CANN-0.5B: `head_dim=64`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. Tie Embeddings, V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Tiny — 24L/1024H/4096I, 0.22 GB.
+BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. No tie embeddings (lm_head separate). V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Largest CANN — 32L/4096H/16384I, 2.65 GB.
 
 ### HF Alignment Check — 22 Models Verified
 
