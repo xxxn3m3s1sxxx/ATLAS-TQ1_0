@@ -144,8 +144,8 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
-### v2.10.3 🔥 — Bug Hunt Round 2 + Llama3-Support (AKTIV)
-- **5 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff `v < 128000`), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json). Bug #6 identifiziert (xoshiro_state global, deferred).
+### v2.10.3 ✅ — Bug Hunt Round 2+3 + Llama3-Support (ABGESCHLOSSEN)
+- **12 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json), Bug #6 (xoshiro_state global → thread_local), Bug #7 (g_has_avx512_vnni Init-Race), Bug #8 (EOS sentinel=0 konfligiert mit Token-ID 0), Bug #9 (fehlende BitNet-Stops in generate_c/_cpp_decode/generate), Bug #10 (silent except:pass → warn).
 - **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=131072. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Base Model (no chat template). T=0 argmax: Prompt repetition. T=0.7: coherent.
 - **v6 added_tokens Support**: C++ preencode scannt longest-first via sortierte `added_specs`. Decode per ID-Nachschlag. Preencode integriert in `tokenize_to_ids()`.
 - **`rope_interleaved_set` Flag**: Neues Struct-Feld. Config-JSON setzt es → Heuristik in `ensure_layer_idx` feuert nicht. Default `true` (interleaved). Qwen3/Bonsai setzen auf `false` (half-split).
@@ -232,7 +232,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
-| **v2.10.3** | **Bug Hunt Round 2 + Llama3-Support**: 5 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
+| **v2.10.3** | **Bug Hunt Round 2+3 + Llama3-Support**: 12 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik, xoshiro_state thread_local, VNNI Init-Race, EOS sentinel=0→None, BitNet-Stops, silent except→warn). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
 | **v2.10.2** | **Consistent Naming + HF-Repos**: Falcon3 HF-Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. `matmul_reorder_deq` pre-divide Optimierung. Bonsai-8B in Performance-Tabelle. |
 | **v2.10.1** | **BitNet EOS Fix + HF-Push**: `build_tokenizer_binary` Pattern-Matching priority fix. BitNet-2B4T + Bonsai (3 Größen) auf HF Hub deployed. `eos_token_id=128001→128009`. |
 | **v2.10.0** | **Unified Packer + BF16 Weight_Scale Fix**: `pack_to_atlas.py` ersetzt alle Einzel-Packer. BF16 weight_scale Fallback. 4 Falcon3 Modelle gepackt. BitNet EOS Token Fix. CLI Build OK. 22/22 Mock-Tests. |
