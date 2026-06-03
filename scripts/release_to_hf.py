@@ -143,6 +143,7 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
     is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
     is_cann = "CANN" in model_name or cfg.get("model_type") == "minicpm"
+    engine_note = ""
 
     if is_bonsai:
         base_model_hf = f"prism-ml/Ternary-Bonsai-{size}-unpacked"
@@ -187,20 +188,23 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
         base_model_hf = f"openbmb/BitCPM-CANN-{size}"
         ctx_window = "32768 (LongRoPE, NTK-scalable)"
         prompt_template = """```
-<|role|>
-{content}
-<|endoftext|>
+<|im_start|>user
+{prompt}<|im_end|>
+<|im_start|>assistant
 ```
 
 ### Example Sequence
 
 ```
-<|user|>
-Explain quantum computing in one sentence.
-<|assistant|>
+<|im_start|>user
+Explain quantum computing in one sentence.<|im_end|>
+<|im_start|>assistant
 ```"""
         license_yaml = "license: apache-2.0"
-        license_section = """\
+        engine_note = """\
+> **Requires ATLAS Engine v2.10.4+** — older engine versions lack `scale_emb` and `scale_depth` support for MiniCPM DeepNorm residual scaling.
+"""
+        license_section = f"""\
 ## License
 
 This is a **quantized derivative work** based on the **BitCPM-CANN** architecture (original model by **OpenBMB**), originally released under **Apache 2.0**.
@@ -316,6 +320,7 @@ This repository contains a highly optimized **TQ1 quantized version** of the off
 | Vocabulary | {vocab} |
 | Context Window | {ctx_window} |
 
+{engine_note}
 ### Verification
 
 During pre-release evaluation (v2.10.0), this quantized derivative demonstrated correct convergence:

@@ -412,8 +412,10 @@ class AtlasModel:
         self._is_phi3 = (self.head_dim == 96 and self.vocab_size <= 40000)
         # TriLM: base LLaMA with no chat format
         self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
-        # Qwen3/Bonsai detection: not TriLM, and head_dim<=128 or large vocab (>131k)
-        self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and not self._is_bitnet and (self.head_dim <= 128 or self.vocab_size > 131072))
+        # BitCPM-CANN: MiniCPM family, 73448 vocab, ChatML format, no thinking blocks
+        self._is_cann = (not self._is_phi3 and not self._is_bitnet and self.head_dim == 128 and self.vocab_size == 73448)
+        # Qwen3/Bonsai detection: not TriLM/Phi3/BitNet/CANN, and head_dim<=128 or large vocab (>131k)
+        self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and not self._is_bitnet and not self._is_cann and (self.head_dim <= 128 or self.vocab_size > 131072))
         self._is_llama3 = False  # may be set below from embedded chat_template
         self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
 
@@ -916,6 +918,8 @@ class AtlasModel:
             stop_tokens += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
         if getattr(self, '_is_bitnet', False):
             stop_tokens += ['<|eot_id|>']
+        if getattr(self, '_is_cann', False):
+            stop_tokens += ['</s>']
 
         full_logits = self.forward(np.array([input_ids], dtype=np.int32))
         logits = full_logits[0, -1, :]
@@ -1012,6 +1016,8 @@ class AtlasModel:
             stops += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
         if getattr(self, '_is_bitnet', False):
             stops += ['<|eot_id|>']
+        if getattr(self, '_is_cann', False):
+            stops += ['</s>']
         for stop in stops:
             idx = decoded.find(stop)
             if idx >= 0:
@@ -1162,6 +1168,8 @@ class AtlasModel:
                 stops += ['<|eot_id|>', '<|begin_of_text|>', '<|start_header_id|>', '<|end_header_id|>']
             if getattr(self, '_is_bitnet', False):
                 stops += ['<|eot_id|>', '<|begin_of_text|>']
+            if getattr(self, '_is_cann', False):
+                stops += ['</s>']
             for s in stops:
                 text = text.replace(s, '')
         return text
@@ -1173,7 +1181,19 @@ class AtlasModel:
         - Falcon3: <|role|>\ncontent\n  (EOS: <|endoftext|>)
         - Qwen3:   <|im_start|>role\ncontent<|im_end|>\n
         Bonsai: Qwen3 format + enable_thinking=False (empty <think> block).
+        - CANN:    ChatML without thinking blocks
         """
+        if getattr(self, '_is_cann', False):
+            eos = '<|im_end|>'
+            result = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg.get('content', '')
+                result += f"<|im_start|>{role}\n{content}{eos}\n"
+            if add_generation_prompt:
+                result += '<|im_start|>assistant\n'
+            return result
+
         if self._is_qwen3:
             eos = '<|im_end|>'
             result = ""

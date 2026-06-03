@@ -42,7 +42,7 @@ Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B),
 TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
 TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO SubLN** — different arch than smaller TriLMs!
 Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
-BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Chat template: `<|role|>\n{content}\n`. 9.7 tok/s on i7-7700T (28L/2048H).
+BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`. 9.7 tok/s on i7-7700T (28L/2048H).
 BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Hybrid path. T=0: "Paris." coherent, T=0.7: coherent.
 BitCPM-CANN-0.5B: `head_dim=64`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. Tie Embeddings, V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Tiny — 24L/1024H/4096I, 0.22 GB.
 BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. No tie embeddings (lm_head separate). V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Largest CANN — 32L/4096H/16384I, 2.65 GB.
@@ -153,7 +153,7 @@ See `atlas_ffi.h` for full API.
 ## Roadmap
 
 ### v2.10.4 ✅ — BitCPM-CANN-1B/3B Support + Debug Print Fixes (ABGESCHLOSSEN)
-- **BitCPM-CANN-1B TQ1.0**: 28L/2048H/6144I/16:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 0.83 GB, MiniCPM v5 Tokenizer eingebettet. Chat template: `<|role|>\n{content}\n`.
+- **BitCPM-CANN-1B TQ1.0**: 28L/2048H/6144I/16:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 0.83 GB, MiniCPM v5 Tokenizer eingebettet. ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`.
 - **BitCPM-CANN-3B TQ1.0**: 32L/2560H/10240I/32:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 1.35 GB, MiniCPM v5 Tokenizer. Hybrid path. T=0/T=0.7 beide kohärent ("The capital of France is Paris. Paris is the most populous city in France...").
 - **Bug fix: Unconditional `logits[96944]` OOB Read**: Debug-Print in `atlas_generate` (Prefill top-5) las `logits[V-1]` mit V=73448. Der Print `logits[96944]` lag 586 Bytes über der Allokation → sporadischer Crash bei `0x...EAE0` je nach Heap-Layout. Fix: Alle unconditional Debug-Prints entfernt (attn_raw/attn_sft, DECLM/PRELM, LMHEAD, Prefill top-5, Decode top-5, before/after barriers).
 - **`[ACTDBG] max_val=` Spam entfernt**: Debug-Print in `matmul_tq2_f32` (lines 3490-3501) produziert >1000 Zeilen pro Forward. Entfernt.
@@ -314,9 +314,12 @@ See `atlas_ffi.h` for full API.
 - **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
 - **v6 format**: v5 + binary tokenizer block (128-byte header, offsets/lengths/pool, BPE merges, byte_encoder, special tokens).
 - **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
-- **Chat template**: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation prompt: `<|assistant|>\n`.
-  BitNet: `{Role}: {content}<|eot_id|>\n` — generation prompt: `Assistant: `. EOS token `<|eot_id|>` = 128009.
-  Llama3 (Base Model): No chat template. Generation: `{prompt}`. Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
+- **Chat template**:
+  - Falcon3: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation: `<|assistant|>\n`.
+  - BitCPM-CANN/Qwen3/Bonsai: `<|im_start|>role\n{content}<|im_end|>\n` (ChatML). Generation: `<|im_start|>assistant\n`.
+  - BitNet: `{Role}: {content}<|eot_id|>\n` — generation: `Assistant: `. EOS `<|eot_id|>` = 128009.
+  - Llama3 (Base Model): No chat template. Generation: `{prompt}`. Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
+  - **CANN EOS tokens**: Both `</s>` (ID 2) and `<|im_end|>` (ID 73440) act as end-of-sequence. Python stop_tokens catches both.
 - **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
 - **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).
 - **Cache**: `.i8` cache auto-generated on first full int8 decompress, mmap'd on reload.
