@@ -127,6 +127,22 @@ MINICPM = {
     "flags_fn": lambda cfg: 0,
 }
 
+# ─── Falcon-E I2_S with per-channel weight_scale (stride=9, ttype=5) ──
+# I2_S uint8 weights + per-channel weight_scale tensors.
+# Block-scaled ttype=5 preserves per-row scales and multiplies (correct direction).
+FALCON_E = {
+    "model_types": {},
+    "layer_tensors": list(FALCON3["layer_tensors"]),
+    "stride": 9,
+    "global_tensors": ["model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"],
+    "conditional_layer": [],
+    "input_format": "uint8_packed",
+    "requires_pre_shuffle": True,
+    "quant_weight": "tq1_block_scaled",
+    "has_weight_scale": True,
+    "flags_fn": lambda cfg: 0,
+}
+
 # ─── Generic Llama (stride=9, no extras) ────────────────────────────────
 LLAMA = {
     "model_types": {"llama", "mistral", "gemma", "gemma2", "starcoder2", "phi3", "phi4"},
@@ -179,9 +195,13 @@ def detect_arch(config, available_tensors=()):
         if entry.get("input_format") == "bf16" and not entry.get("has_weight_scale"):
             has_ws = any(t.endswith("weight_scale") for t in available_tensors)
             if has_ws:
-                invert = config.get("is_bitnet_config", False)
-                print(f"  (detected I2_S variant: {mt} with weight_scale tensors, using uint8 repack, invert_subrows={invert})")
-                return {**FALCON3, "sub_row_bit_invert": invert}
+                is_falcon_e = (config.get("quantization_config") or {}).get("quant_method") == "bitnet"
+                if is_falcon_e:
+                    print(f"  (detected Falcon-E: {mt} with TII bit order, no invert)")
+                    return FALCON3
+                else:
+                    print(f"  (detected I2_S variant: {mt} with Microsoft bit order, invert)")
+                    return {**FALCON3, "sub_row_bit_invert": True, "requires_pre_shuffle": True}
         return entry
 
     # MiniCPM detection: scale_depth/scale_emb/dim_model_base in config, or architectures

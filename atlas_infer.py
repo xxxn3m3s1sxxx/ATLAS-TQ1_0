@@ -408,18 +408,15 @@ class AtlasModel:
         self._eos_id = None
         self._chat_template = None
 
-        # Phi-3: instruct model, head_dim=96, small vocab, <|role|> format with <|end|>
+        # Initial template detection (structural heuristics)
         self._is_phi3 = (self.head_dim == 96 and self.vocab_size <= 40000)
-        # TriLM: base LLaMA with no chat format
-        self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
-        # BitCPM-CANN: MiniCPM family, 73448 vocab, ChatML format, no thinking blocks
         self._is_cann = (not self._is_phi3 and not self._is_bitnet and self.head_dim == 128 and self.vocab_size == 73448)
-        # Qwen3/Bonsai detection: not TriLM/Phi3/BitNet/CANN, and head_dim<=128 or large vocab (>131k)
+        self._is_trilm = (not self._is_phi3 and self.vocab_size <= 60000 and self.head_dim <= 128)
         self._is_qwen3 = (not self._is_trilm and not self._is_phi3 and not self._is_bitnet and not self._is_cann and (self.head_dim <= 128 or self.vocab_size > 131072))
-        self._is_llama3 = False  # may be set below from embedded chat_template
-        self._enable_thinking = True  # Qwen3 supports thinking; Bonsai does not
+        self._is_llama3 = False
+        self._enable_thinking = True
 
-        # Read chat_template from embedded config JSON (present in both v5 and v6)
+        # Read embedded tokenizer config (v5/v6) → override for Falcon-E / Llama3
         tok_size = ctypes.c_int()
         tok_ptr = dll.atlas_get_tokenizer(self.model_ptr, tok_size)
         if tok_ptr and tok_size.value > 0:
@@ -432,11 +429,18 @@ class AtlasModel:
                 if cfg_size > 0:
                     cfg = json.loads(raw[pos:pos+cfg_size].decode('utf-8'))
                     self._chat_template = cfg.get('chat_template')
-                    # Detect Llama3 from embedded chat_template (<|start_header_id|>)
-                    if self._chat_template and '<|start_header_id|>' in self._chat_template:
-                        self._is_llama3 = True
-                        self._is_qwen3 = False
-                    # Bonsai has no embedded template → no thinking support
+                    if self._chat_template:
+                        # Llama3: <|start_header_id|>role<|end_header_id|>
+                        if '<|start_header_id|>' in self._chat_template:
+                            self._is_llama3 = True
+                            self._is_qwen3 = False
+                        # ChatML: <|im_start|>role (Qwen3, Bonsai, Falcon-E Instruct)
+                        elif '<|im_start|>' in self._chat_template:
+                            if self._is_trilm:
+                                self._is_trilm = False
+                                self._is_qwen3 = True
+                        # Falcon3-style: <|role|> → keep initial flags
+                    # Bonsai: qwen3 arch but no embedded template → no thinking
                     if not self._chat_template and self._is_qwen3:
                         self._enable_thinking = False
                     # Get EOS token ID from config
@@ -897,71 +901,20 @@ class AtlasModel:
         return int(np.random.choice(len(probs), p=probs))
 
     def generate(self, prompt, max_new_tokens=50, temperature=1.0,
-                 top_k=40, top_p=0.9):
-        try:
-            if isinstance(prompt, str):
-                prompt = [{"role": "user", "content": prompt}]
-            text = self._apply_chat_template(prompt)
-            if self._use_cpp_tokenizer:
-                input_ids = self._cpp_encode(text)
-                eos_id = self._eos_id
-            elif self._tok is not None:
-                input_ids = self._tok.encode(text).ids
-                eos_id = self._eos_id
-            else:
-                return "[TOKENIZER ERROR: No tokenizer available]"
-        except Exception as e:
-            return f"[TOKENIZER ERROR: {e}]"
-
-        stop_tokens = ['<|user|>', '<|system|>', '<|end|>', '<|im_end|>']
-        if getattr(self, '_is_llama3', False):
-            stop_tokens += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
-        if getattr(self, '_is_bitnet', False):
-            stop_tokens += ['<|eot_id|>']
-        if getattr(self, '_is_cann', False):
-            stop_tokens += ['</s>']
-
-        full_logits = self.forward(np.array([input_ids], dtype=np.int32))
-        logits = full_logits[0, -1, :]
-
-        output = []
-        for step in range(max_new_tokens):
-            if step == 0:
-                current_logits = logits
-            else:
-                h = self._get_embedding(next_token)
-                pos = np.array([len(input_ids) + step - 1], dtype=np.int32)
-                dll.atlas_forward(
-                    self.model_ptr,
-                    h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                    1, pos.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                    self.max_seq_len, len(input_ids) + step,
-                    self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                    self.n_layers)
-                h_norm = self._rmsnorm(h.flatten(), "model.norm.weight")
-                current_logits = self._lmhead_gemv(h_norm.reshape(1, -1)).flatten()
-
-            next_token = self._sample(current_logits, temperature, top_k, top_p)
-            output.append(next_token)
-
-            if eos_id is not None and next_token == eos_id:
-                break
-            if self._use_cpp_tokenizer:
-                decoded = self._cpp_decode(output, skip_special=False)
-            else:
-                decoded = self._tok.decode(output, skip_special_tokens=False)
-            if any(stop in decoded for stop in stop_tokens):
-                break
-
-        if self._use_cpp_tokenizer:
-            text = self._cpp_decode(output)
-        else:
-            text = self._tok.decode(output, skip_special_tokens=True)
-        for stop in stop_tokens:
-            idx = text.find(stop)
-            if idx >= 0:
-                text = text[:idx]
-        return text
+                 top_k=40, top_p=0.9, repetition_penalty=1.0,
+                 max_seq_len=None, min_new_tokens=20, cache_enabled=True):
+        """Generate via atlas_generate (C++ engine). Delegates to generate_c.
+        Kept for backward compatibility — use generate_c() directly for new code."""
+        return self.generate_c(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_seq_len=max_seq_len,
+            min_new_tokens=min_new_tokens,
+            cache_enabled=cache_enabled)
 
     def set_system_prompt(self, prompt):
         """Set system prompt injected before every user message."""
@@ -1011,7 +964,9 @@ class AtlasModel:
 
         output = list(out_arr[:n_gen])
         decoded = self._cpp_decode(output)
-        stops = ['<|user|>', '<|system|>', '<|end|>', '<|im_end|>']
+        stops = ['<|user|>', '<|system|>', '<|end|>', '<|end_of_text|>', '<|im_end|>']
+        if getattr(self, '_is_qwen3', False):
+            stops += ['<|im_start|>']
         if getattr(self, '_is_llama3', False):
             stops += ['<|eot_id|>', '<|start_header_id|>', '<|end_header_id|>']
         if getattr(self, '_is_bitnet', False):
@@ -1163,7 +1118,9 @@ class AtlasModel:
                 result_bytes.append(ord(ch) if ord(ch) < 256 else 32)  # fallback to space
         text = result_bytes.decode('utf-8', errors='replace')
         if skip_special:
-            stops = ['<|endoftext|>', '<|im_end|>', '<|pad|>']
+            stops = ['<|endoftext|>', '<|end_of_text|>', '<|im_end|>', '<|pad|>']
+            if getattr(self, '_is_qwen3', False):
+                stops += ['<|im_start|>']
             if getattr(self, '_is_llama3', False):
                 stops += ['<|eot_id|>', '<|begin_of_text|>', '<|start_header_id|>', '<|end_header_id|>']
             if getattr(self, '_is_bitnet', False):
@@ -1231,6 +1188,13 @@ class AtlasModel:
                 result += f"{role.capitalize()}: {content}{eos}\n"
             if add_generation_prompt:
                 result += 'Assistant: '
+            return result
+
+        if not self._chat_template:
+            # No embedded chat template → base model: raw text, no wrappers
+            result = "\n".join(msg.get('content', '') for msg in messages)
+            if add_generation_prompt:
+                result += '\n'
             return result
 
         eos = '<|endoftext|>'

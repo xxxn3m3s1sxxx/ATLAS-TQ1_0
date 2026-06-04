@@ -4,7 +4,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "atlas-tq1"
-version = "2.4.1"
+version = "2.10.5"
 description = "BitNet b1.58 TQ1.0 CPU inference engine for ternary-quantized LLMs"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -25,8 +25,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/anomalyco/atlas"
-Source = "https://github.com/anomalyco/atlas"
+Homepage = "https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0"
+Source = "https://github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0"
 
 [project.scripts]
 atlas-pack = "atlas_pack:main"

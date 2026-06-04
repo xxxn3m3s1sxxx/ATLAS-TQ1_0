@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Fix broken GitHub URL in HF model READMEs.
 
-Before: github.com/xxxn3m3s1sxxx/ATLAS → 404
-After:  github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0
+Fixes ALL known wrong URL patterns:
+  - /ATLAS.git          → /ATLAS-TQ1_0.git   (clone URL)
+  - /ATLAS-TQ1_0-TQ1_0  → /ATLAS-TQ1_0       (double-replacement)
+  - /ATLAS)             → /ATLAS-TQ1_0)      (link target)
 """
-import os, sys
+
+import os, sys, re
 
 token = os.environ.get("HF_TOKEN")
 if not token:
@@ -29,8 +32,13 @@ REPOS = [
     "xxxn3m3s1sxxx/Ternary-BitCPM-CANN-8B-ATLAS",
 ]
 
-OLD = "github.com/xxxn3m3s1sxxx/ATLAS"
-NEW = "github.com/xxxn3m3s1sxxx/ATLAS-TQ1_0"
+# Targeted replacement: only fix exact URL patterns, never double-replace
+WRONG = [
+    # Double-replacement from fragile str.replace: ATLAS-TQ1_0-TQ1_0 → ATLAS-TQ1_0
+    # NOTE: Do NOT add a "xxxn3m3s1sxxx/ATLAS"->"xxxn3m3s1sxxx/ATLAS-TQ1_0" entry here!
+    # "ATLAS" is a SUBSTRING of "ATLAS-TQ1_0", so it would double-replace.
+    ("xxxn3m3s1sxxx/ATLAS-TQ1_0-TQ1_0", "xxxn3m3s1sxxx/ATLAS-TQ1_0"),
+]
 
 for repo_id in REPOS:
     try:
@@ -41,11 +49,18 @@ for repo_id in REPOS:
         print(f"FAIL download {repo_id}: {e}")
         continue
 
-    if OLD not in content:
-        print(f"SKIP {repo_id}: URL not found in README")
+    changed = False
+    for old, new in WRONG:
+        old_count = content.count(old)
+        if old_count > 0:
+            content = content.replace(old, new)
+            print(f"  REPLACED {old_count}x: {old} -> {new}")
+            changed = True
+
+    if not changed:
+        print(f"SKIP {repo_id}: no changes needed")
         continue
 
-    content = content.replace(OLD, NEW)
     api.upload_file(
         path_or_fileobj=content.encode("utf-8"),
         path_in_repo="README.md",

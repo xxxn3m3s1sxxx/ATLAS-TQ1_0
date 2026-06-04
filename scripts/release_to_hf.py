@@ -69,6 +69,18 @@ KNOWN_CONFIGS = {
                 "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 10000.0,
                 "vocab_size": 73448, "scale_emb": 12, "scale_depth": 1.4,
                 "tie_word_embeddings": False},
+    "1bitllm-large": {"model_type": "bitnet_paper", "num_hidden_layers": 24, "hidden_size": 1536,
+                      "intermediate_size": 4096, "num_attention_heads": 16,
+                      "num_key_value_heads": 16, "head_dim": 96, "rope_theta": 10000.0,
+                      "vocab_size": 32002},
+    "1bitllm-xl": {"model_type": "bitnet_paper", "num_hidden_layers": 24, "hidden_size": 2048,
+                   "intermediate_size": 5460, "num_attention_heads": 32,
+                   "num_key_value_heads": 32, "head_dim": 64, "rope_theta": 10000.0,
+                   "vocab_size": 32002},
+    "1bitllm-3B": {"model_type": "bitnet_paper", "num_hidden_layers": 26, "hidden_size": 3200,
+                   "intermediate_size": 8640, "num_attention_heads": 32,
+                   "num_key_value_heads": 32, "head_dim": 100, "rope_theta": 10000.0,
+                   "vocab_size": 32002},
 }
 
 # Per-model perf & size description — keys must match KNOWN_CONFIGS
@@ -85,6 +97,9 @@ MODEL_SIZES = {
     "cann-1B":     ("9.7 tok/s (hybrid)",     "0.83 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 CANN balanced"),
     "cann-3B":     ("7.1 tok/s (hybrid)",     "1.35 GB", "32 layers, 2560 hidden, 10240 intermediate \u2014 CANN quality"),
     "cann-8B":     ("1.5 tok/s (f32 bypass)", "2.65 GB", "32 layers, 4096 hidden, 16384 intermediate \u2014 CANN max quality"),
+    "1bitllm-large": ("7.0 tok/s (f32 bypass)", "0.23 GB", "24 layers, 1536 hidden, 4096 intermediate \u2014 paper reproduction"),
+    "1bitllm-xl":   ("6.0 tok/s (f32 bypass)", "0.37 GB", "24 layers, 2048 hidden, 5460 intermediate \u2014 paper reproduction"),
+    "1bitllm-3B":   ("4.0 tok/s (f32 bypass)", "0.84 GB", "26 layers, 3200 hidden, 8640 intermediate \u2014 paper reproduction"),
 }
 
 
@@ -105,18 +120,23 @@ def _read_atlas_arch(atlas_path):
 def _detect_size(name):
     """Extract model family+size from filename (e.g. 'Ternary-BitCPM-CANN-1B' -> 'cann-1B')."""
     family_map = {"Falcon3": "falcon3", "Bonsai": "bonsai", "BitNet": "bitnet",
-                  "CANN": "cann", "Llama3": "llama3", "TriLM": "trilm"}
+                  "CANN": "cann", "Llama3": "llama3", "TriLM": "trilm",
+                  "1bitLLM": "1bitllm"}
     for fam, key in family_map.items():
         if fam in name:
             for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B", "0.5B"]:
                 if sz in name:
                     return f"{key}-{sz}"
+            # Variant names (no B-suffix)
+            for variant in ["large", "xl"]:
+                if variant in name:
+                    return f"{key}-{variant}"
     return None
 
 
 def _bare_size(size_key):
     """Extract bare size from family-prefixed key (e.g. 'cann-1B' -> '1B')."""
-    for sz in ["0.5B", "1.7B", "10B", "8B", "7B", "4B", "3B", "2B", "1B"]:
+    for sz in ["0.5B", "1.7B", "10B", "8B", "7B", "4B", "3B", "2B", "1B", "large", "xl"]:
         if sz in size_key:
             return sz
     return size_key
@@ -157,6 +177,7 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
     is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
     is_cann = "CANN" in model_name or cfg.get("model_type") == "minicpm"
+    is_1bitllm = "1bitLLM" in model_name or cfg.get("model_type") == "bitnet_paper"
     bsz = _bare_size(size)  # bare size for base model HF names
     engine_note = ""
 
@@ -226,6 +247,30 @@ This is a **quantized derivative work** based on the **BitCPM-CANN** architectur
 
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
+    elif is_1bitllm:
+        base_model_hf = f"1bitLLM/bitnet_b1_58-{bsz if bsz in ['3B'] else 'large' if bsz == 'large' else 'xl'}"
+        ctx_window = "2048 (NTK-scalable up to 4096)"
+        prompt_template = """```
+{role}: {content}
+```
+
+### Example Sequence
+
+```
+User: What is 2+2?
+Assistant: 4
+```"""
+        license_yaml = "license: mit"
+        engine_note = """\
+> **Paper reproduction model** — this is a research reproduction of the BitNet b1.58 architecture by the 1bitLLM team. Quality is limited by the RedPajama 100B token training budget.
+"""
+        license_section = """\
+## License
+
+This is a **quantized derivative work** based on the **1bitLLM BitNet b1.58 paper reproduction** (original model by **1bitLLM**), originally released under **MIT License**.
+
+The ATLAS engine itself is **Apache 2.0 licensed**.
+"""
     else:
         base_model_hf = f"tiiuae/Falcon3-{bsz}-Instruct-1.58bit"
         ctx_window = "4096 (NTK-scalable up to 8192)"
@@ -265,13 +310,24 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
     extra_tags = ""
     if is_bonsai:
         extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
-    elif is_bitnet:
+    elif is_bitnet or is_1bitllm:
         extra_tags = "- cpu-inference\n- bitnet"
     elif is_falcon3:
         extra_tags = "- cpu-inference\n- bitnet"
     elif is_cann:
         extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
-    arch_tag = "bonsai" if is_bonsai else "bitnet" if is_bitnet else "falcon3" if is_falcon3 else "minicpm"
+    if is_1bitllm:
+        arch_tag = "bitnet"
+    elif is_bonsai:
+        arch_tag = "bonsai"
+    elif is_bitnet:
+        arch_tag = "bitnet"
+    elif is_falcon3:
+        arch_tag = "falcon3"
+    elif is_cann:
+        arch_tag = "minicpm"
+    else:
+        arch_tag = "llama"
     frontmatter = f"""---
 {license_yaml}
 language:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified ATLAS packer — pack any HF model to TQ1.0 format.
+"""ATLAS packer — pack supported HF models to TQ1.0 format.
 
 Usage:
   python pack_to_atlas.py <model_dir> <output.atlas>
@@ -183,6 +183,52 @@ def pack_tq1_base3(ternary_int8, ncols):
     return out.tobytes(), packed_per_row
 
 
+def _decode_i2s_to_fp32(tensor_uint8, weight_scale, sub_row_bit_invert=False):
+    """I2_S uint8 → fp32 with per-row weight_scale.
+
+    Decodes 4 ternary values from each uint8 byte, multiplies each row
+    by its per-row scale from weight_scale tensor.
+
+    Args:
+        tensor_uint8: uint8 array of shape [u8_rows, in_cols]
+        weight_scale: per-row scale, shape [nrows] or [nrows, 1] or scalar
+        sub_row_bit_invert: True for Microsoft bit order (sub 0 in high bits)
+
+    Returns:
+        fp32 array of shape [nrows, in_cols]
+    """
+    u8_rows, in_cols = tensor_uint8.shape
+    nrows = u8_rows * 4
+    arr = tensor_uint8.astype(np.uint32)
+    ws = np.asarray(weight_scale, dtype=np.float32).reshape(-1)
+    out = np.empty((nrows, in_cols), dtype=np.float32)
+
+    for ur in range(u8_rows):
+        row = arr[ur]
+        if sub_row_bit_invert:
+            t0 = np.minimum((row >> 6) & 3, 2).astype(np.int8) - 1
+            t1 = np.minimum((row >> 4) & 3, 2).astype(np.int8) - 1
+            t2 = np.minimum((row >> 2) & 3, 2).astype(np.int8) - 1
+            t3 = np.minimum(row & 3, 2).astype(np.int8) - 1
+        else:
+            t0 = np.minimum(row & 3, 2).astype(np.int8) - 1
+            t1 = np.minimum((row >> 2) & 3, 2).astype(np.int8) - 1
+            t2 = np.minimum((row >> 4) & 3, 2).astype(np.int8) - 1
+            t3 = np.minimum((row >> 6) & 3, 2).astype(np.int8) - 1
+
+        out[ur * 4 + 0] = t0
+        out[ur * 4 + 1] = t1
+        out[ur * 4 + 2] = t2
+        out[ur * 4 + 3] = t3
+
+    if ws.size > 1:
+        out *= ws[:, np.newaxis]
+    else:
+        out *= ws[0]
+
+    return out
+
+
 def pre_shuffle_rows(tensor):
     """Pre-shuffle rows to cancel C++ matmul SIMD reorder.
 
@@ -200,7 +246,7 @@ def pre_shuffle_rows(tensor):
     return out
 
 
-def quantize_tq1_repack(tensor_uint8, scale_val=1.0, sub_row_bit_invert=False):
+def quantize_tq1_repack(tensor_uint8, scale_val=1.0, sub_row_bit_invert=False, pre_shuffle=False):
     """I2_S uint8 [OUT/4, IN] → TQ1 Base-3 with fp16 scale.
 
     Each uint8 byte packs 4 consecutive output rows at one input column.
@@ -208,6 +254,10 @@ def quantize_tq1_repack(tensor_uint8, scale_val=1.0, sub_row_bit_invert=False):
 
     TII Falcon3 format (default): sub-row 0 in low bits [0-1].
     Microsoft format (invert=True): sub-row 0 in high bits [6-7].
+
+    If pre_shuffle=True, output rows are permuted so that the C++ matmul's
+    dst[sub*rows_packed+ur] = W[ur*4+sub] · input produces correct
+    dst[r] = W_natural[r] · input.
 
     Returns (data_bytes, packed_per_row, row_dim).
     """
@@ -242,6 +292,16 @@ def quantize_tq1_repack(tensor_uint8, scale_val=1.0, sub_row_bit_invert=False):
             packed = (t5 * TQ1_MUL).sum(axis=1).astype(np.uint8)
             start = (ur * 4 + sub) * packed_per_row
             out[start:start + packed_per_row] = np.minimum(packed, 242)
+
+    if pre_shuffle:
+        # Reorder logical rows to cancel C++ matmul SIMD output reorder.
+        # Logical row r → position (r % u8_rows) * 4 + r // u8_rows
+        shuffled = np.empty_like(out)
+        for r in range(nrows):
+            target = (r % u8_rows) * 4 + r // u8_rows
+            shuffled[target * packed_per_row:(target + 1) * packed_per_row] = \
+                out[r * packed_per_row:(r + 1) * packed_per_row]
+        out = shuffled
 
     data = struct.pack("<e", float(scale_val)) + out.tobytes()
     return data, packed_per_row, nrows
@@ -595,6 +655,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
     # ── Preload weight scales ──────────────────────────────────────
     scales = {}
+    scales_raw = {}
     if arch["has_weight_scale"]:
         for tname in available:
             if tname.endswith("weight_scale"):
@@ -605,8 +666,11 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                         tensor = reader.get_bf16_manual(tname)
                     except Exception:
                         continue
-                scales[tname] = float(tensor) if np.isscalar(tensor) else float(tensor.flat[0])
-        print(f"  Scales loaded: {len(scales)}")
+                t_flat = tensor.reshape(-1)
+                scales[tname] = float(t_flat[0])
+                if t_flat.size > 1:
+                    scales_raw[tname] = tensor
+        print(f"  Scales loaded: {len(scales)} ({len(scales_raw)} per-channel)")
 
     # ── Build ordered tensor list ──────────────────────────────────
     tensor_names = []
@@ -762,15 +826,29 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
             # ── Determine quantization path ──────────────────────────
             if is_weight and arch["input_format"] == "uint8_packed":
-                # Falcon3 path: uint8 pre-packed → TQ1 repack
-                tensor = reader.get_tensor_pt(name)
+                # Falcon3 path: uint8 pre-packed → TQ1
+                tensor_pt = reader.get_tensor_pt(name)
                 sname = name.replace(".weight", ".weight_scale")
-                scale_val = scales.get(sname, 1.0)
-                data_bytes, packed_per_row, row_dim = quantize_tq1_repack(
-                    tensor.numpy(), scale_val,
-                    sub_row_bit_invert=arch.get("sub_row_bit_invert", False))
-                tens_ttype = 0
-                n_blocks = 0
+                scale_raw = scales_raw.get(sname)
+                if scale_raw is not None:
+                    # Per-channel weight_scale: decode → multiply → block-scaled ttype=5
+                    fp32_weights = _decode_i2s_to_fp32(
+                        tensor_pt.numpy(), scale_raw,
+                        sub_row_bit_invert=arch.get("sub_row_bit_invert", False))
+                    if arch["requires_pre_shuffle"]:
+                        fp32_weights = pre_shuffle_rows(fp32_weights)
+                    result = quantize_tq1_block_scaled(fp32_weights, block_size)
+                    data_bytes, packed_per_row, n_blocks, _, row_dim = result
+                    tens_ttype = ttype if ttype == 7 else 5
+                else:
+                    # Scalar weight_scale: existing repack path (ttype=0)
+                    scale_val = scales.get(sname, 1.0)
+                    data_bytes, packed_per_row, row_dim = quantize_tq1_repack(
+                        tensor_pt.numpy(), scale_val,
+                        sub_row_bit_invert=arch.get("sub_row_bit_invert", False),
+                        pre_shuffle=arch["requires_pre_shuffle"])
+                    tens_ttype = 0
+                    n_blocks = 0
 
             elif is_weight and packed_path:
                 # BitNet --packed path: uint8 I2_S → TQ1
@@ -910,7 +988,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified ATLAS packer — pack any HF model to TQ1.0 format",
+        description="ATLAS packer — pack supported HF models to TQ1.0 format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

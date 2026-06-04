@@ -2902,6 +2902,9 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
     float scale, float* output, int B) {
     init_tq1_decode_lut();
     int rows_packed = rows / 4;
+    #ifdef ATLAS_DEBUG_MODE
+    static int tq1_call_count = 0;
+    #endif
 
     #ifdef _OPENMP
     #pragma omp parallel
@@ -2954,6 +2957,17 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
                     for (; j < input_dim; j++) dot += (int32_t)act[j] * (int32_t)row[j];
                     out4[sub] = (float)(dot - 128 * row_sums[sub]) * deq;
                 }
+
+                #ifdef ATLAS_DEBUG_MODE
+                if (tq1_call_count <= 12 && ur == 0 && b == 0) {
+                    printf("[TQ1_DBG#%d] rows=%d dim=%d pcols=%d scale=%f max_abs=%f deq=%g\n",
+                           tq1_call_count, rows, input_dim, packed_cols, scale, max_abs[b], deq);
+                    printf("[TQ1_DBG#%d]   row_sums=[%d %d %d %d] out4=[%.4f %.4f %.4f %.4f]\n",
+                           tq1_call_count,
+                           row_sums[0], row_sums[1], row_sums[2], row_sums[3],
+                           out4[0], out4[1], out4[2], out4[3]);
+                }
+                #endif
 
                 float* dst = output + b * rows;
                 dst[0 * rows_packed + ur] = out4[0];
