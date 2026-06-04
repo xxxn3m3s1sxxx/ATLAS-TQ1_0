@@ -23,6 +23,7 @@ Exit code: 0 = all pass, 1 = any fail
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -153,15 +154,25 @@ EXPECTED_LAYER_TENSORS = {
 EXPECTED_GLOBAL = ["model.embed_tokens.weight", "model.norm.weight"]
 
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "atlas-hf-alignment/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return {"_error": f"HTTP {e.code}: {e.reason}"}
-    except Exception as e:
-        return {"_error": str(e)}
+def fetch_json(url, retries=3):
+    for attempt in range(retries):
+        req = urllib.request.Request(url, headers={"User-Agent": "atlas-hf-alignment/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  [R] Rate limited — retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            return {"_error": f"HTTP {e.code}: {e.reason}"}
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(1)
+                continue
+            return {"_error": str(e)}
+    return {"_error": "max retries exceeded"}
 
 
 def derive_arch(model_id, config):
