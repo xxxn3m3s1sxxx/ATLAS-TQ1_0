@@ -399,14 +399,23 @@ struct AtlasModel {
     int cache_max_seq_len = 0;
 
     // Ensure KV cache is allocated for at least max_seq_len
-    void ensure_cache(int max_seq_len) {
-        if (max_seq_len <= cache_max_seq_len) return;
-        size_t cache_sz = (size_t)n_kv_heads * max_seq_len * head_dim * n_layers;
+    // Returns false on allocation failure (old cache preserved).
+    bool ensure_cache(int max_seq_len) {
+        if (max_seq_len <= cache_max_seq_len) return true;
+        size_t cache_sz = (size_t)n_kv_heads * max_seq_len * head_dim * n_layers * sizeof(uint16_t);
+        uint16_t* new_k = (uint16_t*)atlas_valloc(cache_sz);
+        uint16_t* new_v = (uint16_t*)atlas_valloc(cache_sz);
+        if (!new_k || !new_v) {
+            if (new_k) atlas_vfree((uint8_t*)new_k);
+            if (new_v) atlas_vfree((uint8_t*)new_v);
+            return false;
+        }
         if (k_cache) atlas_vfree((uint8_t*)k_cache);
         if (v_cache) atlas_vfree((uint8_t*)v_cache);
-        k_cache = (uint16_t*)atlas_valloc(cache_sz * sizeof(uint16_t));
-        v_cache = (uint16_t*)atlas_valloc(cache_sz * sizeof(uint16_t));
+        k_cache = new_k;
+        v_cache = new_v;
         cache_max_seq_len = max_seq_len;
+        return true;
     }
     size_t mmap_size = 0;           // actual file size for range checks
     // mmap atlas file handles (for fp16 tensor data — demand-paged by OS)
@@ -479,8 +488,31 @@ struct AtlasModel {
         return false;
     }
 
-    void ensure_buffers(int B) {
-        if (B <= max_batch) return;
+    // Allocate FFN + attention scratch buffers for batch size B.
+    // Returns false on allocation failure (old buffers preserved).
+    bool ensure_buffers(int B) {
+        if (B <= max_batch) return true;
+        int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
+        if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
+        int max_aligned = ((max_dim + 7) + 31) & ~31;
+        int ws = (int)((size_t)B * n_heads * head_dim * 4);
+        float* new_gate = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
+        float* new_up = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
+        float* new_hidden = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
+        float* new_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
+        uint8_t* new_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
+        float* new_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
+        float* new_ws = (float*)atlas_valloc((size_t)ws * sizeof(float));
+        if (!new_gate || !new_up || !new_hidden || !new_act || !new_i8 || !new_out || !new_ws) {
+            if (new_gate) atlas_vfree((uint8_t*)new_gate);
+            if (new_up) atlas_vfree((uint8_t*)new_up);
+            if (new_hidden) atlas_vfree((uint8_t*)new_hidden);
+            if (new_act) atlas_vfree((uint8_t*)new_act);
+            if (new_i8) atlas_vfree((uint8_t*)new_i8);
+            if (new_out) atlas_vfree((uint8_t*)new_out);
+            if (new_ws) atlas_vfree((uint8_t*)new_ws);
+            return false;
+        }
         if (buf_gate) atlas_vfree((uint8_t*)buf_gate);
         if (buf_up) atlas_vfree((uint8_t*)buf_up);
         if (buf_hidden) atlas_vfree((uint8_t*)buf_hidden);
@@ -488,20 +520,15 @@ struct AtlasModel {
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
         if (attn_ws) atlas_vfree((uint8_t*)attn_ws);
-
-        int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
-        if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
-        int max_aligned = ((max_dim + 7) + 31) & ~31;  // +7 for TQ1 padding (packed_cols*5 up to dim+4)
-
-        buf_gate = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
-        buf_up = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
-        buf_hidden = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
-        buf_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
-        buf_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
-        buf_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
-        int ws = (int)((size_t)B * n_heads * head_dim * 4);
-        attn_ws = (float*)atlas_valloc((size_t)ws * sizeof(float));
+        buf_gate = new_gate;
+        buf_up = new_up;
+        buf_hidden = new_hidden;
+        buf_act = new_act;
+        buf_i8 = new_i8;
+        buf_out = new_out;
+        attn_ws = new_ws;
         max_batch = B;
+        return true;
     }
 };
 
@@ -699,7 +726,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     std::vector<uint32_t> file_offsets(n_tensors);
     FSEEK(f, 64 + meta_size, SEEK_SET);
     for (int i = 0; i < n_tensors; i++) {
-        uint8_t e[12]; fread(e, 1, 12, f);
+        uint8_t e[12]; if (fread(e, 1, 12, f) != 12) { fclose(f); delete m; fprintf(stderr, "[ATLAS] Error: truncated file (corrupt tensor directory)\n"); return nullptr; }
         m->tensors[i].ttype = e[0];
         memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
         memcpy(&m->tensors[i].row_dim, e+5, 4);
@@ -721,7 +748,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             // Names stored right after directory: [name_block_size:4] [name_0\0]... 
             FSEEK(f, 64 + meta_size + n_tensors * 12, SEEK_SET);
             uint8_t* nb = new uint8_t[nb_size];
-            fread(nb, 1, nb_size, f);
+            if (fread(nb, 1, nb_size, f) != (size_t)nb_size) { delete[] nb; fclose(f); delete m; fprintf(stderr, "[ATLAS] Error: truncated file (tensor names)\n"); return nullptr; }
             int pos = 4;  // skip size field
             for (int i = 0; i < n_tensors && pos < nb_size; i++) {
                 const char* s = (const char*)(nb + pos);
@@ -819,6 +846,11 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         } else {
             // Fallback: fread into valloc'd buffer (no mmap available)
             t.data = atlas_valloc(t.data_size);
+            if (!t.data) {
+                fprintf(stderr, "[ATLAS] OOM loading tensor %d (size=%lld)\n",
+                        i, (long long)t.data_size);
+                continue;
+            }
             FSEEK(f, (int64_t)file_offsets[i], SEEK_SET);
             fread(t.data, 1, t.data_size, f);
         }
@@ -916,11 +948,16 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     }
 
     fclose(f);
-    auto& last = m->tensors.back();
-    int64_t total = last.file_offset + last.data_size;
-    printf("[ATLAS] Loaded %d tensors (%.2f MB)%s\n", n_tensors, total / 1048576.0,
-           m->tok.magic == 0x544F4B42 ? " (v6 binary tokenizer)" : "");
     return m;
+
+fail:
+    fclose(f);
+    if (m) {
+        // m->~AtlasModel() via delete cleans up partial allocations
+        delete m;
+    }
+    fprintf(stderr, "[ATLAS] Error loading model (corrupt or truncated file)\n");
+    return nullptr;
 }
 
 // ─── Free model ─────────────────────────────────────────────────────────
@@ -1756,6 +1793,11 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
 
         // ─── ttype=0: raw ternary {-1,0,1} decompression ───
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        if (!new_data) {
+            fprintf(stderr, "[ATLAS] OOM decompressing tensor (row_dim=%d)\n", t.row_dim);
+            total--;
+            continue;
+        }
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
 
@@ -1830,6 +1872,13 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         float stored_scale = 127.0f / global_max;
 
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        if (!new_data) {
+            free(decoded_scales);
+            free(f32_row);
+            fprintf(stderr, "[ATLAS] OOM decompressing ttype=5 tensor\n");
+            total--;
+            continue;
+        }
         uint16_t scale_u16 = fp32_to_fp16(stored_scale);
         memcpy(new_data, &scale_u16, 2);
         int8_t* i8 = (int8_t*)(new_data + 2);
@@ -1888,6 +1937,11 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
 
         // Decode all rows to f32 to find global max
         float* f32_all = (float*)atlas_valloc(n_vals * sizeof(float));
+        if (!f32_all) {
+            fprintf(stderr, "[ATLAS] OOM decoding ttype=7 (f32_all)\n");
+            total--;
+            continue;
+        }
         float global_max = 1e-10f;
         for (int r = 0; r < t.row_dim; r++) {
             const uint8_t* row_packed = packed + r * packed_cols;
@@ -1915,6 +1969,12 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
         float stored_scale = 127.0f / global_max;
 
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        if (!new_data) {
+            atlas_vfree((uint8_t*)f32_all);
+            fprintf(stderr, "[ATLAS] OOM decompressing ttype=7 (new_data)\n");
+            total--;
+            continue;
+        }
         uint16_t scale_u16 = fp32_to_fp16(stored_scale);
         memcpy(new_data, &scale_u16, 2);
         int8_t* i8 = (int8_t*)(new_data + 2);
@@ -1946,6 +2006,15 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
             int rows_packed = t.row_dim / 4;
             int8_t* tmp_i8 = (int8_t*)atlas_valloc(n_vals);
             int32_t* tmp_rs = (int32_t*)atlas_valloc(t.row_dim * sizeof(int32_t));
+            if (!tmp_i8 || !tmp_rs) {
+                if (tmp_i8) atlas_vfree((uint8_t*)tmp_i8);
+                if (tmp_rs) atlas_vfree((uint8_t*)tmp_rs);
+                atlas_vfree((uint8_t*)f32_all);
+                atlas_vfree((uint8_t*)new_data);
+                fprintf(stderr, "[ATLAS] OOM shuffling ttype=7\n");
+                total--;
+                continue;
+            }
             for (int r = 0; r < t.row_dim; r++) {
                 int target = (r % rows_packed) * 4 + r / rows_packed;
                 memcpy(tmp_i8 + target * input_dim, i8 + r * input_dim, input_dim);
@@ -2004,6 +2073,10 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         int new_size = 2 + rows * packed_cols + rows * 4;
         
         uint8_t* new_data = atlas_valloc(new_size);
+        if (!new_data) {
+            fprintf(stderr, "[ATLAS] OOM quantizing FFN to int4\n");
+            continue;
+        }
         // Copy fp16 scale
         memcpy(new_data, t.data, 2);
         
@@ -2073,6 +2146,11 @@ ATLAS_API void atlas_decompress_ffn(AtlasModel* m) {
 
         // ─── ttype=0: raw ternary {-1,0,1} decompression ───
         uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        if (!new_data) {
+            fprintf(stderr, "[ATLAS] OOM decompressing FFN tensor\n");
+            total--;
+            continue;
+        }
         new_data[0] = t.data[0];
         new_data[1] = t.data[1];
 
@@ -5013,15 +5091,16 @@ static void forward_layer_internal(
 // layer_idx: [n_layers * 9] int32 — flat array of tensor indices per layer
 //           (ln1, q, k, v, o, ln2, gate, up, down) repeated for each layer
 // K/V cache is internal to the model (int8 + per-position scales)
-ATLAS_API void atlas_forward(
+// Returns 0 on success, -1 on allocation failure.
+ATLAS_API int atlas_forward(
     AtlasModel* m,
     float* hidden_states, int B,
     const int* positions,
     int max_seq_len, int seq_now,
     const int* layer_idx, int n_layers) {
 
-    m->ensure_buffers(B);
-    m->ensure_cache(max_seq_len);
+    if (!m->ensure_buffers(B)) return -1;
+    if (!m->ensure_cache(max_seq_len)) return -1;
     int H = m->hidden_dim;
     ATLAS_LOG("atlas_forward: B=%d max_seq=%d seq_now=%d H=%d nKV=%d hd=%d n_layers=%d stride=%d\n",
               B, max_seq_len, seq_now, H, m->n_kv_heads, m->head_dim, n_layers, m->layer_stride);
@@ -5070,6 +5149,7 @@ ATLAS_API void atlas_forward(
     if (n_layers % 2 == 1) {
         memcpy(hidden_states, buf_a, (size_t)B * H * sizeof(float));
     }
+    return 0;
 }
 
 // ─── Quantize lm_head from fp16 to per-row symmetric int8 ─────────────
@@ -5088,6 +5168,13 @@ ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx, int keep_data) {
     int8_t* i8 = (int8_t*)atlas_valloc((size_t)n_vals);
     int32_t* offs = (int32_t*)atlas_valloc((size_t)V * sizeof(int32_t));
     float* scales = (float*)atlas_valloc((size_t)V * sizeof(float));
+    if (!i8 || !offs || !scales) {
+        if (i8) atlas_vfree((uint8_t*)i8);
+        if (offs) atlas_vfree((uint8_t*)offs);
+        if (scales) atlas_vfree((uint8_t*)scales);
+        fprintf(stderr, "[ATLAS] OOM quantizing lm_head (%d x %d)\n", V, H);
+        return;
+    }
 
     uint16_t* fp16 = (uint16_t*)t.data;
 
@@ -5144,6 +5231,12 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
     // Quantize activations to u8
     uint8_t* act_u8 = (uint8_t*)atlas_valloc((size_t)B * H);
     float* max_abs = (float*)atlas_valloc((size_t)B * sizeof(float));
+    if (!act_u8 || !max_abs) {
+        if (act_u8) atlas_vfree((uint8_t*)act_u8);
+        if (max_abs) atlas_vfree((uint8_t*)max_abs);
+        fprintf(stderr, "[ATLAS] OOM quantizing activations in lm_head gemv\n");
+        return;
+    }
 
     for (int b = 0; b < B; b++) {
         float ma = 1e-5f;
@@ -5388,9 +5481,14 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     // Fused forward for new tokens only; seq_now = total cached tokens
     ATLAS_LOG("prefill forward: B=%d n_new=%d\n", n_new, n_new);
-    atlas_forward(m, embed_buf, n_new, positions,
-                  max_seq_len, n_input,
-                  layer_idx, m->n_layers);
+    if (atlas_forward(m, embed_buf, n_new, positions,
+                      max_seq_len, n_input,
+                      layer_idx, m->n_layers) != 0) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
+        atlas_vfree((uint8_t*)context);
+        return -1;
+    }
     ATLAS_LOG("prefill forward done\n");
 
     // Final RMSNorm + LM head — only the last new token's logits are needed
@@ -5428,9 +5526,13 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         int seq_now = n_input + step;
         int pos = seq_now - 1;
         ATLAS_LOG("decode step=%d seq_now=%d pos=%d\n", step, seq_now, pos);
-        atlas_forward(m, h, 1, &pos,
-                      max_seq_len, seq_now,
-                      layer_idx, m->n_layers);
+        if (atlas_forward(m, h, 1, &pos,
+                          max_seq_len, seq_now,
+                          layer_idx, m->n_layers) != 0) {
+            atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+            atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context);
+            return -1;
+        }
         ATLAS_LOG("decode forward done\n");
 
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
@@ -5522,9 +5624,14 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     }
     for (int i = 0; i < n_new; i++) positions[i] = cache_offset + i;
 
-    atlas_forward(m, embed_buf, n_new, positions,
-                  max_seq_len, n_input,
-                  layer_idx, m->n_layers);
+    if (atlas_forward(m, embed_buf, n_new, positions,
+                      max_seq_len, n_input,
+                      layer_idx, m->n_layers) != 0) {
+        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
+        atlas_vfree((uint8_t*)context);
+        return -1;
+    }
 
     {
         const float* x = embed_buf + (int64_t)(n_new - 1) * H;
@@ -5558,9 +5665,13 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
 
         int seq_now = n_input + step;
         int pos = seq_now - 1;
-        atlas_forward(m, h, 1, &pos,
-                      max_seq_len, seq_now,
-                      layer_idx, m->n_layers);
+        if (atlas_forward(m, h, 1, &pos,
+                          max_seq_len, seq_now,
+                          layer_idx, m->n_layers) != 0) {
+            atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
+            atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context);
+            return n_gen > 0 ? n_gen : -1;
+        }
 
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);

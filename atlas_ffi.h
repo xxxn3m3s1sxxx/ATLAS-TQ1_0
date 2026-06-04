@@ -266,7 +266,8 @@ ATLAS_API const int8_t* atlas_get_int8(void* model, int idx, int* rows,
 // Final RMSNorm + LM head matmul should be applied in Python (numpy/MKL is faster).
 // Memory: buffers allocated internally via valloc (mmap/VirtualAlloc).
 //   ~4 × B × max(inter_dim, hidden_dim, n_heads*head_dim) × sizeof(float)
-ATLAS_API void atlas_forward(void* model,
+// Returns 0 on success, -1 on allocation failure (OOM).
+ATLAS_API int atlas_forward(void* model,
     float* hidden_states, int B,
     const int* positions,
     int max_seq_len, int seq_now,

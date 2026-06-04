@@ -137,7 +137,7 @@ dll.atlas_lmhead_gemv.argtypes = [
     ctypes.c_int,
 ]
 
-dll.atlas_forward.restype = None
+dll.atlas_forward.restype = ctypes.c_int
 dll.atlas_forward.argtypes = [
     ctypes.c_void_p,                              # model
     ctypes.POINTER(ctypes.c_float),               # hidden_states (in-place)
@@ -860,14 +860,15 @@ class AtlasModel:
         positions = np.array([start_pos + p for b in range(B) for p in range(seq_len)], dtype=np.int32)
         seq_now = start_pos + seq_len
 
-        dll.atlas_forward(
+        if dll.atlas_forward(
             self.model_ptr,
             h.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             n,
             positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             self.max_seq_len, seq_now,
             self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            self.n_layers)
+            self.n_layers) != 0:
+            raise RuntimeError("ATLAS Core: Memory allocation failed during forward pass")
 
         h_norm = np.array([self._rmsnorm(h[b], "model.norm.weight") for b in range(n)])
         output_logits = self._lmhead_gemv(h_norm).reshape(B, seq_len, self.vocab_size)
