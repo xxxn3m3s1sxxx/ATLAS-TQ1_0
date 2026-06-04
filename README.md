@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> 🚀 **v2.10.4 — BitCPM-CANN Series + Bug Hunt**: 4 CANN models (0.5B/1B/3B/8B) — MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm. All 4 deployed to HuggingFace. 12 bugs fixed in v2.10.3 (BPE cutoff, unaligned access, RoPE heuristic, thread safety, EOS sentinel). 66 mock tests, CI green on Windows + Linux.
+> 🚀 **v2.10.6 — OOM Error Propagation (Signal Chain)**: Complete memory allocation failure cascade from `atlas_valloc` NULL → `generate_c` → Python `RuntimeError`. All 37 `atlas_valloc` calls NULL-checked, all 6 `fread` calls checked, `atlas_forward` returns `int` (-1/0). 55 mock tests, 12 sonde tests, CI green.
 
 ## Quickstart
 
@@ -258,6 +258,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.10.6** | **OOM Error Propagation (Signal Chain)**. Complete memory failure cascade: `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked, Python `RuntimeError` on OOM. 55/55 mock tests, 12/12 sonde. |
 | **v2.10.4** | **BitCPM-CANN Series (0.5B/1B/3B/8B) + Bug Hunt**. MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Debug print crash fix (unconditional OOB logits read). 43/43 mock tests, 4 CANN models deployed to HF. |
 | **v2.10.3** | **Bug Hunt Round 2+3 (12 bugs) + Llama3**. Falcon3 BPE cutoff, unaligned memcpy, RoPE heuristic override, xoshiro thread safety, VNNI init race, EOS sentinel, Llama3 stops/specials, v6 added_tokens. 39/39 tests. |
 | **v2.10.2** | **Consistent naming + HF repos**. Falcon3 HF models renamed, Bonsai-8B perf table. |

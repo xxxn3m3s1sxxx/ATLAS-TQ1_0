@@ -152,6 +152,19 @@ See `atlas_ffi.h` for full API.
 
 ## Roadmap
 
+### v2.10.6 ✅ — OOM Error Propagation (Signal Chain) (ABGESCHLOSSEN)
+- **`ensure_cache` → `bool`**: Allocate both k/v caches before freeing old, `cache_max_seq_len` updated only on success. Safe partial free on failure.
+- **`ensure_buffers` → `bool`**: All 7 scratch buffers allocated before freeing old, `max_batch` updated only on success. Safe partial free on failure.
+- **`atlas_forward` → `int` Return**: Changed from `void` to `int` (0=success, -1=OOM). Checks both `ensure_buffers` and `ensure_cache` return values.
+- **`atlas_generate` / `atlas_generate_stream`**: Both prefill and decode loop call sites check `atlas_forward` return, free temporary allocations, return -1 on failure.
+- **`atlas_load`**: `fread` checks for directory entries and tensor names. Tensor data `atlas_valloc` checked. Corrupt/truncated files produce graceful error instead of segfault.
+- **Decompressors**: NULL checks in `atlas_decompress_all` (1 valloc), `atlas_decompress_ttype5` (1), `atlas_decompress_ttype7` (4), `atlas_decompress_ffn` (1), `atlas_quantize_ffn_to_i4` (1). Failed tensors skip with stderr error.
+- **`atlas_quantize_lm_head` / `atlas_lmhead_gemv`**: 3 + 2 allocations checked, early return on failure.
+- **Python FFI**: `dll.atlas_forward.restype` → `ctypes.c_int`. `forward()` raises `RuntimeError("ATLAS Core: Memory allocation failed during forward pass")` on non-zero return.
+- **37/37 `atlas_valloc` NULL-Checks**: Before: 12 (32%), after: 37 (100%). All critical paths guarded.
+- **55/55 Mock-Tests grün + 12/12 Sonde-Tests**: Keine Regression auf 7 Architekturen.
+- **`latest` tag gesetzt**: Zeigt auf v2.10.6.
+
 ### v2.10.4 ✅ — BitCPM-CANN-1B/3B Support + Debug Print Fixes (ABGESCHLOSSEN)
 - **BitCPM-CANN-1B TQ1.0**: 28L/2048H/6144I/16:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 0.83 GB, MiniCPM v5 Tokenizer eingebettet. ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`.
 - **BitCPM-CANN-3B TQ1.0**: 32L/2560H/10240I/32:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 1.35 GB, MiniCPM v5 Tokenizer. Hybrid path. T=0/T=0.7 beide kohärent ("The capital of France is Paris. Paris is the most populous city in France...").
@@ -250,6 +263,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.10.6** | **OOM Error Propagation (Signal Chain)**: Complete memory failure cascade from `atlas_valloc` NULL → `generate_c` → Python `RuntimeError`. `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked. 55/55 mock tests, 12/12 sonde. |
 | **v2.10.4** | **BitCPM-CANN-1B Support + Debug Print Crash Fix**: 28L/2048H/6144I/16:2 heads/73448vocab, Llama-Architektur (LongRoPE), MiniCPM v5 Tokenizer. Unconditional `logits[96944]` OOB Read in Debug-Print gefixt (586 Bytes über Allokation bei V=73448). Alle unconditional Debug-Prints entfernt. `ATLAS_DLL` env var fix (überschreibt jetzt immer). 9.7 tok/s auf i7-7700T. |
 | **v2.10.3** | **Bug Hunt Round 2+3 + Llama3-Support**: 12 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik, xoshiro_state thread_local, VNNI Init-Race, EOS sentinel=0→None, BitNet-Stops, silent except→warn). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
 | **v2.10.2** | **Consistent Naming + HF-Repos**: Falcon3 HF-Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. `matmul_reorder_deq` pre-divide Optimierung. Bonsai-8B in Performance-Tabelle. |

@@ -2,6 +2,15 @@
 
 ## ✅ Recently Fixed
 
+### v2.10.6 — OOM Signal Chain (37 × NULL-Check)
+
+### Bug #13: `atlas_forward` `void` — Stille OOM-Todeskandidaten (Architektur)
+- **Fixed**: `atlas_forward` hatte `void`-Return. Speicherallokationsfehler in `ensure_cache`, `ensure_buffers`, oder tiefer in den Decompressoren wurden stumm ignoriert. Bei OOM schrieb der Engine in NULL-Pointer → segfault statt Fehlermeldung.
+- **Fix**: `atlas_forward` → `int` (-1/0). Alle 37 `atlas_valloc`-Aufrufe haben NULL-Checks. `ensure_cache`/`ensure_buffers` geben `bool` zurück. Python `forward()` wirft `RuntimeError`.
+- **Bereinigt**: `atlas_load` fread-Checks (directory, names), 7 Decompressoren NULL-Checks, `atlas_lmhead_gemv` NULL-Checks.
+
+---
+
 ### v2.10.4 — OOB Logits Read + Debug Print Spam
 
 ### Bug #10: Unconditional `logits[96944]` OOB Read in Debug Print (Critical)
