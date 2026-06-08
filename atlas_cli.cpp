@@ -262,6 +262,7 @@ struct ModelInfo {
     int n_layers, hidden, inter, n_heads, n_kv_heads, head_dim, vocab_size;
     float rope_theta;
     bool is_bitnet = false;
+    bool is_cann = false;
     bool is_qwen3 = false;
     bool is_falcon3 = false;
 };
@@ -273,13 +274,14 @@ static ModelInfo get_model_info(void* model) {
     // Read rope_theta from file header
     // We'll approximate by checking tensor names
     info.is_bitnet = (atlas_get_tensor_index(model, "model.layers.0.self_attn.attn_sub_norm.weight") >= 0);
-    info.is_qwen3 = (!info.is_bitnet && (info.head_dim <= 128 || info.vocab_size > 131072));
-    info.is_falcon3 = (!info.is_bitnet && !info.is_qwen3);
+    info.is_cann = (info.vocab_size == 73448);
+    info.is_qwen3 = (!info.is_bitnet && !info.is_cann && (info.head_dim <= 128 || info.vocab_size > 131072));
+    info.is_falcon3 = (!info.is_bitnet && !info.is_cann && !info.is_qwen3);
     return info;
 }
 
 static std::string apply_chat_template(const ModelInfo& info, const std::string& user_text) {
-    if (info.is_qwen3) {
+    if (info.is_cann || info.is_qwen3) {
         return "<|im_start|>user\n" + user_text + "<|im_end|>\n<|im_start|>assistant\n";
     }
     if (info.is_bitnet) {

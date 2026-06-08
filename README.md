@@ -47,6 +47,14 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | Falcon3-1B-Instruct | 1.2 GB | 3 GB | 18 | 8 | **10.1** |
 | Falcon3-7B-Instruct | 2.8 GB | 6 GB | 28 | 12 | **3.15** |
 | Falcon3-10B-Instruct | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
+| Falcon3-3B-Base | 2.1 GB | 4 GB | 22 | 12 | **7.1** |
+| Falcon3-7B-Base | 3.0 GB | 6 GB | 28 | 12 | **3.15** |
+| Falcon3-10B-Base | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
+| **Falcon-E Edge** (v2.10.5) |||||
+| Falcon-E-1B-Instruct | 0.56 GB | 2 GB | 24 | 16 | **13** |
+| Falcon-E-1B-Base | 0.56 GB | 2 GB | 24 | 16 | **13** |
+| Falcon-E-3B-Instruct | 0.82 GB | 3 GB | 32 | 16 | **7** |
+| Falcon-E-3B-Base | 0.82 GB | 3 GB | 32 | 16 | **7** |
 | **Bonsai (Qwen3)** |||||
 | Bonsai-1.7B | 0.9 GB | 3 GB | 28 | 16 | **13.0** |
 | Bonsai-4B | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
@@ -57,6 +65,10 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | CANN-3B | 1.35 GB | 5 GB | 32 | 32 | **7.1** |
 | CANN-8B | 2.65 GB | 8 GB | 32 | 32 | **1.5** |
 | **TriLM** |||||
+| TriLM-99M | 0.05 GB | 1 GB | 12 | 24 | — |
+| TriLM-190M | 0.1 GB | 1 GB | 18 | 24 | — |
+| TriLM-390M | 0.2 GB | 1 GB | 24 | 24 | — |
+| TriLM-560M | 0.3 GB | 1 GB | 24 | 28 | — |
 | TriLM-830M | 0.4 GB | 2 GB | 24 | 28 | — |
 | TriLM-1.1B | 0.5 GB | 3 GB | 24 | 28 | — |
 | TriLM-1.5B | 0.7 GB | 3 GB | 24 | 32 | — |
@@ -64,27 +76,34 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | TriLM-3.9B ⚠️ | 1.2 GB | 5 GB | 32 | 64 | — |
 | **Other** |||||
 | BitNet-2B4T-b1.58 | 1.0 GB | 4 GB | 30 | 20 | **2.8** |
+| Llama3-8B-1.58 | 4.1 GB | 10 GB | 32 | 32 | **0.8** |
 
 "Best tok/s" on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Your speed depends on CPU.
 - **3B+ models** work well on 4-8 GB RAM laptops
 - **7B/10B models** need 6-8 GB RAM (faster with int4 FFN mode)
 - **1B models** are fast but less capable
+- **Falcon-E Edge**: BitNet 1.58-bit architecture (SubLN, ReLU²), 32K native context. 0.56–0.82 GB on disk.
 - **CANN models**: MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Chat template: `<|role|>\n{content}\n`.
 - **TriLM 3.9B ⚠️**: Uses **standard Llama** architecture (head_dim=128, no SubLN) — different from smaller TriLMs (SubLN, head_dim=64). Auto-detected.
+- **Llama3-8B-1.58**: Llama3 architecture (GQA, QK-Norm), 256 added tokens (IDs 128000–128255). Base model only (no chat template).
 
 ### Model Sources
 
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
-| **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-Instruct-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
-| **Falcon3 ATLAS** (1B/3B/7B/10B) | [`xxxn3m3s1sxxx/Falcon3-*-Instruct-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
+| **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
+| **Falcon3 ATLAS** (1B/3B/7B/10B Base+Instruct) | [`xxxn3m3s1sxxx/Falcon3-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
+| **Falcon-E Edge** (1B/3B Base+Instruct) | [`tiiuae/Falcon-E-*`](https://huggingface.co/tiiuae) | Falcon-LLM License | ✅ |
+| **Falcon-E Edge ATLAS** (1B/3B) | [`xxxn3m3s1sxxx/Falcon-E-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon-E) | Falcon-LLM License | ✅ |
 | **Ternary Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **Ternary Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | ✅ |
+| **Llama3-8B-1.58 ATLAS** (8B) | [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS) | Llama3 | ✅ |
 | **BitCPM-CANN** (0.5B/1B/3B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb) | Apache 2.0 | ✅ |
-| **BitCPM-CANN ATLAS** (0.5B/1B/3B/8B) | [`xxxn3m3s1sxxx/Ternary-BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-BitCPM-CANN) | Apache 2.0 | ✅ |
-| **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
+| **BitCPM-CANN ATLAS** (0.5B/1B/3B/8B) | [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN) | Apache 2.0 | ✅ |
+| **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite/TriLM_*_Unpacked`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
+| **TriLM ATLAS** (99M→3.9B) | [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM) | Apache 2.0 | ✅ |
 
 ✅ — Supported and tested.
 
@@ -96,7 +115,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 # Requires Python + transformers:
 pip install safetensors transformers numpy
 
-# All architectures auto-detected (Falcon3, Bonsai, Qwen3, BitNet, TriLM, Llama):
+# All architectures auto-detected (Falcon3, Falcon-E, Bonsai, Qwen3, BitNet, BitCPM-CANN, TriLM, Llama3):
 python pack_to_atlas.py path/to/model-directory
 ```
 
@@ -171,11 +190,19 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 | Falcon3-10B (int4) | hybrid+int8 | **2.25** | 18% faster than int8 |
 | Bonsai-8B | f32 bypass | **1.8** | Most capable, slowest |
 | BitNet-2B4T | f32 bypass | **2.8** | Experimental |
+| **Falcon-E Edge** (v2.10.5) ||||
+| Falcon-E-1B | hybrid+int8 | **13** | BitNet 1.58 arch, SubLN, ReLU² |
+| Falcon-E-3B | hybrid+int8 | **7** | Balanced Falcon Edge |
 | **BitCPM-CANN** (v2.10.4) ||||
 | CANN-0.5B | f32 bypass | **30** | Tiny, MiniCPM v5 tok, DeepNorm |
 | CANN-1B | hybrid+int8 | **9.7** | Llama arch, LongRoPE 32K ctx |
 | CANN-3B | hybrid+int8 | **7.1** | Balanced quality/speed |
 | CANN-8B | f32 bypass | **1.5** | Max quality, 16384 intermediate |
+| **TriLM** ||||
+| TriLM-99M | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-190M | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-390M | f32 bypass | — | SubLN, head_dim=64 |
+| TriLM-560M | f32 bypass | — | SubLN, head_dim=64 |
 | TriLM-830M | f32 bypass | — | SubLN, head_dim=64 |
 | TriLM-1.1B | f32 bypass | — | SubLN, head_dim=64 |
 | TriLM-1.5B | f32 bypass | — | SubLN, head_dim=64 |
@@ -259,6 +286,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 | Version | What's New |
 |---------|------------|
 | **v2.10.6** | **OOM Error Propagation (Signal Chain)**. Complete memory failure cascade: `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked, Python `RuntimeError` on OOM. 55/55 mock tests, 12/12 sonde. |
+| **v2.10.5** | **Falcon-E Edge Integration + Unified C++ Generation Path**. Falcon-E 1B/3B (Base+Instruct) in TQ1.0 format. CANN dual EOS (`eos_id2` for `</s>` ID 2), thread_local block scales, relaxed QK-Norm arch guard. 58/58 mock tests across 9 architectures. |
 | **v2.10.4** | **BitCPM-CANN Series (0.5B/1B/3B/8B) + Bug Hunt**. MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Debug print crash fix (unconditional OOB logits read). 43/43 mock tests, 4 CANN models deployed to HF. |
 | **v2.10.3** | **Bug Hunt Round 2+3 (12 bugs) + Llama3**. Falcon3 BPE cutoff, unaligned memcpy, RoPE heuristic override, xoshiro thread safety, VNNI init race, EOS sentinel, Llama3 stops/specials, v6 added_tokens. 39/39 tests. |
 | **v2.10.2** | **Consistent naming + HF repos**. Falcon3 HF models renamed, Bonsai-8B perf table. |
@@ -280,4 +308,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0).
+Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Falcon-E Edge: TII Falcon-LLM License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: Llama3 License (derivative at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS)). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).

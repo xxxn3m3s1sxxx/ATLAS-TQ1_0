@@ -359,6 +359,7 @@ struct AtlasModel {
     int layer_stride = 9;    // tensors per layer (9 Falcon3, 11 Qwen3/BitNet)
     int model_arch = 0;      // 0=LLaMA, 1=Qwen3, 2=BitNet
     int eos_id = 11;   // default Falcon3 endoftext
+    int eos_id2 = -1;  // second EOS (CANN: </s> ID 2)
     int pad_id = 0;    // default padding token
     bool use_f32_matmul = false; // skip activation quantization (1B model needs full precision)
     bool use_ternary_matmul = false; // v1.3.0: vpsignb-based ternary-add kernel (no multiplication)
@@ -695,8 +696,9 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
     // EOS/PAD IDs from header (bytes 45-52), fallback to defaults
     uint32_t eos_val; memcpy(&eos_val, hdr+45, 4);
     uint32_t pad_val; memcpy(&pad_val, hdr+49, 4);
-    if (eos_val != 0) m->eos_id = (int)eos_val;
-    if (pad_val != 0) m->pad_id = (int)pad_val;
+    if (eos_val != 0 && eos_val != 0xFFFFFFFF) m->eos_id = (int)eos_val;
+    if (pad_val != 0 && pad_val != 0xFFFFFFFF) m->pad_id = (int)pad_val;
+    if (m->vocab_size == 73448) m->eos_id2 = 2; // CANN: also stop on </s>
 
     // Byte 53: model_flags — use_relu2 (bit 3) for ReLU² (BitNet b1.58)
     m->use_relu2 = (hdr[53] >> 3) & 1;
@@ -3351,18 +3353,14 @@ static void matmul_tq1_block_fused_f32(int rows, int input_dim, int packed_cols,
     const uint8_t* scale_data = tensor_data + 3;
     const uint8_t* packed = tensor_data + 3 + rows * n_blocks * 2;
 
-    static float* s_block_scales = nullptr;
-    static size_t s_block_scales_cap = 0;
-    static std::mutex s_bs_mutex;
+    static thread_local float* s_block_scales = nullptr;
+    static thread_local size_t s_block_scales_cap = 0;
     {
         size_t need_bs = (size_t)rows * n_blocks;
         if (need_bs > s_block_scales_cap) {
-            std::lock_guard<std::mutex> lock(s_bs_mutex);
-            if (need_bs > s_block_scales_cap) {
-                free(s_block_scales);
-                s_block_scales = (float*)malloc(need_bs * sizeof(float));
-                s_block_scales_cap = need_bs;
-            }
+            free(s_block_scales);
+            s_block_scales = (float*)malloc(need_bs * sizeof(float));
+            s_block_scales_cap = need_bs;
         }
     }
     float* block_scales = s_block_scales;
@@ -4348,8 +4346,8 @@ static void forward_layer_internal(
         memcpy(k_f32 + b * kvd, m->buf_hidden + b * tk.row_dim, kvd * sizeof(float));
         memcpy(v_f32 + b * kvd, m->buf_up + b * tv.row_dim, kvd * sizeof(float));
     }
-    const uint8_t* qn_w = (idx_q_norm >= 0 && m->model_arch == ARCH_QWEN3) ? m->tensors[idx_q_norm].data : nullptr;
-    const uint8_t* kn_w = (idx_k_norm >= 0 && m->model_arch == ARCH_QWEN3) ? m->tensors[idx_k_norm].data : nullptr;
+    const uint8_t* qn_w = (idx_q_norm >= 0) ? m->tensors[idx_q_norm].data : nullptr;
+    const uint8_t* kn_w = (idx_k_norm >= 0) ? m->tensors[idx_k_norm].data : nullptr;
     atlas_attention_f32(q_f32, k_f32, v_f32, positions,
         k_cache_layer, v_cache_layer,
         max_seq_len, seq_now, B,
@@ -5011,9 +5009,7 @@ static void forward_layer_internal(
                 float* tmp = m->buf_act + b * dim;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
-                if (m->model_arch == ARCH_BITNET && idx_k_norm >= 0) {
-                    apply_sub_norm(tmp, inter, m->tensors[idx_k_norm].data);
-                }
+                // removed: dead code (ARCH_BITNET never has idx_k_norm >= 0)
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
             }
             if (idx_ffn_sub_norm >= 0) {
@@ -5310,7 +5306,7 @@ ATLAS_API void atlas_sample(AtlasModel* m, float* logits, int* output,
                              float temperature, int top_k, float top_p) {
     (void)m;
     if (!output || !logits) return;
-    *output = gumbel_sample(logits, m ? m->vocab_size : 131072,
+    *output = gumbel_sample(logits, m ? m->vocab_size : (151669),
                              temperature, top_k, top_p,
                              nullptr, 0, 1.0f);
 }
@@ -5348,7 +5344,7 @@ static void ensure_layer_idx(AtlasModel* m) {
     // Respect config.json override (v6+ meta-block): if rope_interleaved was explicitly set,
     // the heuristic cannot override it.
     if (!m->rope_interleaved_set) {
-        m->rope_interleaved = (model_arch == ARCH_QWEN3) || (m->head_dim >= 256);
+        m->rope_interleaved = (m->head_dim >= 256) && (model_arch != ARCH_QWEN3);
     }
     if (model_arch == ARCH_BITNET) m->use_f32_matmul = 1;
     m->layer_idx_cache.clear();
@@ -5500,13 +5496,17 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     // Sample first token from prefill logits
     const int eos_id = m->eos_id;
-    if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+    const int eos_id2 = m->eos_id2;
+    if (n_gen < min_new_tokens) {
+        if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+        if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
+    }
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
     context[n_input] = next_token;
     output_ids[n_gen++] = next_token;
 
-    if (next_token == eos_id) {
+    if (next_token == eos_id || next_token == eos_id2) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
         atlas_vfree((uint8_t*)context);
@@ -5538,13 +5538,16 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
 
-        if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+        if (n_gen < min_new_tokens) {
+            if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+            if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
+        }
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
         context[n_input + n_gen] = next_token;
         output_ids[n_gen++] = next_token;
 
-        if (next_token == eos_id) break;  // EOS
+        if (next_token == eos_id || next_token == eos_id2) break;  // EOS
     }
 
     atlas_vfree((uint8_t*)embed_buf);
@@ -5640,14 +5643,18 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     }
 
     const int eos_id = m->eos_id;
-    if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+    const int eos_id2 = m->eos_id2;
+    if (n_gen < min_new_tokens) {
+        if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+        if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
+    }
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
     context[n_input] = next_token;
     callback(next_token, user_data);
     n_gen++;
 
-    if (next_token == eos_id) {
+    if (next_token == eos_id || next_token == eos_id2) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
         atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
         atlas_vfree((uint8_t*)context);
@@ -5676,14 +5683,17 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
 
-        if (n_gen < min_new_tokens && eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+        if (n_gen < min_new_tokens) {
+            if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
+            if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
+        }
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
         context[n_input + n_gen] = next_token;
         callback(next_token, user_data);
         n_gen++;
 
-        if (next_token == eos_id) break;
+        if (next_token == eos_id || next_token == eos_id2) break;
     }
 
     atlas_vfree((uint8_t*)embed_buf);

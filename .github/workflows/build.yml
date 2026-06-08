@@ -24,38 +24,75 @@ on:
     types: [published]
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
+      - name: Check API parity (C -> Python)
+        run: python scripts/check_api_parity.py
+      - name: HF alignment check
+        run: python scripts/verify_hf_alignment.py || echo "[WARN] HF alignment check non-fatal (network flake)"
+
+  sanitizer-build:
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
+      - name: Install LLVM/Clang + OMP
+        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+      - name: Generate test fixtures
+        run: python tests/generate_test_fixtures.py tests/
+      - name: Build with ASan+UBSan
+        run: |
+          ASAN_FLAGS="-fsanitize=address,undefined -shared-libasan -fno-omit-frame-pointer"
+          clang++ $ASAN_FLAGS -fopenmp -O1 -g -mavx2 -mfma -mf16c -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
+      - name: Run tests under ASan
+        env:
+          OMP_NUM_THREADS: "4"
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_stats=1:log_path=/tmp/asan"
+        run: |
+          ASAN_LIB=$(clang++ --print-file-name=libclang_rt.asan-x86_64.so)
+          echo "ASan runtime: $ASAN_LIB"
+          LD_PRELOAD=$ASAN_LIB python tests/ci_smoke.py
+          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_dll.py -v
+          rc=0; LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q 2>/tmp/asan_err.txt || rc=$?; echo "=== ASAN STDERR ==="; cat /tmp/asan_err.txt 2>/dev/null; echo "=== ASAN LOGFILE ==="; cat /tmp/asan.* 2>/dev/null; echo "=== EXIT CODE: $rc ==="; exit $rc
+
   build:
+    needs: sanitizer-build
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         os:
           - ubuntu-latest
           - windows-latest
-
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Check API parity (C ⇄ Python)
-        run: python scripts/check_api_parity.py
-
-      - name: HF alignment check
-        run: python scripts/verify_hf_alignment.py || echo "[WARN] HF alignment check non-fatal (network flake)"
-
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn gcovr
       - name: Install LLVM/Clang
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
-
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
-
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -67,26 +104,18 @@ jobs:
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
           Write-Output "=== Copied $(@(Get-ChildItem *.dll).Count) DLLs ==="
           echo "$llvmDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Install test deps
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
-
       - name: Generate test fixtures
         shell: pwsh
         run: python tests/generate_test_fixtures.py tests/
-
       - name: Test (Linux)
         if: runner.os == 'Linux'
         run: |
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
           python -m pytest tests/test_fixtures.py -v
-
       - name: Coverage (Linux)
         if: runner.os == 'Linux'
         run: |
-          pip install --quiet gcovr
-          # Find llvm-cov (clang coverage tools)
           GCOV_TOOL="gcov"
           if command -v llvm-cov-19 &>/dev/null; then
             GCOV_TOOL="llvm-cov-19 gcov"
@@ -104,7 +133,6 @@ jobs:
           python -m gcovr --gcov-executable "$GCOV_TOOL" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python -m gcovr --gcov-executable "$GCOV_TOOL" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python scripts/check_coverage_thresholds.py coverage_summary.json
-
       - name: Test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -116,14 +144,12 @@ jobs:
           python -m pytest tests/test_fixtures.py::test_golden_regression -v --no-header -q 2>$null
           $env:GENERATE_GOLDEN="0"
           python -m pytest tests/test_fixtures.py -v
-
       - name: Coverage (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $llvmDir = "C:\Program Files\LLVM"
           if (-not (Test-Path $llvmDir)) { throw "LLVM not found" }
-          pip install --quiet gcovr
           Remove-Item -Force -Path *.gcda, *.gcno -ErrorAction SilentlyContinue
           clang++ -fopenmp -O0 -g -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas_cov.dll atlas_api.cpp atlas_vnni.cpp "$llvmDir\lib\libomp.lib" --coverage
           Copy-Item "$llvmDir\bin\*.dll" -Destination . -Force -ErrorAction SilentlyContinue
@@ -135,7 +161,6 @@ jobs:
           python -m gcovr --gcov-executable "llvm-cov gcov" --html-details coverage.html --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python -m gcovr --gcov-executable "llvm-cov gcov" --json-summary coverage_summary.json --root . --filter "atlas_api\.cpp" --gcov-ignore-parse-errors
           python scripts/check_coverage_thresholds.py coverage_summary.json
-
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
@@ -143,58 +168,26 @@ jobs:
           path: coverage.*
           if-no-files-found: ignore
 
-  sanitizer-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install LLVM/Clang + OMP
-        run: sudo apt-get update && sudo apt-get install -y clang libomp-dev
-
-      - name: Build with ASan+UBSan
-        run: |
-          ASAN_FLAGS="-fsanitize=address,undefined -shared-libasan -fno-omit-frame-pointer"
-          clang++ $ASAN_FLAGS -fopenmp -O1 -g -mavx2 -mfma -mf16c -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
-
-      - name: Install test deps
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
-
-      - name: Generate test fixtures
-        run: python tests/generate_test_fixtures.py tests/
-
-      - name: Run tests under ASan
-        env:
-          OMP_NUM_THREADS: "4"
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:print_stats=1:log_path=/tmp/asan"
-        run: |
-          ASAN_LIB=$(clang++ --print-file-name=libclang_rt.asan-x86_64.so)
-          echo "ASan runtime: $ASAN_LIB"
-          LD_PRELOAD=$ASAN_LIB python tests/ci_smoke.py
-          LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_dll.py -v
-          rc=0; LD_PRELOAD=$ASAN_LIB python -m pytest tests/test_fixtures.py tests/test_mock_model.py tests/test_omp_stress.py tests/test_e2e_pipeline.py tests/test_fuzz.py -v --no-header -q 2>/tmp/asan_err.txt || rc=$?; echo "=== ASAN STDERR ==="; cat /tmp/asan_err.txt 2>/dev/null; echo "=== ASAN LOGFILE ==="; cat /tmp/asan.* 2>/dev/null; echo "=== EXIT CODE: $rc ==="; exit $rc
-
-  # macOS only on release (free tier runner bottleneck)
   build-macos:
     if: github.event_name == 'release'
+    needs: sanitizer-build
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
       - name: Install LLVM/Clang
         run: brew install llvm libomp
-      - name: Check API parity (C ⇄ Python)
-        run: python scripts/check_api_parity.py
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
       - name: Build
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
           $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -L$LLVM_PREFIX/lib -lomp
           echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
-      - name: Install test deps
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
       - name: Generate test fixtures
         run: python tests/generate_test_fixtures.py tests/
       - name: Test

@@ -126,6 +126,29 @@ def test_bonsai_corridor_load(arch, corridor):
     assert not np.any(np.isnan(logits))
     assert not np.any(np.isinf(logits))
 
+TRILM_CORRIDORS = {
+    "trilm_1_5b": "f32_bypass",
+    "trilm_2_4b": "production_int8",
+    "trilm_3_9b": "production_int8",
+}
+
+@pytest.mark.parametrize("arch,corridor", list(TRILM_CORRIDORS.items()))
+def test_trilm_corridor_load(arch, corridor):
+    core = CORRIDORS[corridor]
+    path = os.path.join(MOCK_DIR, f"trilm-{arch}.atlas")
+    if not os.path.exists(path):
+        make(path, arch, corridor=corridor)
+    m = AtlasModel(path)
+    for func_name, args in core["post_init"]:
+        fn = getattr(dll, func_name)
+        fn(m.model_ptr, *args)
+    assert m.n_layers == 2
+    ids = np.array([[1, 2, 3]], dtype=np.int32)
+    logits = m.forward(ids)
+    assert logits.shape == (1, 3, m.vocab_size)
+    assert not np.any(np.isnan(logits))
+    assert not np.any(np.isinf(logits))
+
 # ─── v6 Binary Tokenizer with Added Tokens ─────────────────────────────
 
 def _build_v6_binary(vocab_size=256, added_tokens=None):

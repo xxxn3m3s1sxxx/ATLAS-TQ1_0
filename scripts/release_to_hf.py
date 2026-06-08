@@ -17,6 +17,15 @@ Examples:
 """
 import argparse, json, os, sys
 
+# Auto-load .env from project root
+_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.isfile(_env):
+    with open(_env) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 
 # Known configs for README completeness when model_dir unavailable
 KNOWN_CONFIGS = {
@@ -81,14 +90,25 @@ KNOWN_CONFIGS = {
                    "intermediate_size": 8640, "num_attention_heads": 32,
                    "num_key_value_heads": 32, "head_dim": 100, "rope_theta": 10000.0,
                    "vocab_size": 32002},
+    "falcon-e-1B": {"model_type": "llama", "num_hidden_layers": 24, "hidden_size": 2048,
+                    "intermediate_size": 9216, "num_attention_heads": 16,
+                    "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 1000000.0,
+                    "vocab_size": 32768},
+    "falcon-e-3B": {"model_type": "llama", "num_hidden_layers": 32, "hidden_size": 2048,
+                    "intermediate_size": 13312, "num_attention_heads": 16,
+                    "num_key_value_heads": 2, "head_dim": 128, "rope_theta": 1000000.0,
+                    "vocab_size": 32768},
 }
 
 # Per-model perf & size description — keys must match KNOWN_CONFIGS
 MODEL_SIZES = {
-    "falcon3-10B": ("2.3 tok/s (int4 FFN)",  "3.28 GB", "40 layers, 3072 hidden, 23040 intermediate \u2014 maximum quality"),
-    "falcon3-7B":  ("3.2 tok/s (int4 FFN)",  "2.75 GB", "28 layers, 3072 hidden, 23040 intermediate \u2014 quality output"),
-    "falcon3-3B":  ("7.1 tok/s (hybrid)",    "1.97 GB", "22 layers, 3072 hidden, 9216 intermediate \u2014 best balance"),
-    "falcon3-1B":  ("10.1 tok/s (f32 bypass)", "1.22 GB", "18 layers, 2048 hidden, 8192 intermediate \u2014 light & fast"),
+    "falcon3-10B":   ("2.3 tok/s (int4 FFN)",  "3.28 GB", "40 layers, 3072 hidden, 23040 intermediate \u2014 maximum quality"),
+    "falcon3-10B-Base": ("2.3 tok/s (int4 FFN)", "3.28 GB", "40 layers, 3072 hidden, 23040 intermediate \u2014 TII Base variant"),
+    "falcon3-7B":    ("3.2 tok/s (int4 FFN)",  "2.75 GB", "28 layers, 3072 hidden, 23040 intermediate \u2014 quality output"),
+    "falcon3-7B-Base": ("3.2 tok/s (int4 FFN)", "2.96 GB", "28 layers, 3072 hidden, 23040 intermediate \u2014 TII Base variant"),
+    "falcon3-3B":    ("7.1 tok/s (hybrid)",    "1.97 GB", "22 layers, 3072 hidden, 9216 intermediate \u2014 best balance"),
+    "falcon3-3B-Base": ("7.1 tok/s (hybrid)",  "2.11 GB", "22 layers, 3072 hidden, 9216 intermediate \u2014 TII Base variant"),
+    "falcon3-1B":    ("10.1 tok/s (f32 bypass)", "1.22 GB", "18 layers, 2048 hidden, 8192 intermediate \u2014 light & fast"),
     "bonsai-4B":   ("17.4 tok/s (hybrid)",   "1.49 GB", "36 layers, 2560 hidden, 9728 intermediate \u2014 fast Bonsai"),
     "bonsai-1.7B": ("13.0 tok/s (f32 bypass)","0.86 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 light Bonsai"),
     "bonsai-8B":   ("1.8 tok/s (f32 bypass)", "3.72 GB", "36 layers, 4096 hidden, 12288 intermediate \u2014 max Bonsai quality"),
@@ -97,6 +117,8 @@ MODEL_SIZES = {
     "cann-1B":     ("9.7 tok/s (hybrid)",     "0.83 GB", "28 layers, 2048 hidden, 6144 intermediate \u2014 CANN balanced"),
     "cann-3B":     ("7.1 tok/s (hybrid)",     "1.35 GB", "32 layers, 2560 hidden, 10240 intermediate \u2014 CANN quality"),
     "cann-8B":     ("1.5 tok/s (f32 bypass)", "2.65 GB", "32 layers, 4096 hidden, 16384 intermediate \u2014 CANN max quality"),
+    "falcon-e-1B": ("13 tok/s (hybrid)",        "0.56 GB", "24 layers, 2048 hidden, 9216 intermediate \u2014 lightweight Falcon Edge series"),
+    "falcon-e-3B": ("7 tok/s (hybrid)",         "0.82 GB", "32 layers, 2048 hidden, 13312 intermediate \u2014 balanced Falcon Edge series"),
     "1bitllm-large": ("7.0 tok/s (f32 bypass)", "0.23 GB", "24 layers, 1536 hidden, 4096 intermediate \u2014 paper reproduction"),
     "1bitllm-xl":   ("6.0 tok/s (f32 bypass)", "0.37 GB", "24 layers, 2048 hidden, 5460 intermediate \u2014 paper reproduction"),
     "1bitllm-3B":   ("4.0 tok/s (f32 bypass)", "0.84 GB", "26 layers, 3200 hidden, 8640 intermediate \u2014 paper reproduction"),
@@ -119,13 +141,17 @@ def _read_atlas_arch(atlas_path):
 
 def _detect_size(name):
     """Extract model family+size from filename (e.g. 'Ternary-BitCPM-CANN-1B' -> 'cann-1B')."""
-    family_map = {"Falcon3": "falcon3", "Bonsai": "bonsai", "BitNet": "bitnet",
-                  "CANN": "cann", "Llama3": "llama3", "TriLM": "trilm",
-                  "1bitLLM": "1bitllm"}
+    family_map = {"Falcon-E": "falcon-e", "Falcon3": "falcon3", "Bonsai": "bonsai",
+                  "BitNet": "bitnet", "CANN": "cann", "Llama3": "llama3",
+                  "TriLM": "trilm", "1bitLLM": "1bitllm"}
     for fam, key in family_map.items():
         if fam in name:
+            # Check Base variants first (contains "-Base-" or "-Base" suffix)
+            is_base = "-Base" in name or "_Base" in name
             for sz in ["10B", "8B", "1.7B", "7B", "4B", "3B", "2B", "1B", "0.5B"]:
                 if sz in name:
+                    if is_base:
+                        return f"{key}-{sz}-Base"
                     return f"{key}-{sz}"
             # Variant names (no B-suffix)
             for variant in ["large", "xl"]:
@@ -177,7 +203,9 @@ def _generate_readme(model_name, size, cfg, atlas_name, perf, file_size_str, des
     is_falcon3 = "Falcon3" in model_name or cfg.get("model_type") == "falcon3"
     is_bitnet = "BitNet" in model_name or cfg.get("model_type") == "bitnet"
     is_cann = "CANN" in model_name or cfg.get("model_type") == "minicpm"
+    is_falcon_e = "Falcon-E" in model_name
     is_1bitllm = "1bitLLM" in model_name or cfg.get("model_type") == "bitnet_paper"
+    is_base = "-Base" in model_name or "_Base" in model_name
     bsz = _bare_size(size)  # bare size for base model HF names
     engine_note = ""
 
@@ -271,40 +299,71 @@ This is a **quantized derivative work** based on the **1bitLLM BitNet b1.58 pape
 
 The ATLAS engine itself is **Apache 2.0 licensed**.
 """
-    else:
-        base_model_hf = f"tiiuae/Falcon3-{bsz}-Instruct-1.58bit"
-        ctx_window = "4096 (NTK-scalable up to 8192)"
+    elif is_falcon_e:
+        variant = "Base" if "-Base" in model_name else "Instruct" if "-Instruct" in model_name else "Base"
+        base_model_hf = f"tiiuae/Falcon-E-{bsz}-{variant}"
+        ctx_window = "32768 (NTK-scalable up to 65536)"
         prompt_template = """```
-<|role|>
-{content}
-<|endoftext|>
+<|im_start|>system
+{system_message}<|im_end|>
+<|im_start|>user
+{user_message}<|im_end|>
+<|im_start|>assistant
 ```
 
 ### Example Sequence
 
 ```
-<|user|>
-Explain quantum computing in one sentence.
-<|assistant|>
+<|im_start|>user
+Explain quantum computing in one sentence.<|im_end|>
+<|im_start|>assistant
 ```"""
         license_yaml = """\
 license: other
-license_name: tii-falcon-llm-license-2.0
-license_link: https://huggingface.co/spaces/tiiuae/falcon3-license"""
+license_name: falcon-llm-license
+license_link: https://falconllm.tii.ae/falcon-terms-and-conditions.html"""
         license_section = """\
 ## License & Usage Restrictions
 
-This is a **quantized derivative work** based on Falcon3 architectures developed by the **Technology Innovation Institute (TII)**.
+This is a **quantized derivative work** based on the **Falcon-E Edge** series (original model by the **Technology Innovation Institute (TII)**), originally released under the **Falcon-LLM License**.
 
-By downloading or utilizing this file, you agree to be bound by the **TII Falcon-LLM License 2.0**:
+By downloading or utilizing this file, you agree to be bound by the **Falcon-LLM License**:
 
 1. **Attribution:** Any usage or secondary deployment must credit the Technology Innovation Institute (TII).
 2. **Non-Commercial & Small Commercial Use:** Free for academic research, personal projects, and commercial entities with **annual revenue under $1,000,000 USD**.
-3. **Commercial Royalty Terms:** Entities exceeding the $1M annual revenue threshold are subject to a **10% licensing fee** on revenue exceeding that amount, as specified in the master Falcon3 license terms.
+3. **Commercial Hosting:** Entities intending to provide shared, managed hosting of the model or its derivatives as a service must enter into a separate license arrangement with TII.
 
-*Disclaimer: This quantized file is provided "as-is" by the open-source community. While model outputs have been verified for correctness (see Verification above), no explicit or implied warranties regarding mathematical equivalence to FP16 baselines are made.*
+*Disclaimer: This quantized file is provided "as-is". The ATLAS engine itself is **Apache 2.0 licensed**.*
+"""
+    else:
+        is_base = "-Base" in model_name or "_Base" in model_name
+        base_model_hf = f"tiiuae/Falcon3-{bsz}-Base" if is_base else f"tiiuae/Falcon3-{bsz}-Instruct"
+        ctx_window = "4096 (NTK-scalable up to 8192)"
+        if is_base:
+            prompt_template = """```
+{prompt}
+```"""
+        else:
+            prompt_template = """```
+<|role|>
+{content}
+```"""
+        license_yaml = """\
+license: other
+license_name: falcon-llm-license
+license_link: https://falconllm.tii.ae/falcon-terms-and-conditions.html"""
+        license_section = """\
+## License & Usage Restrictions
 
-The ATLAS engine itself is **Apache 2.0 licensed**.
+This is a **quantized derivative work** based on the **Falcon3** series (original model by the **Technology Innovation Institute (TII)**), originally released under the **Falcon-LLM License**.
+
+By downloading or utilizing this file, you agree to be bound by the **Falcon-LLM License**:
+
+1. **Attribution:** Any usage or secondary deployment must credit the Technology Innovation Institute (TII).
+2. **Non-Commercial & Small Commercial Use:** Free for academic research, personal projects, and commercial entities with **annual revenue under $1,000,000 USD**.
+3. **Commercial Hosting:** Entities intending to provide shared, managed hosting of the model or its derivatives as a service must enter into a separate license arrangement with TII.
+
+*Disclaimer: This quantized file is provided "as-is". The ATLAS engine itself is **Apache 2.0 licensed**.*
 """
 
     extra_tags = ""
@@ -314,6 +373,8 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
         extra_tags = "- cpu-inference\n- bitnet"
     elif is_falcon3:
         extra_tags = "- cpu-inference\n- bitnet"
+    elif is_falcon_e:
+        extra_tags = "- edge\n- cpu-inference\n- bitnet\n- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
     elif is_cann:
         extra_tags = "- cpu-llm\n- edge-ai\n- no-gpu\n- efficient-inference"
     if is_1bitllm:
@@ -324,6 +385,8 @@ The ATLAS engine itself is **Apache 2.0 licensed**.
         arch_tag = "bitnet"
     elif is_falcon3:
         arch_tag = "falcon3"
+    elif is_falcon_e:
+        arch_tag = "falcon-e"
     elif is_cann:
         arch_tag = "minicpm"
     else:
@@ -402,9 +465,9 @@ During pre-release evaluation (v2.10.0), this quantized derivative demonstrated 
 
 ---
 
-## Prompt Template
+## Prompt {"Template" if not is_base else "Format"}
 
-To prevent token degradation and alignment shifting, use the standard chat template:
+{"To prevent token degradation and alignment shifting, use the standard chat template:" if not is_base else "This is a **Base model** — it generates raw text continuation without instruction-following. Simply provide your prompt:"}
 
 {prompt_template}
 
@@ -567,14 +630,16 @@ def main():
             else:
                 cfg = {"model_type": "unknown"}
         else:
-            # Try reading arch from v8 metadata block
-            arch = _read_atlas_arch(atlas_path)
-            if arch:
-                cfg = {"model_type": arch}
+            # Prefer KNOWN_CONFIGS (full details) over arch-only metadata
+            sz = _detect_size(fname)
+            if sz and sz in KNOWN_CONFIGS:
+                cfg = dict(KNOWN_CONFIGS[sz])
+            elif sz and sz.endswith("-Base") and sz[:-5] in KNOWN_CONFIGS:
+                cfg = dict(KNOWN_CONFIGS[sz[:-5]])
             else:
-                sz = _detect_size(fname)
-                if sz and sz in KNOWN_CONFIGS:
-                    cfg = dict(KNOWN_CONFIGS[sz])
+                arch = _read_atlas_arch(atlas_path)
+                if arch:
+                    cfg = {"model_type": arch}
                 else:
                     clean = fname.replace("-tq1.atlas", "").replace(".atlas", "")
                     cfg = {"model_type": clean}

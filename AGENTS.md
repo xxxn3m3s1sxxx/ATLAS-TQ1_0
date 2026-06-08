@@ -30,6 +30,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 | SubLN (head_dim=64) |
 | TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
 | TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
+| TriLM-3.9B | 0.84 GB | 32 | 3072 | 9216 | 24 | 24 | 50688 | Llama (head_dim=128, no SubLN) |
 | Llama3-8B-1.58-100B-tokens | 4.11 GB | 32 | 4096 | 14336 | 32 | 8 | 131072 | Llama3 (GQA, QK-Norm) |
 | BitCPM-CANN-0.5B | 0.22 GB | 24 | 1024 | 4096 | 16 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
 | BitCPM-CANN-1B | 0.83 GB | 28 | 2048 | 6144 | 16 | 2 | 73448 | Llama (LongRoPE) |
@@ -40,7 +41,7 @@ Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
 Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
 TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
-TriLM 3.9B (⚠️ not yet packed): `head_dim=128`, standard Llama arch, **NO SubLN** — different arch than smaller TriLMs!
+TriLM 3.9B: `head_dim=128`, `rope_theta=10K`, Llama arch, MHA (no GQA), SwiGLU. Auto-detected by packer via head_dim threshold.
 Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
 BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`. 9.7 tok/s on i7-7700T (28L/2048H).
 BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Hybrid path. T=0: "Paris." coherent, T=0.7: coherent.
@@ -59,7 +60,7 @@ BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU
 | TriLM (99M→3.9B, all sizes) | 10 | ✅ 9 PASS, ⏭️ 1 SKIP (2.3B private) |
 | Qwen reference (Qwen2.5/3/QwQ) | 4 | ✅ All PASS |
 
-**Critical finding**: TriLM family is **internally inconsistent** — ≤2.4B uses SubLN (head_dim=64), 3.9B uses standard Llama (head_dim=128, no SubLN). `derive_arch` auto-detects this via head_dim threshold.
+TriLM 3.9B is auto-detected by the packer: ≤2.4B uses SubLN (head_dim=64), 3.9B uses Llama arch (head_dim=128, no SubLN).
 
 ## Build
 
