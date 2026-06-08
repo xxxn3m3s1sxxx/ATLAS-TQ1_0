@@ -31,8 +31,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: .github/workflows/build.yml
       - name: Check API parity (C -> Python)
         run: python scripts/check_api_parity.py
       - name: HF alignment check
