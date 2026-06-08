@@ -6,7 +6,7 @@
 
 **No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
 
-> 🚀 **v2.10.6 — OOM Error Propagation (Signal Chain)**: Complete memory allocation failure cascade from `atlas_valloc` NULL → `generate_c` → Python `RuntimeError`. All 37 `atlas_valloc` calls NULL-checked, all 6 `fread` calls checked, `atlas_forward` returns `int` (-1/0). 55 mock tests, 12 sonde tests, CI green.
+> 🚀 **v2.11.0 — Falcon-E Edge + TriLM Full Series + CI Hardening**: Falcon-E 1B/3B Base+Instruct (BitNet 1.58 arch) in TQ1.0 format. TriLM 99M–560M added (9-model full series). CANN dual EOS, thread_local block scales, relaxed QK-Norm guard. CI: sanitizer-build, coverage gates, all platforms. 58/58 mock tests across 9 architectures.
 
 ## Quickstart
 
@@ -285,6 +285,7 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 | Version | What's New |
 |---------|------------|
+| **v2.11.0** | **Falcon-E Edge + TriLM Full Series + CI Hardening**. Falcon-E 1B/3B Base+Instruct (BitNet 1.58 arch) in TQ1.0 format. TriLM 99M–560M added (9-model full series). CANN dual EOS, thread_local block scales, relaxed QK-Norm arch guard. README: full model table with TriLM, Falcon-E, Llama3-8B-1.58. CI: sanitizer-build (ASan+UBSan), coverage gates, pip cache, fail-fast, macOS fix, release_to_hf.py Falcon-E support. 58/58 mock tests across 9 architectures. |
 | **v2.10.6** | **OOM Error Propagation (Signal Chain)**. Complete memory failure cascade: `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked, Python `RuntimeError` on OOM. 55/55 mock tests, 12/12 sonde. |
 | **v2.10.5** | **Falcon-E Edge Integration + Unified C++ Generation Path**. Falcon-E 1B/3B (Base+Instruct) in TQ1.0 format. CANN dual EOS (`eos_id2` for `</s>` ID 2), thread_local block scales, relaxed QK-Norm arch guard. 58/58 mock tests across 9 architectures. |
 | **v2.10.4** | **BitCPM-CANN Series (0.5B/1B/3B/8B) + Bug Hunt**. MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Debug print crash fix (unconditional OOB logits read). 43/43 mock tests, 4 CANN models deployed to HF. |
