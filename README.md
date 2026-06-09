@@ -220,12 +220,32 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 
 ### Matmul Modes
 
-| Mode | How | When |
-|------|-----|------|
-| int8 (default) | `vpmaddubs` SIMD | Best general speed |
-| int4 (v2.8.0) | nibble-unpack + `vpmaddubsw` | 7B/10B FFN (18-26% faster) |
-| f32 bypass | `vfmadd231ps` | Small models (1B, Bonsai-1.7B) |
-| TQ1-packed | chunked decode + SIMD | Models with no decompress |
+The engine dispatches per-tensor based on `ttype` (packing format) and model flags. Key modes:
+
+| Mode | Kernel | Trigger | Used By |
+|------|--------|---------|---------|
+| **f32 bypass** | `vfmadd231ps` | `use_f32_matmul` | SubLN archs (BitNet, TriLM ≤2.4B), hidden≤2048 (1B, Bonsai-1.7B), rope_theta≥3M (Bonsai-8B). No activation quant — prevents signal collapse. |
+| **int8** (default) | `vpmaddubs` + 128×row_sum | `ttype==3` (decompressed int8) | FFN in hybrid mode (3B/7B/10B), any model after decompress |
+| **int4** (v2.8.0) | nibble-unpack + `vpmaddubsw` | `ttype==8 && !f32_matmul` | 7B/10B FFN (18-26% faster). Halves FFN memory bandwidth. |
+| **TQ1-packed** | chunked decode + SIMD | `ttype==0` | QKV/O in hybrid mode (5× less memory reads) |
+| **TQ2** | chunked decode + `ttype==10` matmul | `ttype==10` | BitNet v2 two-bit packed format |
+| **g128 fused** | block-decode + fused s8/f32/LUT | `ttype==5` | Block-scaled g128 models (Bonsai/Qwen3). Auto-selects f32/LUT/s8 sub-path per batch size. |
+| **ternary** | `vpsignb` | `use_ternary_matmul` | Pure sign path (no multiply). Rarely used; superseded by hybrid. |
+
+**Dispatch flow** (simplified):
+
+```
+Tensor ttype?
+├── 10 → TQ2 matmul
+├── 5  → g128 fused (f32 if use_f32_matmul, else LUT if B≥8, else s8)
+├── 7  → TurboQuant fused
+├── 0  → TQ1-packed (activation quant + chunked decode)
+├── 8  → int4 packed (if !use_f32_matmul) — FFN only
+└── 3  → decompressed int8:
+          ├── ternary → vpsignb
+          ├── f32     → vfmadd231ps (no activation quant)
+          └── default → vpmaddubs + activation quant + 128×row_sum
+```
 
 ## Python API
 
