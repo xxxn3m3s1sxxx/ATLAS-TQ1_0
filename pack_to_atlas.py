@@ -46,8 +46,9 @@ def _clean_embed_rows(fp32, name):
 class SafetensorsReader:
     """Read tensors from safetensors or PyTorch .bin files."""
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, in_memory=None):
         self.model_dir = model_dir
+        self._in_memory = in_memory or {}
         self._shards_np = {}  # path → numpy safe_open handle
         self._shards_pt = {}  # path → torch safe_open handle
         self._torch_state = None  # torch full state_dict (for .bin fallback)
@@ -77,14 +78,26 @@ class SafetensorsReader:
             self.weight_map = {k: "pytorch_model.bin" for k in self._torch_state.keys()}
             return
 
+        # In-memory-only mode: weight_map gets keys from _in_memory dict
+        if self._in_memory:
+            self.weight_map = {k: "_in_memory" for k in self._in_memory}
+            return
+
         raise FileNotFoundError(f"No safetensors or pytorch_model.bin found in {model_dir}")
 
     def get_tensor_np(self, tname):
         """Read tensor as numpy array."""
+        if tname in self._in_memory:
+            t = self._in_memory[tname]
+            if hasattr(t, "cpu"):
+                return t.cpu().numpy()
+            return t
         if self._torch_state is not None:
             return self._torch_state[tname].cpu().numpy()
         sp = self.weight_map.get(tname)
         if not sp:
+            if self._in_memory:
+                raise KeyError(f"Tensor {tname} not in in_memory dict")
             raise KeyError(f"Tensor {tname} not found in weight map")
         shard = os.path.join(self.model_dir, sp)
         with safe_open(shard, framework="np") as sf:
@@ -93,10 +106,14 @@ class SafetensorsReader:
 
     def get_tensor_pt(self, tname):
         """Read tensor via PyTorch."""
+        if tname in self._in_memory:
+            return self._in_memory[tname]
         if self._torch_state is not None:
             return self._torch_state[tname]
         sp = self.weight_map.get(tname)
         if not sp:
+            if self._in_memory:
+                raise KeyError(f"Tensor {tname} not in in_memory dict")
             raise KeyError(f"Tensor {tname} not found in weight map")
         shard = os.path.join(self.model_dir, sp)
         if shard not in self._shards_pt:
@@ -108,6 +125,11 @@ class SafetensorsReader:
 
         Handles safetensors (BitNet) and torch .bin (MiniCPM) formats.
         """
+        if tname in self._in_memory:
+            t = self._in_memory[tname]
+            if hasattr(t, "cpu"):
+                return t.cpu().to(torch.float32).numpy()
+            return t
         if self._torch_state is not None:
             t = self._torch_state[tname]
             arr = t.cpu().to(torch.float32).numpy()
@@ -116,6 +138,8 @@ class SafetensorsReader:
             return arr
         sp = self.weight_map.get(tname)
         if not sp:
+            if self._in_memory:
+                raise KeyError(f"Tensor {tname} not in in_memory dict")
             raise KeyError(f"Tensor {tname} not found")
         shard = os.path.join(self.model_dir, sp)
 
@@ -611,7 +635,8 @@ def build_tokenizer_binary(model_dir):
 # ═══════════════════════════════════════════════════════════════════════
 
 def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
-                  packed_path=False, thinking=False):
+                  packed_path=False, thinking=False, raw_int8=False,
+                  in_memory_tensors=None, per_row_int8=False):
     """Pack a HuggingFace model directory to ATLAS TQ1.0 format.
 
     Args:
@@ -622,6 +647,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         use_v6: Embed v6 binary tokenizer (default: True)
         packed_path: Use U8 pre-quantized path (BitNet --packed, default: False)
         thinking: Set enable_thinking flag (default: False)
+        per_row_int8: Per-row int8 quantization (ttype=11) instead of per-tensor. Reduces quantization noise.
     """
     # ── Read config ────────────────────────────────────────────────
     with open(os.path.join(model_dir, "config.json")) as f:
@@ -641,7 +667,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
     print(f"  Intermediate:{inter} Vocab:{vocab} Head_dim:{head_dim}")
 
     # ── Open reader ────────────────────────────────────────────────
-    reader = SafetensorsReader(model_dir)
+    reader = SafetensorsReader(model_dir, in_memory=in_memory_tensors)
 
     # Auto-detect which tensors are available (for arch detection)
     available = list(reader.weight_map.keys())
@@ -825,7 +851,49 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             is_weight = "proj" in name and "weight" in name
 
             # ── Determine quantization path ──────────────────────────
-            if is_weight and arch["input_format"] == "uint8_packed":
+            if is_weight and raw_int8:
+                # Raw int8 path: store dequantized weights as int8, skip ternary
+                try:
+                    tensor_fp32 = reader.get_bf16_manual(name)
+                except (TypeError, KeyError):
+                    tensor_pt = reader.get_tensor_pt(name)
+                    tensor_fp32 = tensor_pt.cpu().to(torch.float32).numpy()
+                if arch["requires_pre_shuffle"]:
+                    tensor_fp32 = pre_shuffle_rows(tensor_fp32)
+                nrows, ncols = tensor_fp32.shape
+                if per_row_int8:
+                    # Per-row int8 (ttype=11): one fp16 scale per row, for MLP only
+                    row_scales = np.zeros(nrows, dtype=np.float16)
+                    i8_rows = []
+                    for r in range(nrows):
+                        row = tensor_fp32[r]
+                        row_max = np.max(np.abs(row))
+                        rs = np.float16(127.0 / row_max if row_max > 1e-10 else 1.0)
+                        row_scales[r] = rs
+                        rs_f32 = float(rs)
+                        row_i8 = np.round(row * rs_f32).astype(np.int32)
+                        np.clip(row_i8, -127, 127, out=row_i8)
+                        i8_rows.append(row_i8.astype(np.int8))
+                    i8 = np.stack(i8_rows)
+                    row_sums = np.sum(i8.astype(np.int32), axis=1).astype(np.int32)
+                    data_bytes = row_scales.tobytes() + i8.tobytes() + row_sums.tobytes()
+                    tens_ttype = 11
+                else:
+                    # Per-tensor int8 (ttype=3): single fp16 scale for all rows
+                    max_abs = np.max(np.abs(tensor_fp32))
+                    scale = 127.0 / max_abs if max_abs > 1e-10 else 1.0
+                    i8 = np.round(tensor_fp32 * scale).astype(np.int32)
+                    np.clip(i8, -127, 127, out=i8)
+                    i8 = i8.astype(np.int8)
+                    row_sums = np.sum(i8.astype(np.int32), axis=1).astype(np.int32)
+                    scale_fp16 = np.float16(scale)
+                    data_bytes = scale_fp16.tobytes() + i8.tobytes() + row_sums.tobytes()
+                    tens_ttype = 3
+                packed_per_row = ncols
+                n_blocks = 0
+                row_dim = nrows
+
+            elif is_weight and arch["input_format"] == "uint8_packed":
                 # Falcon3 path: uint8 pre-packed → TQ1
                 tensor_pt = reader.get_tensor_pt(name)
                 sname = name.replace(".weight", ".weight_scale")

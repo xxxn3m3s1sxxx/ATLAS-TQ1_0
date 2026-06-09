@@ -829,6 +829,15 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
                 t.data_size = (int64_t)t.row_dim * 2;
             }
             t.packed_cols = 0;
+        } else if (t.ttype == 3 || t.ttype == 8 || t.ttype == 11) {
+            // ttype=3: [fp16_scale:2][i8:rows*cols][row_sums:rows*4]
+            // ttype=8: [fp16_scale:2][packed_i4:rows*packed_cols][row_sums:rows*4]
+            // ttype=11: [fp16_row_scales:rows*2][i8:rows*cols][row_sums:rows*4]
+            int actual = (i + 1 < n_tensors)
+                ? (int)(file_offsets[i + 1] - file_offsets[i])
+                : (int)(file_size - (int64_t)file_offsets[i]);
+            if (actual % 32 != 0) actual += 32 - (actual % 32);
+            t.data_size = actual;
         } else if (t.ttype != 5 && t.ttype != 7) {  // lm_head / scales (not block-scaled TQ1)
             int actual_bytes = (i + 1 < n_tensors)
                 ? (int)(file_offsets[i + 1] - file_offsets[i]) - ((int)(file_offsets[i + 1] - file_offsets[i]) % 32)
@@ -2197,6 +2206,16 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
             int n_vals = (int)(t.data_size - 2 - t.row_dim * 4);
             if (n_vals <= 0) continue;
             int8_t* data = (int8_t*)(d8 + 2);
+            for (int64_t i = 0; i < n_vals; i += step) {
+                volatile int sink = data[i]; (void)sink;
+            }
+            total += n_vals;
+        } else if (t.ttype == 11) {
+            volatile uintptr_t d8 = (uintptr_t)t.data;
+            if (!d8) continue;
+            int n_vals = (int)(t.data_size - t.row_dim * 6);
+            if (n_vals <= 0) continue;
+            int8_t* data = (int8_t*)(d8 + t.row_dim * 2);
             for (int64_t i = 0; i < n_vals; i += step) {
                 volatile int sink = data[i]; (void)sink;
             }
@@ -3997,6 +4016,112 @@ static void matmul_f32_reorder(int rows, int input_dim,
     }
 }
 
+// ─── Per-row int8 matmul (ttype=11) — reordered output ───────────────
+// Like matmul_f32_reorder but each weight row has its own fp16 scale.
+// row_scales_fp16[r] = 127 / max_abs(row_r). Reordered output (4-row chunks).
+static void matmul_f32_reorder_per_row(int rows, int dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    const uint16_t* __restrict__ row_scales_fp16,
+    float* __restrict__ output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        float rsc[4];
+        for (int sub = 0; sub < 4; sub++)
+            rsc[sub] = fp16_to_fp32(row_scales_fp16[ur * 4 + sub]);
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * dim;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * dim;
+                __m256 sum = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 8 <= dim; c += 8) {
+                    __m256 af = _mm256_loadu_ps(a + c);
+                    __m128i w8 = _mm_loadl_epi64((const __m128i*)(w + c));
+                    __m256i w32 = _mm256_cvtepi8_epi32(w8);
+                    __m256 wf = _mm256_cvtepi32_ps(w32);
+                    sum = _mm256_fmadd_ps(af, wf, sum);
+                }
+                float s = hsum_ps(sum);
+                for (; c < dim; c++) s += a[c] * w[c];
+                out4[sub] = s / rsc[sub];
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+    // Remaining rows (if rows % 4 != 0)
+    int rem_start = rows_packed * 4;
+    for (int r = 0; r < rows - rem_start; r++) {
+        int ri = rem_start + r;
+        float rs = fp16_to_fp32(row_scales_fp16[ri]);
+        for (int b = 0; b < B; b++) {
+            const int8_t* w = weights + ri * dim;
+            const float* a = act_f32 + b * dim;
+            __m256 sum = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 8 <= dim; c += 8) {
+                __m256 af = _mm256_loadu_ps(a + c);
+                __m128i w8 = _mm_loadl_epi64((const __m128i*)(w + c));
+                __m256i w32 = _mm256_cvtepi8_epi32(w8);
+                __m256 wf = _mm256_cvtepi32_ps(w32);
+                sum = _mm256_fmadd_ps(af, wf, sum);
+            }
+            float s = hsum_ps(sum);
+            for (; c < dim; c++) s += a[c] * w[c];
+            output[b * rows + ri] = s / rs;
+        }
+    }
+}
+
+// ─── Per-row int8 matmul (ttype=11) — non-reordered, stride-aware ───
+static void matmul_f32_per_row(int rows, int input_dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    int act_stride, const uint16_t* __restrict__ row_scales_fp16,
+    float* __restrict__ output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        float rsc[4];
+        for (int sub = 0; sub < 4; sub++)
+            rsc[sub] = fp16_to_fp32(row_scales_fp16[ur * 4 + sub]);
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * act_stride;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * input_dim;
+                __m256 sum = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 8 <= input_dim; c += 8) {
+                    __m256 af = _mm256_loadu_ps(a + c);
+                    __m128i w8 = _mm_loadl_epi64((const __m128i*)(w + c));
+                    __m256i w32 = _mm256_cvtepi8_epi32(w8);
+                    __m256 wf = _mm256_cvtepi32_ps(w32);
+                    sum = _mm256_fmadd_ps(af, wf, sum);
+                }
+                float s = hsum_ps(sum);
+                for (; c < input_dim; c++) s += a[c] * w[c];
+                out4[sub] = s / rsc[sub];
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+}
+
+
+
 // ─── Helper: int8 matmul + reorder + dequant ──────────────────────────
 // act_u8: [B, input_dim] quantized activations
 // max_abs: [B] per-token max
@@ -4075,6 +4200,20 @@ static void forward_layer_internal(
     int inter = m->inter_dim;
     float theta = m->rope_theta;
 
+    #ifdef ATLAS_DEBUG_MODE
+    static int dbg_layer_count = 0;
+    int dbg_cur_layer = dbg_layer_count++;
+    char dbg_path[256];
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DBG_INPUT_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", input[i]);
+        fprintf(stderr, "\n");
+        snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_INPUT.bin", dbg_cur_layer);
+        FILE* f = fopen(dbg_path, "wb");
+        if (f) { fwrite(input, sizeof(float), B * H, f); fclose(f); }
+    }
+    #endif
+
     // ─── 1. Pre-attention RMSNorm ───
     {
         auto& t = m->tensors[idx_ln1];
@@ -4090,6 +4229,19 @@ static void forward_layer_internal(
                 nb[i] = xb[i] * rms * fp16_to_fp32(w16);
             }
         }
+        #ifdef ATLAS_DEBUG_MODE
+        if (B <= 6 && H == 2048) {
+            fprintf(stderr, "DEBUG_LN1_b0: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", output[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "DEBUG_INPUT_b0: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", input[i]);
+            fprintf(stderr, "\n");
+            snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_LN1.bin", dbg_cur_layer);
+            FILE* f = fopen(dbg_path, "wb");
+            if (f) { fwrite(output, sizeof(float), B * H, f); fclose(f); }
+        }
+        #endif
     }
     float* x_norm = output;
 
@@ -4097,6 +4249,7 @@ static void forward_layer_internal(
     auto t3_dim = [](const TensorInfo& t) -> int {
         if (t.ttype == 10 || t.ttype == 5) return t.packed_cols * 5;
         if (t.ttype == 3) return (int)((t.data_size - 2 - (int64_t)t.row_dim * 4) / t.row_dim);
+        if (t.ttype == 11) return (int)((t.data_size - (int64_t)t.row_dim * 6) / t.row_dim);
         if (t.ttype == 7) return t.packed_cols * 4;
         if (t.ttype == 8) return t.packed_cols * 2;
         return t.packed_cols * 5;
@@ -4277,18 +4430,72 @@ static void forward_layer_internal(
         // Full-precision path: f32×i8, no activation quantization
         {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
-            get_i8(tq, w, rs, rows, dim, scale);
-            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+            if (tq.ttype == 11) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(tq.data);
+                w = (int8_t*)(tq.data + tq.row_dim * 2);
+                rows = tq.row_dim;
+                dim = t3_dim(tq);
+                matmul_f32_reorder_per_row(rows, dim, w, m->buf_act, rs_fp16, m->buf_gate, B);
+            } else {
+                get_i8(tq, w, rs, rows, dim, scale);
+                #ifdef ATLAS_DEBUG_MODE
+                if (B <= 6 && H == 2048) fprintf(stderr, "DEBUG_Q: rows=%d dim=%d scale=%.6f\n", rows, dim, scale);
+                #endif
+                matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+            }
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DEBUG_Q_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_gate[i]);
+                fprintf(stderr, "\n");
+            }
+            #endif
         }
         {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
-            get_i8(tk, w, rs, rows, dim, scale);
-            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_hidden, B);
+            if (tk.ttype == 11) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(tk.data);
+                w = (int8_t*)(tk.data + tk.row_dim * 2);
+                rows = tk.row_dim;
+                dim = t3_dim(tk);
+                matmul_f32_reorder_per_row(rows, dim, w, m->buf_act, rs_fp16, m->buf_hidden, B);
+            } else {
+                get_i8(tk, w, rs, rows, dim, scale);
+                #ifdef ATLAS_DEBUG_MODE
+                if (B <= 6 && H == 2048) fprintf(stderr, "DEBUG_K: rows=%d dim=%d scale=%.6f\n", rows, dim, scale);
+                #endif
+                matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_hidden, B);
+            }
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DEBUG_K_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_hidden[i]);
+                fprintf(stderr, "\n");
+            }
+            #endif
         }
         {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
-            get_i8(tv, w, rs, rows, dim, scale);
-            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_up, B);
+            if (tv.ttype == 11) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(tv.data);
+                w = (int8_t*)(tv.data + tv.row_dim * 2);
+                rows = tv.row_dim;
+                dim = t3_dim(tv);
+                matmul_f32_reorder_per_row(rows, dim, w, m->buf_act, rs_fp16, m->buf_up, B);
+            } else {
+                get_i8(tv, w, rs, rows, dim, scale);
+                #ifdef ATLAS_DEBUG_MODE
+                if (B <= 6 && H == 2048) fprintf(stderr, "DEBUG_V: rows=%d dim=%d scale=%.6f\n", rows, dim, scale);
+                #endif
+                matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_up, B);
+            }
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DEBUG_V_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_up[i]);
+                fprintf(stderr, "\n");
+            }
+            #endif
         }
     } else {
         quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
@@ -4362,6 +4569,14 @@ static void forward_layer_internal(
         }
     }
 
+    #ifdef ATLAS_DEBUG_MODE
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DEBUG_ATTN_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", attn_out[i]);
+        fprintf(stderr, "\n");
+    }
+    #endif
+
     // ─── 4. O projection (int8) ───
     {
         auto& to = m->tensors[idx_o];
@@ -4408,6 +4623,17 @@ static void forward_layer_internal(
             }
             quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
+        } else if (to.ttype == 11) {
+            // Per-row int8 O projection
+            const uint16_t* o_rs_fp16 = (const uint16_t*)(to.data);
+            const int8_t* ow = (const int8_t*)(to.data + to.row_dim * 2);
+            int o11_rows = to.row_dim;
+            int o11_dim = t3_dim(to);
+            for (int b = 0; b < B; b++) {
+                memcpy(m->buf_act + b * o11_dim, attn_out + b * qd, qd * sizeof(float));
+                memset(m->buf_act + b * o11_dim + qd, 0, (o11_dim - qd) * sizeof(float));
+            }
+            matmul_f32_reorder_per_row(o11_rows, o11_dim, ow, m->buf_act, o_rs_fp16, m->buf_gate, B);
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(to, w, rs, rows, dim, scale);
@@ -4430,10 +4656,31 @@ static void forward_layer_internal(
         }
     }
 
+    #ifdef ATLAS_DEBUG_MODE
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DEBUG_O_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_gate[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "DEBUG_SDF: %.6f\n", m->scale_depth_factor);
+        snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_O.bin", dbg_cur_layer);
+        FILE* f = fopen(dbg_path, "wb");
+        if (f) { fwrite(m->buf_gate, sizeof(float), B * H, f); fclose(f); }
+    }
+    #endif
     // ─── 5. Residual: output = input + attn_out_proj (* scale_depth_factor) ───
     for (int i = 0; i < B * H; i++) {
         output[i] = input[i] + m->buf_gate[i] * m->scale_depth_factor;
     }
+    #ifdef ATLAS_DEBUG_MODE
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DBG_RES1_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", output[i]);
+        fprintf(stderr, "\n");
+        snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_RES1.bin", dbg_cur_layer);
+        FILE* f = fopen(dbg_path, "wb");
+        if (f) { fwrite(output, sizeof(float), B * H, f); fclose(f); }
+    }
+    #endif
     // ─── 6. Post-attention RMSNorm ───
     {
         auto& t = m->tensors[idx_ln2];
@@ -4450,6 +4697,16 @@ static void forward_layer_internal(
             }
         }
     }
+    #ifdef ATLAS_DEBUG_MODE
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DBG_LN2_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_act[i]);
+        fprintf(stderr, "\n");
+        snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_LN2.bin", dbg_cur_layer);
+        FILE* f = fopen(dbg_path, "wb");
+        if (f) { fwrite(m->buf_act, sizeof(float), B * H, f); fclose(f); }
+    }
+    #endif
     float* x_norm2 = m->buf_act;
 
     // ─── 7. FFN: fused gate + up projections (one OMP region) ───
@@ -4647,59 +4904,90 @@ static void forward_layer_internal(
             }
         }
     } else if (m->use_f32_matmul) {
-        // Full-precision FFN: f32 activations × int8 weights, no quantization
-        int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
-        int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
-        get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
-        get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
-        int rows = g_rows, dim_w = g_dim_v;
-        int rows_packed = rows / 4;
-
-        #ifdef _OPENMP
-        #pragma omp parallel for if(rows_packed > 4)
-        #endif
-        for (int ur = 0; ur < rows_packed; ur++) {
-            const int8_t* gw4 = gw + ur * 4 * dim_w;
-            const int8_t* uw4 = uw + ur * 4 * dim_w;
+        // Full-precision FFN: f32 activations × int8 weights, no activation quantization
+        if (tg.ttype == 11 && tu.ttype == 11) {
+            // Per-row int8 (ttype=11): gate and up separately
+            const uint16_t* g_rs_fp16 = (const uint16_t*)(tg.data);
+            const int8_t* gw = (const int8_t*)(tg.data + tg.row_dim * 2);
+            const uint16_t* u_rs_fp16 = (const uint16_t*)(tu.data);
+            const int8_t* uw = (const int8_t*)(tu.data + tu.row_dim * 2);
+            int dim11 = t3_dim(tg);
             for (int b = 0; b < B; b++) {
-                const float* a = m->buf_act + b * ffn_dim;
-                float g_val[4], u_val[4];
-                for (int sub = 0; sub < 4; sub++) {
-                    const int8_t* wg = gw4 + sub * dim_w;
-                    const int8_t* wu = uw4 + sub * dim_w;
-                    __m256 gs = _mm256_setzero_ps();
-                    __m256 us = _mm256_setzero_ps();
-                    int c = 0;
-                    for (; c + 8 <= dim_w; c += 8) {
-                        __m256 af = _mm256_loadu_ps(a + c);
-                        __m128i wg8 = _mm_loadl_epi64((const __m128i*)(wg + c));
-                        __m128i wu8 = _mm_loadl_epi64((const __m128i*)(wu + c));
-                        __m256 wg_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wg8));
-                        __m256 wu_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wu8));
-                        gs = _mm256_fmadd_ps(af, wg_f, gs);
-                        us = _mm256_fmadd_ps(af, wu_f, us);
+                memmove(m->buf_act + b * ffn_dim, x_norm2 + b * H, H * sizeof(float));
+                memset(m->buf_act + b * ffn_dim + H, 0, (ffn_dim - H) * sizeof(float));
+            }
+            matmul_f32_per_row(tg.row_dim, dim11, gw, m->buf_act, ffn_dim, g_rs_fp16, m->buf_gate, B);
+            matmul_f32_per_row(tu.row_dim, dim11, uw, m->buf_act, ffn_dim, u_rs_fp16, m->buf_up, B);
+        } else {
+            int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
+            int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
+            get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
+            get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
+            int rows = g_rows, dim_w = g_dim_v;
+            int rows_packed = rows / 4;
+
+            #ifdef _OPENMP
+            #pragma omp parallel for if(rows_packed > 4)
+            #endif
+            for (int ur = 0; ur < rows_packed; ur++) {
+                const int8_t* gw4 = gw + ur * 4 * dim_w;
+                const int8_t* uw4 = uw + ur * 4 * dim_w;
+                for (int b = 0; b < B; b++) {
+                    const float* a = m->buf_act + b * ffn_dim;
+                    float g_val[4], u_val[4];
+                    for (int sub = 0; sub < 4; sub++) {
+                        const int8_t* wg = gw4 + sub * dim_w;
+                        const int8_t* wu = uw4 + sub * dim_w;
+                        __m256 gs = _mm256_setzero_ps();
+                        __m256 us = _mm256_setzero_ps();
+                        int c = 0;
+                        for (; c + 8 <= dim_w; c += 8) {
+                            __m256 af = _mm256_loadu_ps(a + c);
+                            __m128i wg8 = _mm_loadl_epi64((const __m128i*)(wg + c));
+                            __m128i wu8 = _mm_loadl_epi64((const __m128i*)(wu + c));
+                            __m256 wg_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wg8));
+                            __m256 wu_f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wu8));
+                            gs = _mm256_fmadd_ps(af, wg_f, gs);
+                            us = _mm256_fmadd_ps(af, wu_f, us);
+                        }
+                        float gs_f = hsum_ps(gs);
+                        float us_f = hsum_ps(us);
+                        for (; c < dim_w; c++) {
+                            gs_f += a[c] * wg[c];
+                            us_f += a[c] * wu[c];
+                        }
+                        g_val[sub] = gs_f / g_scale;
+                        u_val[sub] = us_f / u_scale;
                     }
-                    float gs_f = hsum_ps(gs);
-                    float us_f = hsum_ps(us);
-                    for (; c < dim_w; c++) {
-                        gs_f += a[c] * wg[c];
-                        us_f += a[c] * wu[c];
-                    }
-                    g_val[sub] = gs_f / g_scale;
-                    u_val[sub] = us_f / u_scale;
+                    float* g_out = m->buf_gate + b * rows;
+                    float* u_out = m->buf_up + b * rows;
+                    g_out[0 * rows_packed + ur] = g_val[0];
+                    g_out[1 * rows_packed + ur] = g_val[1];
+                    g_out[2 * rows_packed + ur] = g_val[2];
+                    g_out[3 * rows_packed + ur] = g_val[3];
+                    u_out[0 * rows_packed + ur] = u_val[0];
+                    u_out[1 * rows_packed + ur] = u_val[1];
+                    u_out[2 * rows_packed + ur] = u_val[2];
+                    u_out[3 * rows_packed + ur] = u_val[3];
                 }
-                float* g_out = m->buf_gate + b * rows;
-                float* u_out = m->buf_up + b * rows;
-                g_out[0 * rows_packed + ur] = g_val[0];
-                g_out[1 * rows_packed + ur] = g_val[1];
-                g_out[2 * rows_packed + ur] = g_val[2];
-                g_out[3 * rows_packed + ur] = g_val[3];
-                u_out[0 * rows_packed + ur] = u_val[0];
-                u_out[1 * rows_packed + ur] = u_val[1];
-                u_out[2 * rows_packed + ur] = u_val[2];
-                u_out[3 * rows_packed + ur] = u_val[3];
             }
         }
+        #ifdef ATLAS_DEBUG_MODE
+        if (B <= 6 && H == 2048) {
+            fprintf(stderr, "DBG_GATE_f32_b0: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_gate[i]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "DBG_UP_f32_b0: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_up[i]);
+            fprintf(stderr, "\n");
+            snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_GATE.bin", dbg_cur_layer);
+            FILE* f = fopen(dbg_path, "wb");
+            if (f) { fwrite(m->buf_gate, sizeof(float), B * m->inter_dim, f); fclose(f); }
+            snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_UP.bin", dbg_cur_layer);
+            f = fopen(dbg_path, "wb");
+            if (f) { fwrite(m->buf_up, sizeof(float), B * m->inter_dim, f); fclose(f); }
+        }
+        #endif
     } else {
         quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
 
@@ -4957,6 +5245,55 @@ static void forward_layer_internal(
             }
             quantize_f32_to_u8(m->buf_act, B, down_dim, max_abs, m->buf_i8);
             matmul_i4_reorder_deq(td.row_dim, d_cols, d_pw, d_rs, m->buf_i8, max_abs, d_scale, m->buf_act, m->buf_gate, B);
+        } else if (td.ttype == 11) {
+            // Per-row int8 down_proj (ttype=11)
+            const uint16_t* d_rs_fp16 = (const uint16_t*)(td.data);
+            const int8_t* dw = (const int8_t*)(td.data + td.row_dim * 2);
+            int d11_dim = t3_dim(td);
+            int d11_rows = td.row_dim;
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * d11_dim;
+                for (int i = 0; i < inter; i++)
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                for (int i = inter; i < d11_dim; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * d11_dim;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DBG_SILUUP_f32_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_act[i]);
+                fprintf(stderr, "\n");
+                snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_SILUUP.bin", dbg_cur_layer);
+                FILE* f = fopen(dbg_path, "wb");
+                if (f) { fwrite(m->buf_act, sizeof(float), B * m->inter_dim, f); fclose(f); }
+            }
+            #endif
+            matmul_f32_per_row(d11_rows, d11_dim, dw, m->buf_act, d11_dim, d_rs_fp16, m->buf_gate, B);
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_DOWN.bin", dbg_cur_layer);
+                FILE* f = fopen(dbg_path, "wb");
+                if (f) { fwrite(m->buf_gate, sizeof(float), B * d11_rows, f); fclose(f); }
+            fprintf(stderr, "DBG_DOWN_b0: ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_gate[i]);
+            fprintf(stderr, "\n");
+            }
+            #endif
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(td, w, rs, rows, dim, scale);
@@ -5012,6 +5349,16 @@ static void forward_layer_internal(
                 // removed: dead code (ARCH_BITNET never has idx_k_norm >= 0)
                 for (int i = inter; i < dim; i++) tmp[i] = 0.0f;
             }
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DBG_SILUUP_f32_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_act[i]);
+                fprintf(stderr, "\n");
+                snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_SILUUP.bin", dbg_cur_layer);
+                FILE* f = fopen(dbg_path, "wb");
+                if (f) { fwrite(m->buf_act, sizeof(float), B * m->inter_dim, f); fclose(f); }
+            }
+            #endif
             if (idx_ffn_sub_norm >= 0) {
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
@@ -5027,6 +5374,16 @@ static void forward_layer_internal(
                 }
             }
             matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+            #ifdef ATLAS_DEBUG_MODE
+            if (B <= 6 && H == 2048) {
+                fprintf(stderr, "DBG_DOWN_f32_b0: ");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_gate[i]);
+                fprintf(stderr, "\n");
+                snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_DOWN.bin", dbg_cur_layer);
+                FILE* f = fopen(dbg_path, "wb");
+                if (f) { fwrite(m->buf_gate, sizeof(float), B * H, f); fclose(f); }
+            }
+            #endif
         } else {
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
@@ -5077,6 +5434,16 @@ static void forward_layer_internal(
     for (int i = 0; i < B * H; i++) {
         output[i] += m->buf_gate[i] * m->scale_depth_factor;
     }
+    #ifdef ATLAS_DEBUG_MODE
+    if (B <= 6 && H == 2048) {
+        fprintf(stderr, "DBG_FINAL_b0: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", output[i]);
+        fprintf(stderr, "\n");
+        snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_FINAL.bin", dbg_cur_layer);
+        FILE* f = fopen(dbg_path, "wb");
+        if (f) { fwrite(output, sizeof(float), B * H, f); fclose(f); }
+    }
+    #endif
 }
 
 
