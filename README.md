@@ -91,10 +91,10 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 
 | Family | HuggingFace Repo | License | Status |
 |--------|-----------------|:-------:|:------:|
-| **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License 2.0 | ✅ |
-| **Falcon3 ATLAS** (1B/3B/7B/10B Base+Instruct) | [`xxxn3m3s1sxxx/Falcon3-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License 2.0 | ✅ |
-| **Falcon-E Edge** (1B/3B Base+Instruct) | [`tiiuae/Falcon-E-*`](https://huggingface.co/tiiuae) | Falcon-LLM License | ✅ |
-| **Falcon-E Edge ATLAS** (1B/3B) | [`xxxn3m3s1sxxx/Falcon-E-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon-E) | Falcon-LLM License | ✅ |
+| **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License | ✅ |
+| **Falcon3 ATLAS** (1B/3B/7B/10B Base+Instruct) | [`xxxn3m3s1sxxx/Falcon3-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License | ✅ |
+| **Falcon-E Edge** (1B/3B Base+Instruct) | [`tiiuae/Falcon-E-*`](https://huggingface.co/tiiuae) | TII Falcon License | ✅ |
+| **Falcon-E Edge ATLAS** (1B/3B) | [`xxxn3m3s1sxxx/Falcon-E-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon-E) | TII Falcon License | ✅ |
 | **Ternary Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
 | **Ternary Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
@@ -213,7 +213,7 @@ Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at
 ### How It Works
 
 1. **TQ1.0 format**: Repacks HuggingFace safetensors into 5 ternary trits per byte (Base-3 encoding). ~1.58 bits/weight.
-2. **Hybrid mode** (default): FFN projections run as decompressed int8 (dominate compute), QKV/O stay TQ1-packed (5× less memory reads).
+2. **Hybrid mode** (default for 3B+ non-SubLN models): FFN projections run as decompressed int8 (dominate compute), QKV/O stay TQ1-packed (5× less memory reads). **f32 bypass** takes priority for SubLN architectures (BitNet, TriLM ≤2.4B), hidden≤2048 (1B, Bonsai-1.7B), or rope_theta≥3M (Bonsai-8B) — no activation quantization needed.
 3. **Int8 KV-cache**: Per-position int8 quantization with dynamic scaling halves KV cache RAM. 10B@4K: 320 MB → 173 MB.
 4. **Int4 FFN**: Load-time conversion halves FFN memory bandwidth (7B: +26%). Auto-enabled.
 5. **C++ binary tokenizer**: No Python dependencies at runtime. Encode via preencode + BPE merge, decode via pool lookup.
@@ -330,4 +330,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Falcon-E Edge: TII Falcon-LLM License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (Llama3 License, derived from `meta-llama/Meta-Llama-3-8B-Instruct`); derivative ATLAS at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).
+Code: Apache 2.0. Falcon3: TII Falcon License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License). Falcon-E Edge: TII Falcon License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (Llama3 License, derived from `meta-llama/Meta-Llama-3-8B-Instruct`); derivative ATLAS at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).
