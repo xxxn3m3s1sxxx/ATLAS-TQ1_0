@@ -346,7 +346,6 @@ def quantize_tq1_block_scaled(weights_fp16, block_size=128):
     w_3d = w_pad.reshape(nrows, n_blocks, block_size)
     block_scales32 = np.max(np.abs(w_3d), axis=2)
     block_scales32 = np.where(block_scales32 < 1e-10, 1.0, block_scales32)
-
     scales_expanded = np.repeat(block_scales32[:, :, np.newaxis], block_size, axis=2)
     ternary_3d = np.clip(np.round(w_3d / scales_expanded).astype(np.int32), -1, 1)
     ternary_flat = ternary_3d.reshape(nrows, n_blocks * block_size)[:, :ncols].astype(np.int8)
