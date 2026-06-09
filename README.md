@@ -85,7 +85,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 - **Falcon-E Edge**: BitNet 1.58-bit architecture (SubLN, ReLU²), 32K native context. 0.56–0.82 GB on disk.
 - **CANN models**: MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Chat template: `<|role|>\n{content}\n`.
 - **TriLM 3.9B ⚠️**: Uses **standard Llama** architecture (head_dim=128, no SubLN) — different from smaller TriLMs (SubLN, head_dim=64). Auto-detected.
-- **Llama3-8B-1.58**: Llama3 architecture (GQA, QK-Norm), 256 added tokens (IDs 128000–128255). Base model only (no chat template).
+- **Llama3-8B-1.58** ([`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens)): Llama3 architecture (GQA, QK-Norm), 256 added tokens (IDs 128000–128255). Base model (no chat template, Llama3 license).
 
 ### Model Sources
 
@@ -99,6 +99,7 @@ atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
 | **Ternary Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
 | **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
 | **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | ✅ |
+| **Llama3-8B-1.58** (8B) | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama3 | ✅ |
 | **Llama3-8B-1.58 ATLAS** (8B) | [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS) | Llama3 | ✅ |
 | **BitCPM-CANN** (0.5B/1B/3B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb) | Apache 2.0 | ✅ |
 | **BitCPM-CANN ATLAS** (0.5B/1B/3B/8B) | [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN) | Apache 2.0 | ✅ |
@@ -309,4 +310,4 @@ safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
 
 ## License
 
-Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Falcon-E Edge: TII Falcon-LLM License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: Llama3 License (derivative at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS)). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).
+Code: Apache 2.0. Falcon3: TII Falcon License 2.0 (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License 2.0). Falcon-E Edge: TII Falcon-LLM License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (Llama3 License, derived from `meta-llama/Meta-Llama-3-8B-Instruct`); derivative ATLAS at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).
