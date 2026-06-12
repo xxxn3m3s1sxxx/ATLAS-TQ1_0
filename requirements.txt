@@ -1,0 +1,4 @@
+numpy>=1.24
+safetensors>=0.4
+tokenizers>=0.15  # for Python-side encode (C++ decode is native)
+# torch & transformers only needed for packing -> requirements-dev.txt
