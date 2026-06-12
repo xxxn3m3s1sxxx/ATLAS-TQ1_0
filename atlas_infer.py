@@ -306,7 +306,7 @@ class AtlasModel:
         # v2.11.0: f32 bypass needed (decompresses ttype=5 -> int8). When false,
         # ttype=5 tensors stay packed — LUT path handles prefill (B>=16) and
         # fused_s8 handles decode (B<16), both on native TQ1 format.
-        self._needs_f32_bypass = (use_f32_matmul or self._is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0) and not force_tq1_native
+        self._needs_f32_bypass = (use_f32_matmul or self._is_bitnet or self.hidden <= 2048 or self.rope_theta >= 3000000.0 or self.vocab_size == 73448 or self.head_dim == 64) and not force_tq1_native
 
         # v2.8.0: Persistent KV cache tracking for multi-turn
         self._cached_input_ids = []
@@ -1167,17 +1167,11 @@ class AtlasModel:
                     result += '<think>\n\n</think>\n\n'
             return result
 
-        # Llama3: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
+        # Llama3 (Base Model): no chat template — use raw content
         if self._is_llama3:
-            eos = '<|eot_id|>'
-            result = ""
-            for msg in messages:
-                role = msg['role']
-                content = msg.get('content', '')
-                result += f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}{eos}\n"
             if add_generation_prompt:
-                result += '<|start_header_id|>assistant<|end_header_id|>\n\n'
-            return result
+                return messages[-1].get('content', '') if messages else ""
+            return "\n".join(m.get('content', '') for m in messages if m.get('content'))
 
         # BitNet: Role: content<|eot_id|> (per tokenizer_config.json Jinja2 template)
         if self._is_bitnet:
