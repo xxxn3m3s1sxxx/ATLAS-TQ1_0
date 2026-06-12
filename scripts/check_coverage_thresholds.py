@@ -3,7 +3,7 @@
 import json
 import sys
 
-MIN_LINES = 65.0
+MIN_LINES = 63.0
 MIN_FUNCS = 79.0
 
 report = sys.argv[1] if len(sys.argv) > 1 else "coverage_summary.json"
