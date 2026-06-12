@@ -1,0 +1,70 @@
+{
+  "report": "ATLAS Deep Analysis v2.11.2 — 29 Models Across 7 Families",
+  "date": "2026-06-12",
+  "engine": "ATLAS TQ1.0 v2.11.2",
+  "max_score": 100,
+  "results": [
+    {"model": "Falcon3-1B-Instruct-1.58bit-ATLAS", "family": "Falcon3 Instruct", "score": 70, "size_gb": 1.2, "load_s": 1.0, "tok_s": 12.0, "issues": ["T=0 newline collapse (known: 18L/2048H too small for argmax)"], "status": "PASS"},
+    {"model": "Falcon3-3B-Instruct-1.58bit-ATLAS", "family": "Falcon3 Instruct", "score": 100, "size_gb": 2.0, "load_s": 2.7, "tok_s": 9.0, "issues": [], "status": "PASS"},
+    {"model": "Falcon3-7B-Instruct-1.58bit-ATLAS", "family": "Falcon3 Instruct", "score": 97, "size_gb": 2.8, "load_s": 6.1, "tok_s": 4.0, "issues": [], "status": "PASS"},
+    {"model": "Falcon3-10B-Instruct-1.58bit-ATLAS", "family": "Falcon3 Instruct", "score": 91, "size_gb": 3.3, "load_s": 9.4, "tok_s": 3.1, "issues": ["multi-turn privacy refusal (model behavior)"], "status": "PASS"},
+    {"model": "Falcon3-3B-Base-1.58bit-ATLAS", "family": "Falcon3 Base", "score": 90, "size_gb": 2.0, "load_s": 2.3, "tok_s": 9.8, "issues": ["T=0 prompt repetition (Base model behavior)"], "status": "PASS"},
+    {"model": "Falcon3-7B-Base-1.58bit-ATLAS", "family": "Falcon3 Base", "score": 98, "size_gb": 2.8, "load_s": 5.4, "tok_s": 4.5, "issues": [], "status": "PASS"},
+    {"model": "Falcon3-10B-Base-1.58bit-ATLAS", "family": "Falcon3 Base", "score": 86, "size_gb": 3.3, "load_s": 10.6, "tok_s": 3.2, "issues": ["T=0 French facts instead of direct answer (Base behavior)"], "status": "PASS"},
+    {"model": "Falcon-E-1B-Base-1.58bit-ATLAS", "family": "Falcon-E", "score": 97, "size_gb": 0.5, "load_s": 1.5, "tok_s": 10.5, "issues": [], "status": "PASS"},
+    {"model": "Falcon-E-1B-Instruct-1.58bit-ATLAS", "family": "Falcon-E", "score": 93, "size_gb": 0.5, "load_s": 1.6, "tok_s": 12.6, "issues": [], "status": "PASS"},
+    {"model": "Falcon-E-3B-Base-1.58bit-ATLAS", "family": "Falcon-E", "score": 91, "size_gb": 0.8, "load_s": 3.3, "tok_s": 6.4, "issues": ["T=0 MCQ format answer (Base behavior)"], "status": "PASS"},
+    {"model": "Falcon-E-3B-Instruct-1.58bit-ATLAS", "family": "Falcon-E", "score": 96, "size_gb": 0.8, "load_s": 3.3, "tok_s": 6.1, "issues": [], "status": "PASS"},
+    {"model": "Ternary-Bonsai-1.7B-ATLAS", "family": "Bonsai", "score": 99, "size_gb": 0.9, "load_s": 5.5, "tok_s": 9.8, "issues": [], "status": "PASS"},
+    {"model": "Ternary-Bonsai-4B-ATLAS", "family": "Bonsai", "score": 94, "size_gb": 1.5, "load_s": 13.6, "tok_s": 4.5, "issues": [], "status": "PASS"},
+    {"model": "Ternary-Bonsai-8B-ATLAS", "family": "Bonsai", "score": 99, "size_gb": 3.7, "load_s": 40.8, "tok_s": 2.9, "issues": [], "status": "PASS"},
+    {"model": "BitNet-2B4T-b1.58-ATLAS", "family": "BitNet", "score": 97, "size_gb": 1.0, "load_s": 15.2, "tok_s": 7.3, "issues": [], "status": "PASS"},
+    {"model": "Llama3-8B-1.58-ATLAS", "family": "Llama3", "score": 87, "size_gb": 3.3, "load_s": 6.1, "tok_s": 3.8, "issues": ["T=0 rep degradation (Base model inherent)"], "status": "PASS"},
+    {"model": "TriLM-99M-ATLAS", "family": "TriLM", "score": 90, "size_gb": 0.1, "load_s": 0.5, "tok_s": 130.4, "issues": ["tiny model: repetitive output pattern"], "status": "PASS"},
+    {"model": "TriLM-190M-ATLAS", "family": "TriLM", "score": 100, "size_gb": 0.2, "load_s": 0.9, "tok_s": 84.6, "issues": [], "status": "PASS"},
+    {"model": "TriLM-390M-ATLAS", "family": "TriLM", "score": 100, "size_gb": 0.3, "load_s": 2.1, "tok_s": 38.8, "issues": [], "status": "PASS"},
+    {"model": "TriLM-560M-ATLAS", "family": "TriLM", "score": 100, "size_gb": 0.3, "load_s": 3.1, "tok_s": 28.7, "issues": [], "status": "PASS"},
+    {"model": "TriLM-830M-ATLAS", "family": "TriLM", "score": 100, "size_gb": 0.4, "load_s": 4.8, "tok_s": 20.8, "issues": [], "status": "PASS"},
+    {"model": "TriLM-1.1B-ATLAS", "family": "TriLM", "score": 100, "size_gb": 0.5, "load_s": 6.3, "tok_s": 15.0, "issues": [], "status": "PASS"},
+    {"model": "TriLM-1.5B-ATLAS", "family": "TriLM", "score": 97, "size_gb": 0.7, "load_s": 8.5, "tok_s": 11.6, "issues": [], "status": "PASS"},
+    {"model": "TriLM-2.4B-ATLAS", "family": "TriLM", "score": 97, "size_gb": 0.9, "load_s": 15.6, "tok_s": 7.3, "issues": [], "status": "PASS"},
+    {"model": "TriLM-3.9B-ATLAS", "family": "TriLM", "score": 82, "size_gb": 1.3, "load_s": 0.5, "tok_s": 2.8, "issues": ["Llama arch: answers with questions instead of direct answer"], "status": "PASS"},
+    {"model": "BitCPM-CANN-0.5B-ATLAS", "family": "BitCPM-CANN", "score": 95, "size_gb": 0.2, "load_s": 2.3, "tok_s": 22.1, "issues": [], "status": "PASS"},
+    {"model": "BitCPM-CANN-1B-ATLAS", "family": "BitCPM-CANN", "score": 97, "size_gb": 0.8, "load_s": 7.9, "tok_s": 7.6, "issues": [], "status": "PASS"},
+    {"model": "BitCPM-CANN-3B-ATLAS", "family": "BitCPM-CANN", "score": 93, "size_gb": 1.4, "load_s": 26.3, "tok_s": 3.6, "issues": [], "status": "PASS"},
+    {"model": "BitCPM-CANN-8B-ATLAS", "family": "BitCPM-CANN", "score": 93, "size_gb": 2.7, "load_s": 40.8, "tok_s": 1.6, "issues": [], "status": "PASS"}
+  ],
+  "family_averages": {
+    "Falcon3 Instruct": {"avg_score": 89.5, "models": 4, "status": "PASS"},
+    "Falcon3 Base": {"avg_score": 91.3, "models": 3, "status": "PASS"},
+    "Falcon-E": {"avg_score": 94.3, "models": 4, "status": "PASS"},
+    "Bonsai": {"avg_score": 97.3, "models": 3, "status": "PASS"},
+    "BitNet": {"avg_score": 97.0, "models": 1, "status": "PASS"},
+    "Llama3": {"avg_score": 87.0, "models": 1, "status": "PASS"},
+    "TriLM": {"avg_score": 96.2, "models": 9, "status": "PASS"},
+    "BitCPM-CANN": {"avg_score": 94.5, "models": 4, "status": "PASS"}
+  },
+  "summary": {
+    "total_models": 29,
+    "overall_avg_score": 93.8,
+    "all_pass": true,
+    "critical_bugs_fixed": [
+      "CANN 3B/8B: vocab_size==73448 triggers f32_bypass (fixes Chinese garbage output)",
+      "TriLM-2.4B: head_dim==64 triggers f32_bypass (fixes SubLN signal collapse)",
+      "Llama3-8B Base: no chat template applied (fixes prompt repetition)"
+    ],
+    "known_model_limitations": [
+      "Falcon3-1B: T=0 newline collapse (18L too small for stable argmax)",
+      "Llama3-8B-1.58: Base model behavior (no instruction following, rep degradation)",
+      "TriLM-3.9B: Llama arch variant answers with questions instead of direct answers",
+      "Bonsai-8B: requires explicit use_f32_matmul=True (rope_theta=1M below 3M threshold)"
+    ],
+    "sample_outputs": {
+      "Falcon3-10B-Instruct T=0": "The capital of France is Paris.",
+      "Bonsai-1.7B T=0": "The capital of France is **Paris**. It is a major city...",
+      "BitNet-2B4T T=0": "The capital of France is Paris. It is a major city in France...",
+      "CANN-3B T=0": "The capital of France is Paris. Paris is not only the political...",
+      "TriLM-2.4B T=0": "The capital of France is Paris."
+    }
+  }
+}
