@@ -965,10 +965,25 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                     tensor = reader.get_bf16_manual(name)
 
                 if "embed" in name:
-                    tensor_fp32 = _clean_embed_rows(
-                        tensor.astype(np.float32), name)
-                    np.clip(tensor_fp32, -65504.0, 65504.0, out=tensor_fp32)
-                    tensor = tensor_fp32.astype(np.float16)
+                    embed_ref = reader._in_memory.get(name) if reader._in_memory else None
+                    if embed_ref is not None:
+                        del reader._in_memory[name]
+                        tensor = None
+                        tensor = embed_ref.cpu().numpy()
+                    if embed_ref is not None and tensor.size > 10_000_000:
+                        embed_rows = []
+                        for start in range(0, tensor.shape[0], 4096):
+                            chunk = tensor[start:start+4096].astype(np.float32)
+                            chunk = _clean_embed_rows(chunk, name)
+                            np.clip(chunk, -65504.0, 65504.0, out=chunk)
+                            embed_rows.append(chunk.astype(np.float16))
+                        tensor = np.concatenate(embed_rows, axis=0)
+                        del embed_ref
+                    else:
+                        tensor_fp32 = _clean_embed_rows(
+                            tensor.astype(np.float32), name)
+                        np.clip(tensor_fp32, -65504.0, 65504.0, out=tensor_fp32)
+                        tensor = tensor_fp32.astype(np.float16)
                 elif tensor.dtype in (np.float32, np.float64):
                     tensor = tensor.astype(np.float16)
                 elif tensor.dtype == np.uint16:
@@ -1004,6 +1019,8 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
             out.write(data_bytes)
             current_offset += len(data_bytes)
+            if reader._in_memory and name in reader._in_memory:
+                del reader._in_memory[name]
 
             if idx % 8 == 0:
                 print(f"  [{idx}/{len(tensor_names)}] {name[:55]:55s} {len(data_bytes)/1024:7.1f}KB ttype={tens_ttype}")

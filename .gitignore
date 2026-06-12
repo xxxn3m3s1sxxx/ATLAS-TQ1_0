@@ -233,3 +233,29 @@ atlas-qlora-professor/
 *.atlas
 *.dll
 *.exe
+
+# Temp scripts and debug artifacts
+tmp_*.py
+debug_*.py
+verify_*.py
+verify_*.py
+trace_*.py
+compute_*
+tensor_idx_check.py
+deep_benchmark.py
+run_debug_test.py
+get_hf_intermediates.py
+compare_per_row.py
+merge_pid.txt
+coverage.functions.html
+
+# Test debug/auxiliary scripts
+tests/_*.py
+tests/debug_*.py
+scripts/_*.py
+
+# Analysis outputs
+plots/
+models/eval_full/
+models/paper_results/
+models/ste_telemetry.json

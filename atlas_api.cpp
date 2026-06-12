@@ -2049,7 +2049,8 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
 // ─── v2.8.0: Convert FFN int8 tensors to int4 (ttype=8) in-place ───
 // Halves memory bandwidth for FFN matmuls. Clip int8→int4, pack 2/byte.
 ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
-    if (m->use_f32_matmul) return;  // f32_bypass needs full precision, no activation quant
+    // Split-mode: FFN int4 even when use_f32_matmul is true.
+    // QKV stays in f32_bypass for attention precision; FFN gets int4 bandwidth halving.
     int total = 0;
     for (size_t i = 0; i < m->tensors.size(); i++) {
         auto& t = m->tensors[i];
@@ -2068,19 +2069,29 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         float scale = fp16_to_fp32(s16);
         const int8_t* i8 = (const int8_t*)(t.data + 2);
         int rows = t.row_dim;
-        int input_dim; memcpy(&input_dim, t.data + 2, 4); // HACK: need actual dim
-        // Actually, for ttype=3, data_size = 2 + rows*cols + rows*4
-        // So cols = (data_size - 2 - rows*4) / rows
         
-        // Hmm, I need the cols dimension. Let me derive it from data_size.
-        // data_size = 2 + rows * cols + rows * 4
-        // cols = (data_size - 2 - rows * 4) / rows
         int64_t ds = t.data_size;
         int cols = (int)((ds - 2 - (int64_t)rows * 4) / rows);
-        if (cols <= 0 || cols > 1000000) continue;  // sanity check
+        if (cols <= 0 || cols > 1000000) continue;
         
-        int old_size = (int)ds;
-        int packed_cols = (cols + 1) / 2;  // round up
+        // Find actual max abs value for proper rescaling to int4 range [-7,7].
+        // ttype=3 weights from atlas_decompress_ttype5 span [-127,127] (per-tensor uniform scale).
+        // Naive clip to [-7,7] loses ~16× precision. We rescale: compute factor=7/max_abs,
+        // pack weights in [-7,7], and multiply fp16 scale by 127/factor = 127*max_abs/7
+        // so that dequant: weight_i4 * new_scale = weight_i8 * original_scale.
+        int n_vals = rows * cols;
+        int i4_max = 7;
+        int max_abs = 0;
+        for (int j = 0; j < n_vals; j++) {
+            int v = (int)i8[j]; if (v < 0) v = -v;
+            if (v > max_abs) max_abs = v;
+        }
+        float rescale = (max_abs > i4_max) ? (float)i4_max / (float)max_abs : 1.0f;
+        uint16_t new_s16 = (max_abs > i4_max)
+            ? fp32_to_fp16(scale * rescale)  // kernel: weight_true = w_i4 / stored_scale, so stored_scale' = scale * 7/max_abs
+            : s16;
+        
+        int packed_cols = (cols + 1) / 2;
         int new_size = 2 + rows * packed_cols + rows * 4;
         
         uint8_t* new_data = atlas_valloc(new_size);
@@ -2088,36 +2099,32 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
             fprintf(stderr, "[ATLAS] OOM quantizing FFN to int4\n");
             continue;
         }
-        // Copy fp16 scale
-        memcpy(new_data, t.data, 2);
+        memcpy(new_data, &new_s16, 2);
         
         uint8_t* packed = new_data + 2;
         int32_t* new_rs = (int32_t*)(packed + rows * packed_cols);
         
-        // OMP parallel over rows (each row is independent)
     #ifdef _OPENMP
     #pragma omp parallel for
     #endif
-    for (int r = 0; r < rows; r++) {
+        for (int r = 0; r < rows; r++) {
             int sum = 0;
             for (int c = 0; c < cols; c += 2) {
-                int v0 = (int)i8[r * cols + c];
-                int v1 = (c + 1 < cols) ? (int)i8[r * cols + c + 1] : 0;
+                float f0 = (float)i8[r * cols + c] * rescale;
+                float f1 = (c + 1 < cols) ? (float)i8[r * cols + c + 1] * rescale : 0.0f;
+                int v0 = (int)(f0 >= 0.0f ? f0 + 0.5f : f0 - 0.5f);
+                int v1 = (int)(f1 >= 0.0f ? f1 + 0.5f : f1 - 0.5f);
                 
-                // Clip to int4 range [-8, 7]
                 if (v0 < -8) v0 = -8;
                 if (v0 > 7) v0 = 7;
                 if (v1 < -8) v1 = -8;
                 if (v1 > 7) v1 = 7;
                 
-                // Convert to 4-bit unsigned
-                int u0 = v0 & 0x0F;  // -8→8, -1→15, 0→0, 7→7
+                int u0 = v0 & 0x0F;
                 int u1 = v1 & 0x0F;
                 
-                // Pack: low nibble = v0, high nibble = v1
                 packed[r * packed_cols + c / 2] = (uint8_t)(u0 | (u1 << 4));
                 
-                // Recalculate row_sum from clipped values
                 sum += v0;
                 if (c + 1 < cols) sum += v1;
             }
@@ -4801,7 +4808,7 @@ static void forward_layer_internal(
             get_tq1_packed(tu, wp, rows, dim, pc, scale);
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
         }
-    } else if (tg.ttype == 8 && !m->use_f32_matmul) {
+    } else if (tg.ttype == 8) {  // Split-mode: int4 FFN even with f32_bypass
         uint16_t gs16; memcpy(&gs16, tg.data, 2); float g_scale = fp16_to_fp32(gs16);
         uint16_t us16; memcpy(&us16, tu.data, 2); float u_scale = fp16_to_fp32(us16);
         int g_cols = tg.packed_cols * 2;
@@ -5214,7 +5221,7 @@ static void forward_layer_internal(
                 }
             }
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
-        } else if (td.ttype == 8 && !m->use_f32_matmul) {
+        } else if (td.ttype == 8) {  // Split-mode: int4 FFN even with f32_bypass
             uint16_t d16; memcpy(&d16, td.data, 2); float d_scale = fp16_to_fp32(d16);
             int d_cols = td.packed_cols * 2;
             const uint8_t* d_pw = td.data + 2;
