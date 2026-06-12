@@ -822,7 +822,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 "scale_emb": cfg.get("scale_emb", 1.0),
                 "scale_depth": cfg.get("scale_depth", 1.0),
                 "rope_interleaved": False,
-                "use_f32_bypass": False,
+                "use_f32_bypass": True,
                 "rope_theta": rope_theta,
             }
             meta_json = json.dumps(meta).encode("utf-8")

@@ -40,25 +40,27 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
 BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
 Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
-TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU.  
+TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU. f32 bypass auto-detected via head_dim=64 (v2.11.2+).  
 TriLM 3.9B: `head_dim=128`, `rope_theta=10K`, Llama arch, MHA (no GQA), SwiGLU. Auto-detected by packer via head_dim threshold.
 Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
 BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`. 9.7 tok/s on i7-7700T (28L/2048H).
-BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). Hybrid path. T=0: "Paris." coherent, T=0.7: coherent.
+BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). f32 bypass (auto-detected via vocab=73448). T=0: "Paris." coherent, T=0.7: coherent.
 BitCPM-CANN-0.5B: `head_dim=64`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. Tie Embeddings, V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Tiny — 24L/1024H/4096I, 0.22 GB.
-BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. No tie embeddings (lm_head separate). V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Largest CANN — 32L/4096H/16384I, 2.65 GB.
+BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. No tie embeddings (lm_head separate). V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. f32 bypass (auto-detected via vocab=73448). Largest CANN — 32L/4096H/16384I, 2.65 GB.
 
-### HF Alignment Check — 22 Models Verified
+### HF Alignment Check — 29 Models Verified
 
 `scripts/verify_hf_alignment.py` auto-checks all models against HF Hub:
 
 | Family | Count | Status |
 |--------|-------|--------|
-| Falcon3 (1B/3B/7B/10B) | 4 | ✅ All PASS |
+| Falcon3 (1B/3B/7B/10B, Base+Instruct) | 7 | ✅ All PASS |
+| Falcon-E (1B/3B, Base+Instruct) | 4 | ✅ All PASS |
 | Bonsai (1.7B/4B/8B) | 3 | ✅ All PASS |
 | BitNet-2B4T | 1 | ⏭️ SKIP (restricted repo) |
-| TriLM (99M→3.9B, all sizes) | 10 | ✅ 9 PASS, ⏭️ 1 SKIP (2.3B private) |
-| Qwen reference (Qwen2.5/3/QwQ) | 4 | ✅ All PASS |
+| Llama3-8B-1.58 | 1 | ✅ PASS |
+| TriLM (99M→3.9B, all sizes) | 9 | ✅ All PASS |
+| BitCPM-CANN (0.5B/1B/3B/8B) | 4 | ✅ All PASS |
 
 TriLM 3.9B is auto-detected by the packer: ≤2.4B uses SubLN (head_dim=64), 3.9B uses Llama arch (head_dim=128, no SubLN).
 
@@ -112,6 +114,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 | **Bonsai-8B** | f32 bypass | **2.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent |
 
 Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B rope_theta=1M (<3M threshold, f32 not auto-triggered), use `AtlasModel(..., use_f32_matmul=True)`. Hybrid path degenerates to garbage — needs f32_bypass despite hidden=4096. Quantized hybrid mode yields 19.2 tok/s (1.7B only).
+CANN 3B/8B: `vocab_size==73448` auto-triggers f32_bypass (v2.11.2+).
 
 ### Architecture Notes
 
@@ -152,6 +155,12 @@ const char* atlas_get_tokenizer(void* model, int* size);
 See `atlas_ffi.h` for full API.
 
 ## Roadmap
+
+### v2.11.2 ✅ — Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix (ABGESCHLOSSEN)
+- **CANN 3B/8B f32_bypass**: `vocab_size==73448` triggert automatisch f32_bypass — behebt chinesischen Garbage-Output (Signal wurde durch activation quant u8+128 zerstört). `pack_to_atlas.py` Meta-Block ebenfalls auf `use_f32_bypass: True` gesetzt.
+- **TriLM-2.4B f32_bypass**: `head_dim==64` triggert automatisch f32_bypass — TriLM SubLN-Modelle ohne `attn_sub_norm` Tensor-Namen werden korrekt erkannt. Prompt-Wiederholung behoben.
+- **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
+- **29/29 Modelle getestet**: Falcon3 (7), Falcon-E (4), Bonsai (3), BitNet (1), Llama3 (1), TriLM (9), BitCPM-CANN (4) — alle ✅.
 
 ### v2.10.6 ✅ — OOM Error Propagation (Signal Chain) (ABGESCHLOSSEN)
 - **`ensure_cache` → `bool`**: Allocate both k/v caches before freeing old, `cache_max_seq_len` updated only on success. Safe partial free on failure.
@@ -264,6 +273,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.11.2** | **Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix**. CANN 3B/8B f32_bypass via vocab=73448. TriLM-2.4B f32_bypass via head_dim=64. Llama3 Base: kein Chat-Template. 29/29 Modelle getestet. |
 | **v2.11.1** | **Kernel Cleanup + tritplane3 Dok**. `ternary_tensors`-Infrastruktur entfernt (pre-ternarized path in `quantize_tq1_block_scaled`, `extract_ternary_and_fp32`, lookup + pre-shuffle in packer). `docs/double-quant.md`: Warum tritplane3 + TQ1.0 Signal-Collapse produziert (48% Gesamtfehler), per-row int8 als einzig stabile Brücke. `pack_to_atlas.py`: 92 Zeilen entfernt. Benchmark bestätigt: Bonsai-1.7B (7.8 tok/s), Bonsai-4B (3.0 tok/s), tritplane→per-row int8 (7.1-8.4 tok/s). |
 | **v2.11.0** | **Falcon-E Edge + TriLM Full Series + CI Hardening**. Falcon-E 1B/3B Base+Instruct TQ1.0 (BitNet 1.58 arch). TriLM 99M–560M added (9-model series). CANN dual EOS, thread_local block scales, relaxed QK-Norm guard. README: TriLM, Falcon-E, Llama3-8B-1.58 entries. CI: sanitizer-build (ASan+UBSan), coverage gates, pip cache, fail-fast, macOS fix, release_to_hf.py Falcon-E support. 58/58 mock tests across 9 architectures. |
 | **v2.10.6** | **OOM Error Propagation (Signal Chain)**: Complete memory failure cascade from `atlas_valloc` NULL → `generate_c` → Python `RuntimeError`. `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked. 55/55 mock tests, 12/12 sonde. |
