@@ -7,3 +7,6 @@
 *.i8
 __pycache__/
 *.pyc
+*.npy
+*.log
+dbg_*

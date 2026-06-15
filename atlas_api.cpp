@@ -129,6 +129,14 @@ static int check_avx512_vnni(void) {
 }
 #endif
 
+// --- Int4 KV cache block size ------------------------------------------------
+#define KV_BLOCK_SIZE 32
+#define KV_BYTES_PER_BLOCK (2 + KV_BLOCK_SIZE / 2)
+static inline int kv_pos_bytes(int hd) {
+    int n_blk = (hd + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    return n_blk * KV_BYTES_PER_BLOCK;
+}
+
 // ─── Xoshiro256** PRNG (thread-safe via thread_local, 64-bit) ──────────
 static thread_local uint64_t xoshiro_state[4] = {0};
 
@@ -457,25 +465,25 @@ struct AtlasModel {
     void* mmap_handle = nullptr;    // CreateFileMapping handle (Win) / file size (Lin)
     void* mmap_file = nullptr;      // CreateFile handle (Win) / fd (Lin)
 
-    // v2.9.2: FP16 KV cache (full precision, no quantization noise)
-    uint16_t* k_cache = nullptr;
-    uint16_t* v_cache = nullptr;
+    // v2.12.0: Int4 KV cache (per-block fp16 scales, block_size=32)
+    uint8_t* k_cache = nullptr;
+    uint8_t* v_cache = nullptr;
     int cache_max_seq_len = 0;
 
     // Ensure KV cache is allocated for at least max_seq_len
     // Returns false on allocation failure (old cache preserved).
     bool ensure_cache(int max_seq_len) {
         if (max_seq_len <= cache_max_seq_len) return true;
-        size_t cache_sz = (size_t)n_kv_heads * max_seq_len * head_dim * n_layers * sizeof(uint16_t);
-        uint16_t* new_k = (uint16_t*)atlas_valloc(cache_sz);
-        uint16_t* new_v = (uint16_t*)atlas_valloc(cache_sz);
+        size_t cache_sz = (size_t)n_layers * n_kv_heads * max_seq_len * kv_pos_bytes(head_dim);
+        uint8_t* new_k = (uint8_t*)atlas_valloc(cache_sz);
+        uint8_t* new_v = (uint8_t*)atlas_valloc(cache_sz);
         if (!new_k || !new_v) {
-            if (new_k) atlas_vfree((uint8_t*)new_k);
-            if (new_v) atlas_vfree((uint8_t*)new_v);
+            if (new_k) atlas_vfree(new_k);
+            if (new_v) atlas_vfree(new_v);
             return false;
         }
-        if (k_cache) atlas_vfree((uint8_t*)k_cache);
-        if (v_cache) atlas_vfree((uint8_t*)v_cache);
+        if (k_cache) atlas_vfree(k_cache);
+        if (v_cache) atlas_vfree(v_cache);
         k_cache = new_k;
         v_cache = new_v;
         cache_max_seq_len = max_seq_len;
@@ -2624,13 +2632,13 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 // k: [B, n_kv_heads * head_dim] float32 — RoPE applied in-place, modified
 // v: [B, n_kv_heads * head_dim] float32
 // positions: [B] int32
-// k_cache: [n_kv_heads, max_seq, head_dim] uint16_t — fp16 K cache
-// v_cache: [n_kv_heads, max_seq, head_dim] uint16_t — fp16 V cache
+// k_cache: [n_kv_heads, max_seq] uint8_t — int4 K cache (per-block fp16 scale)
+// v_cache: [n_kv_heads, max_seq] uint8_t — int4 V cache (per-block fp16 scale)
 // output: [B, n_heads * head_dim] float32
 // q_norm_w, k_norm_w: [head_dim] uint8 fp16 RMSNorm weights (QK-Norm, Qwen3), NULL = skip
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
-    uint16_t* k_cache, uint16_t* v_cache,
+    uint8_t* k_cache, uint8_t* v_cache,
     int max_seq_len, int seq_now, int B,
     int n_heads, int n_kv_heads, int head_dim,
     float rope_theta, float rope_scale, float* output,
@@ -2736,47 +2744,87 @@ ATLAS_API void atlas_attention_f32(
             }
         }
 
-        // Store K, V into cache (fp32 -> fp16, full precision)
+        // Store K, V into cache (fp32 → int4, per-block fp16 scale)
+        int n_blk = (head_dim + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+        int pos_bytes = kv_pos_bytes(head_dim);
         for (int h = 0; h < n_kv_heads; h++) {
             float* k_row = kb + h * head_dim;
             float* v_row = vb + h * head_dim;
             int cache_pos = pos % max_seq_len;
-            uint16_t* kc = k_cache + (size_t)h * max_seq_len * head_dim + (size_t)cache_pos * head_dim;
-            uint16_t* vc = v_cache + (size_t)h * max_seq_len * head_dim + (size_t)cache_pos * head_dim;
-            for (int d = 0; d < head_dim; d += 8) {
-                __m128i kh = _mm256_cvtps_ph(_mm256_loadu_ps(k_row + d), _MM_FROUND_TO_NEAREST_INT);
-                __m128i vh = _mm256_cvtps_ph(_mm256_loadu_ps(v_row + d), _MM_FROUND_TO_NEAREST_INT);
-                _mm_storeu_si128((__m128i*)(kc + d), kh);
-                _mm_storeu_si128((__m128i*)(vc + d), vh);
+            uint8_t* kc = k_cache + (size_t)h * max_seq_len * pos_bytes + (size_t)cache_pos * pos_bytes;
+            uint8_t* vc = v_cache + (size_t)h * max_seq_len * pos_bytes + (size_t)cache_pos * pos_bytes;
+            for (int blk = 0; blk < n_blk; blk++) {
+                int blk_start = blk * KV_BLOCK_SIZE;
+                int blk_end = blk_start + KV_BLOCK_SIZE;
+                if (blk_end > head_dim) blk_end = head_dim;
+                float max_abs_k = 0.0f, max_abs_v = 0.0f;
+                for (int d = blk_start; d < blk_end; d++) {
+                    float ak = fabsf(k_row[d]); if (ak > max_abs_k) max_abs_k = ak;
+                    float av = fabsf(v_row[d]); if (av > max_abs_v) max_abs_v = av;
+                }
+                float scale_k = (max_abs_k > 1e-10f) ? max_abs_k / 7.0f : 1.0f;
+                float scale_v = (max_abs_v > 1e-10f) ? max_abs_v / 7.0f : 1.0f;
+                uint16_t sk = fp32_to_fp16(scale_k), sv = fp32_to_fp16(scale_v);
+                memcpy(kc + blk * KV_BYTES_PER_BLOCK, &sk, 2);
+                memcpy(vc + blk * KV_BYTES_PER_BLOCK, &sv, 2);
+                float inv_sk = 1.0f / scale_k, inv_sv = 1.0f / scale_v;
+                int ne = blk_end - blk_start;
+                for (int i = 0; i < ne; i += 2) {
+                    int d = blk_start + i;
+                    int vk0 = (int)(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
+                    int vk1 = (int)(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
+                    kc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vk0 & 0x0F) | ((vk1 & 0x0F) << 4);
+                    int vv0 = (int)(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
+                    int vv1 = (int)(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
+                    vc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vv0 & 0x0F) | ((vv1 & 0x0F) << 4);
+                }
             }
         }
 
+        #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             for (int s = 0; s < ring_len; s++) {
                 int cache_idx = (ring_start + s) % max_seq_len;
-                const uint16_t* k_row = k_cache + (size_t)kh * max_seq_len * head_dim + (size_t)cache_idx * head_dim;
+                const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
                 const float* qh = qb + h * head_dim;
-                int d = 0;
                 __m256 sum_v = _mm256_setzero_ps();
-                for (; d + 8 <= head_dim; d += 8) {
-                    __m128i k16 = _mm_loadu_si128((const __m128i*)(k_row + d));
-                    __m256 k32 = _mm256_cvtph_ps(k16);
-                    __m256 qv8 = _mm256_loadu_ps(qh + d);
-                    sum_v = _mm256_fmadd_ps(qv8, k32, sum_v);
+                for (int blk = 0; blk < n_blk; blk++) {
+                    int blk_start = blk * KV_BLOCK_SIZE;
+                    int blk_end = blk_start + KV_BLOCK_SIZE;
+                    if (blk_end > head_dim) blk_end = head_dim;
+                    uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                    float scale = fp16_to_fp32(sr);
+                    __m256 scale_v = _mm256_set1_ps(scale);
+                    const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                    int j = blk_start;
+                    for (; j + 8 <= blk_end; j += 8) {
+                        int nib_off = (j - blk_start) / 2;
+                        int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                        __m128i pack = _mm_cvtsi32_si128(pw);
+                        __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                        __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                        inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                        __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                        __m256 qv = _mm256_loadu_ps(qh + j);
+                        sum_v = _mm256_fmadd_ps(qv, wf, sum_v);
+                    }
+                    for (; j < blk_end; j++) {
+                        int nib_off = (j - blk_start) / 2;
+                        int shft = ((j - blk_start) & 1) ? 4 : 0;
+                        int nib = (nb[nib_off] >> shft) & 0x0F;
+                        sum_v = _mm256_add_ps(sum_v, _mm256_set1_ps(qh[j] * (float)((nib ^ 8) - 8) * scale));
+                    }
                 }
                 float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
                           + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
-                for (; d < head_dim; d++) {
-                    __m128i k_fp16 = _mm_set1_epi16((short)k_row[d]);
-                    float k_val = _mm_cvtss_f32(_mm_cvtph_ps(k_fp16));
-                    sum += qh[d] * k_val;
-                }
                 scores[h * max_seq + s] = sum * inv_sqrt_d;
             }
         }
 
         // Causal mask + softmax per head (ring_start + s = actual position)
+        #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
             float* sh = scores + h * max_seq;
             float max_val = -1e9f;
@@ -2796,6 +2844,7 @@ ATLAS_API void atlas_attention_f32(
             for (int s = 0; s < max_seq; s++) sh[s] *= inv_sum;
         }
         // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
+        #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
             float* sh = scores + h * max_seq;
@@ -2803,22 +2852,39 @@ ATLAS_API void atlas_attention_f32(
             for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
             for (int s = 0; s < max_seq; s++) {
                 int cache_idx = (ring_start + s) % max_seq_len;
-                const uint16_t* v_row = v_cache
-                    + (size_t)kh * max_seq_len * head_dim + (size_t)cache_idx * head_dim;
+                const uint8_t* v_pos = v_cache
+                    + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
                 float score = sh[s];
                 __m256 sv = _mm256_set1_ps(score);
                 int d = 0;
-                for (; d + 8 <= head_dim; d += 8) {
-                    __m128i v16 = _mm_loadu_si128((const __m128i*)(v_row + d));
-                    __m256 v32 = _mm256_cvtph_ps(v16);
-                    __m256 out_v = _mm256_loadu_ps(out_h + d);
-                    out_v = _mm256_fmadd_ps(sv, v32, out_v);
-                    _mm256_storeu_ps(out_h + d, out_v);
-                }
-                for (; d < head_dim; d++) {
-                    __m128i vh = _mm_set1_epi16((short)v_row[d]);
-                    float v_val = _mm_cvtss_f32(_mm_cvtph_ps(vh));
-                    out_h[d] += score * v_val;
+                for (int blk = 0; blk < n_blk; blk++) {
+                    int blk_start = blk * KV_BLOCK_SIZE;
+                    int blk_end = blk_start + KV_BLOCK_SIZE;
+                    if (blk_end > head_dim) blk_end = head_dim;
+                    uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                    float scale = fp16_to_fp32(sr);
+                    __m256 scale_v = _mm256_set1_ps(scale);
+                    const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                    for (int j = blk_start; j + 8 <= blk_end; j += 8) {
+                        int nib_off = (j - blk_start) / 2;
+                        int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                        __m128i pack = _mm_cvtsi32_si128(pw);
+                        __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                        __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                        inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                        __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                        __m256 out_v = _mm256_loadu_ps(out_h + j);
+                        out_v = _mm256_fmadd_ps(sv, wf, out_v);
+                        _mm256_storeu_ps(out_h + j, out_v);
+                    }
+                    for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
+                        int nib_off = (j - blk_start) / 2;
+                        int shft = ((j - blk_start) & 1) ? 4 : 0;
+                        int nib = (nb[nib_off] >> shft) & 0x0F;
+                        float vv = (float)((nib ^ 8) - 8) * scale;
+                        out_h[j] += score * vv;
+                    }
                 }
             }
         }
@@ -2920,11 +2986,11 @@ ATLAS_API void atlas_set_scale_depth_factor(void* model, float factor) {
     if (m && factor > 0.0f) m->scale_depth_factor = factor;
 }
 
-// v2.6.0: Reset KV cache — zeros all cache data without freeing allocation.
+// v2.12.0: Reset int4 KV cache — zeros all cache data without freeing allocation.
 ATLAS_API void atlas_reset_cache(void* model) {
     AtlasModel* m = (AtlasModel*)model;
     if (!m || !m->k_cache) return;
-    size_t cache_bytes = (size_t)m->n_kv_heads * m->cache_max_seq_len * m->head_dim * m->n_layers * sizeof(uint16_t);
+    size_t cache_bytes = (size_t)m->n_layers * m->n_kv_heads * m->cache_max_seq_len * kv_pos_bytes(m->head_dim);
     memset(m->k_cache, 0, cache_bytes);
     memset(m->v_cache, 0, cache_bytes);
 }
@@ -4286,7 +4352,7 @@ static void forward_layer_internal(
     AtlasModel* m,
     const float* input, float* output, int B,
     const int* positions,
-    uint16_t* k_cache_layer, uint16_t* v_cache_layer,
+    uint8_t* k_cache_layer, uint8_t* v_cache_layer,
     int max_seq_len, int seq_now,
     int idx_ln1, int idx_q, int idx_k, int idx_v, int idx_o,
     int idx_ln2, int idx_gate, int idx_up, int idx_down,
@@ -5588,8 +5654,8 @@ ATLAS_API int atlas_forward(
 
     for (int L = 0; L < n_layers; L++) {
         const int* idx = layer_idx + L * m->layer_stride;
-        uint16_t* kc = m->k_cache + (size_t)L * nKV * max_seq_len * hd;
-        uint16_t* vc = m->v_cache + (size_t)L * nKV * max_seq_len * hd;
+        uint8_t* kc = m->k_cache + (size_t)L * nKV * max_seq_len * kv_pos_bytes(hd);
+        uint8_t* vc = m->v_cache + (size_t)L * nKV * max_seq_len * kv_pos_bytes(hd);
         int qn_i = -1, kn_i = -1, asn_i = -1, fsn_i = -1;
         if (m->layer_stride >= 11) {
             if (m->model_arch == ARCH_BITNET) {

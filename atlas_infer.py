@@ -847,8 +847,45 @@ class AtlasModel:
             1)
         return out
 
-    def forward(self, tokens, start_pos=0):
-        """Full forward pass — all layers fused in C++, final RMSNorm + LM head in Python."""
+    @staticmethod
+    def _fwht(arr):
+        """Fast Walsh-Hadamard Transform in-place on 1D array (len must be power of 2)."""
+        n = len(arr)
+        step = 1
+        while step < n:
+            for i in range(0, n, step * 2):
+                for j in range(i, i + step):
+                    u = arr[j]
+                    v = arr[j + step]
+                    arr[j] = u + v
+                    arr[j + step] = u - v
+            step *= 2
+
+    @staticmethod
+    def _fwht_filter(hidden_states, keep_ratio=0.9, rolloff=2.0, floor=0.05):
+        """FWHT with soft roll-off instead of binary cutoff.
+        keep_ratio: fraction of low-sequency components to leave untouched.
+        rolloff: exponent for attenuation curve (1=linear, 2=quadratic).
+        floor: minimum multiplier for highest sequency components."""
+        n = hidden_states.shape[-1]
+        n_keep = max(1, int(n * keep_ratio))
+        for i in range(hidden_states.shape[0]):
+            AtlasModel._fwht(hidden_states[i])
+        for j in range(n_keep, n):
+            frac = (j - n_keep) / (n - n_keep)
+            atten = floor + (1.0 - floor) * (1.0 - frac) ** rolloff
+            hidden_states[:, j] *= atten
+        for i in range(hidden_states.shape[0]):
+            AtlasModel._fwht(hidden_states[i])
+        hidden_states /= n
+        return hidden_states
+
+    def forward(self, tokens, start_pos=0, fwht_keep_ratio=None,
+                fwht_rolloff=2.0, fwht_floor=0.05):
+        """Full forward pass — all layers fused in C++, final RMSNorm + LM head in Python.
+        fwht_keep_ratio: if set, apply FWHT filter to hidden states before LM head.
+        fwht_rolloff: attenuation curve exponent (1=linear, 2=quadratic).
+        fwht_floor: minimum multiplier for highest sequency components."""
         B, seq_len = tokens.shape
         h = self._embed_w[tokens].astype(np.float32)
         se = self.scale_emb
@@ -869,6 +906,9 @@ class AtlasModel:
             self._layer_idx_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             self.n_layers) != 0:
             raise RuntimeError("ATLAS Core: Memory allocation failed during forward pass")
+
+        if fwht_keep_ratio is not None:
+            h = self._fwht_filter(h, fwht_keep_ratio, fwht_rolloff, fwht_floor)
 
         h_norm = np.array([self._rmsnorm(h[b], "model.norm.weight") for b in range(n)])
         output_logits = self._lmhead_gemv(h_norm).reshape(B, seq_len, self.vocab_size)
