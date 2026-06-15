@@ -10,3 +10,7 @@ __pycache__/
 *.npy
 *.log
 dbg_*
+paper_results/
+paper_results_1_7b/
+paper_results_4b/
+paper_results_4b_v2/
