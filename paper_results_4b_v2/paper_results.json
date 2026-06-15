@@ -1,0 +1,58 @@
+{
+  "baseline": "C:\\atlas\\models\\models\\Ternary-Bonsai-4B-BASELINE.atlas",
+  "finetuned": "C:\\atlas\\models\\models\\Ternary-Bonsai-4B-ATLAS-Pro-v2.atlas",
+  "baseline_generations": [
+    {
+      "label": "capital_of_france",
+      "prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "The capital of France is **Paris**. \ud83c\uddeb\ud83c\uddf7\n\nI notice there's a typo in my response \u2014 I meant to write \"The capital of France is **Paris**,\" not \"bien s\u00fbr\" or a different word. Let me correct that:\n\n\u2705 **The capital of France is Paris.**"
+    },
+    {
+      "label": "explain_quantum",
+      "prompt": "<|im_start|>user\nExplain quantum computing in simple terms.<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "Sure! Let's break down **quantum computing** in simple, easy-to-understand terms \u2014 without math or jargon:\n\n---\n\n### Imagine a regular computer (like a regular old laptop or a smartphone):\n\n- It uses **bits** (0s and 1s) to process information.\n- Like a light switch: either **on (1)** or **off (0)**.\n\n---\n\n### Now imagine a **quantum computer** \u2014 it works differently.\n\nIn a quantum computer, the"
+    },
+    {
+      "label": "write_python",
+      "prompt": "<|im_start|>user\nWrite a Python function to check if a string is a palindrome.<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "Here's a Python function to check if a string is a palindrome:\n\n```python\ndef is_palindrome(s):\n    \"\"\"\n    Check if a string is a palindrome (reads the same forwards and backwards).\n    \n    Args:\n        s (str): The string to check\n        \n    Returns:\n        bool: True if the string is a palindrome, False otherwise\n    \"\"\"\n    # Remove spaces and convert to lowercase for case-insensitive comparison\n    cleaned = s.replace(\" \", \"\").lower()\n    \n   "
+    },
+    {
+      "label": "solve_math",
+      "prompt": "<|im_start|>user\nSolve for x: 3x + 7 = 22<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "We are given the equation:\n\n$$\n3x + 7 = 22\n$$\n\n**Step 1:** Subtract 7 from both sides to isolate the term with the variable:\n\n$$\n3x + 7 - 7 = 22 - 7\n$$\n\n$$$\n3x = 15\n$$\n\n**Step 2:** Divide both sides by 3 to solve for $x$:\n\n$$$\nx = \\frac{15}{3}"
+    },
+    {
+      "label": "reasoning_chain",
+      "prompt": "<|im_start|>user\nIf a train leaves Station A at 60 mph and another leaves Station B at 80 mph, 200 miles apart, when do they meet?<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "To find when two trains leave two towns \u2014 200 miles apart \u2014 and travel toward each other at speeds of 60 mph and 80 mph, we can solve the problem using relative speed.\n\n### Given:\n- Speed of train from Station A: 60 mph\n- Speed of train from Station B: 80 mph\n- Distance between stations: 200 miles\n\nWhen two objects moves toward each other, their **relative speed** is the sum of"
+    }
+  ],
+  "finetuned_generations": [
+    {
+      "label": "capital_of_france",
+      "prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "The capital of France is Paris. It is the capital of the country. I'm sorry, but I can't tell you why."
+    },
+    {
+      "label": "explain_quantum",
+      "prompt": "<|im_start|>user\nExplain quantum computing in simple terms.<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "Quantum computing is like a computer, but instead of using 0s and 1s, it uses 0s and 1s. A normal computer goes through all possible combinations in order. Quantum computers go through many possible combinations at once."
+    },
+    {
+      "label": "write_python",
+      "prompt": "<|im_start|>user\nWrite a Python function to check if a string is a palindrome.<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "def is_palindrome(s):\n    # Reverse the string\n    reversed_str = s[::-1]\n    # Check if the string is equal to its reverse\n    return reversed_str == s"
+    },
+    {
+      "label": "solve_math",
+      "prompt": "<|im_start|>user\nSolve for x: 3x + 7 = 22<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "3x + 7 = 22\n\nSubtract 7 from both sides:\n\n3x + 7 - 7 = 22 - 7\n\n3x = 15\n\nDivide both sides by 3:\n\n3x / 3 = 15 / 3\n\nx = 5"
+    },
+    {
+      "label": "reasoning_chain",
+      "prompt": "<|im_start|>user\nIf a train leaves Station A at 60 mph and another leaves Station B at 80 mph, 200 miles apart, when do they meet?<|im_end|>\n<|im_start|>assistant\n",
+      "generation": "The two trains start 200 miles apart, so let's suppose that each takes 2 hours to get to the meeting point.\n\nThe first train is going 60 mph and takes 2h, so it covers 60*2=120 miles.\n\nThe second train is going 80 mph and takes 2h, so it covers 80*2=160 miles.\n\nThis adds up to 280 miles, which is more than"
+    }
+  ]
+}

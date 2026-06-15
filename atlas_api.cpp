@@ -310,13 +310,76 @@ extern "C" {
 typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
 // Timer for debug profiling
-#ifdef ATLAS_DEBUG_MODE
+#if defined(ATLAS_DEBUG_MODE) || defined(PROFILE_MODE)
 static inline double atlas_now() {
     LARGE_INTEGER c, f;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
+
+// ─── v2.12.0: Per-operation profiling accumulators ───
+// Tracks cumulative wall time across all layers + lm_head.
+// Reset at start of atlas_generate, dumped at end.
+struct ProfileAccum {
+    double t_rmsnorm = 0;
+    double t_qkv = 0;
+    double t_attention = 0;
+    double t_o_proj = 0;  // O projection matmul + residual
+    double t_ffn_gate_up = 0;
+    double t_silu_down = 0;  // SiLU + down projection matmul + residual
+    double t_lmhead = 0;
+    double t_other = 0;
+    int n_layers = 0;
+    int n_tokens = 0;
+};
+static thread_local ProfileAccum g_prof;
+
+#define P_START(name) double _prof_##name = atlas_now()
+#define P_ACCUM(name) g_prof.t_##name += atlas_now() - _prof_##name
+#define P_RESTART(name) _prof_##name = atlas_now()
+#define PROF_ADD_LAYERS(n) g_prof.n_layers += (n)
+#define PROF_ADD_TOKENS(n) g_prof.n_tokens += (n)
+
+static void profile_reset() { g_prof = ProfileAccum(); }
+
+static void profile_print() {
+    double total = g_prof.t_rmsnorm + g_prof.t_qkv + g_prof.t_attention
+                 + g_prof.t_o_proj + g_prof.t_ffn_gate_up + g_prof.t_silu_down
+                 + g_prof.t_lmhead + g_prof.t_other;
+    if (total < 0.001) return;
+    fprintf(stderr, "\n═══════ PROFILE (%d layers × %d tokens, %.3fs total) ═══════\n",
+            g_prof.n_layers, g_prof.n_tokens, total);
+    double tok_s = g_prof.n_tokens / total;
+    auto pct = [total](double t) { return 100.0 * t / total; };
+    fprintf(stderr, "  RMSNorm       %7.3fs (%5.1f%%) — avg %.3fms/layer\n",
+            g_prof.t_rmsnorm, pct(g_prof.t_rmsnorm),
+            1000.0 * g_prof.t_rmsnorm / (g_prof.n_layers * g_prof.n_tokens));
+    fprintf(stderr, "  QKV matmul    %7.3fs (%5.1f%%)\n",
+            g_prof.t_qkv, pct(g_prof.t_qkv));
+    fprintf(stderr, "  Attention     %7.3fs (%5.1f%%) — avg %.3fms/layer\n",
+            g_prof.t_attention, pct(g_prof.t_attention),
+            1000.0 * g_prof.t_attention / (g_prof.n_layers * g_prof.n_tokens));
+    fprintf(stderr, "  O proj        %7.3fs (%5.1f%%)\n",
+            g_prof.t_o_proj, pct(g_prof.t_o_proj));
+    fprintf(stderr, "  FFN gate+up   %7.3fs (%5.1f%%)\n",
+            g_prof.t_ffn_gate_up, pct(g_prof.t_ffn_gate_up));
+    fprintf(stderr, "  SiLU+down     %7.3fs (%5.1f%%)\n",
+            g_prof.t_silu_down, pct(g_prof.t_silu_down));
+    fprintf(stderr, "  lm_head       %7.3fs (%5.1f%%) — avg %.3fms/token\n",
+            g_prof.t_lmhead, pct(g_prof.t_lmhead), 1000.0 * g_prof.t_lmhead / g_prof.n_tokens);
+    fprintf(stderr, "  other         %7.3fs (%5.1f%%)\n",
+            g_prof.t_other, pct(g_prof.t_other));
+    fprintf(stderr, "═══════════════════════════════════════════════════\n\n");
+}
+#else
+#define P_START(name)
+#define P_ACCUM(name)
+#define P_RESTART(name)
+#define PROF_ADD_LAYERS(n)
+#define PROF_ADD_TOKENS(n)
+static void profile_reset() {}
+static void profile_print() {}
 #endif
 
 static inline float fp16_to_fp32(uint16_t h) {
@@ -4221,6 +4284,7 @@ static void forward_layer_internal(
     }
     #endif
 
+    P_START(rmsnorm);
     // ─── 1. Pre-attention RMSNorm ───
     {
         auto& t = m->tensors[idx_ln1];
@@ -4250,8 +4314,10 @@ static void forward_layer_internal(
         }
         #endif
     }
+    P_ACCUM(rmsnorm);
     float* x_norm = output;
 
+    P_START(qkv);
     // ─── 2. QKV projections (int8) ───
     auto t3_dim = [](const TensorInfo& t) -> int {
         if (t.ttype == 10 || t.ttype == 5) return t.packed_cols * 5;
@@ -4547,8 +4613,9 @@ static void forward_layer_internal(
                               scale, m->buf_act, m->buf_up, B);
         }
     }
+    P_ACCUM(qkv);
 
-
+    P_START(attention);
     // ─── 3. Fused attention (reuse atlas_attention_f32) ───
     int ws = B * nH * hd;
     float* attn_out = m->attn_ws;
@@ -4583,6 +4650,8 @@ static void forward_layer_internal(
         fprintf(stderr, "\n");
     }
     #endif
+    P_ACCUM(attention);
+    P_START(o_proj);
 
     // ─── 4. O projection (int8) ───
     {
@@ -4674,6 +4743,7 @@ static void forward_layer_internal(
         if (f) { fwrite(m->buf_gate, sizeof(float), B * H, f); fclose(f); }
     }
     #endif
+    P_ACCUM(o_proj);
     // ─── 5. Residual: output = input + attn_out_proj (* scale_depth_factor) ───
     for (int i = 0; i < B * H; i++) {
         output[i] = input[i] + m->buf_gate[i] * m->scale_depth_factor;
@@ -4688,6 +4758,7 @@ static void forward_layer_internal(
         if (f) { fwrite(output, sizeof(float), B * H, f); fclose(f); }
     }
     #endif
+    P_RESTART(rmsnorm);
     // ─── 6. Post-attention RMSNorm ───
     {
         auto& t = m->tensors[idx_ln2];
@@ -4715,6 +4786,8 @@ static void forward_layer_internal(
     }
     #endif
     float* x_norm2 = m->buf_act;
+    P_ACCUM(rmsnorm);
+    P_START(ffn_gate_up);
 
     // ─── 7. FFN: fused gate + up projections (one OMP region) ───
     // Fused kernel processes both in one pass: shared activation, no scratch buffer,
@@ -5078,6 +5151,8 @@ static void forward_layer_internal(
             }
         }
     }
+    P_ACCUM(ffn_gate_up);
+    P_START(silu_down);
 
     // ─── 8. Fused SiLU(gate)*up → down matmul with optional ffn_sub_norm ───
     {
@@ -5451,6 +5526,8 @@ static void forward_layer_internal(
         if (f) { fwrite(output, sizeof(float), B * H, f); fclose(f); }
     }
     #endif
+    PROF_ADD_LAYERS(1);
+    P_ACCUM(silu_down);
 }
 
 
@@ -5769,6 +5846,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     int cache_offset,
     int* output_ids)
 {
+    profile_reset();
     if (!m || !input_ids || !output_ids || n_input < 1 || max_new_tokens < 1)
         return -1;
     if (n_input >= max_seq_len) {
@@ -5864,8 +5942,12 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     // Final RMSNorm + LM head — only the last new token's logits are needed
     {
         const float* x = embed_buf + (int64_t)(n_new - 1) * H;
+        P_START(rmsnorm);
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
+        P_ACCUM(rmsnorm);
+        P_START(lmhead);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
+        P_ACCUM(lmhead);
     }
 
     // Sample first token from prefill logits
@@ -5909,8 +5991,13 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         }
         ATLAS_LOG("decode forward done\n");
 
+        P_START(rmsnorm);
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
+        P_ACCUM(rmsnorm);
+        P_START(lmhead);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
+        P_ACCUM(lmhead);
+        PROF_ADD_TOKENS(1);
 
         if (n_gen < min_new_tokens) {
             if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
@@ -5928,7 +6015,9 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     atlas_vfree((uint8_t*)h_norm);
     atlas_vfree((uint8_t*)logits);
     atlas_vfree((uint8_t*)context);
+    PROF_ADD_TOKENS(1);  // account for prefill token
 
+    profile_print();
     return n_gen;
 }
 
@@ -5942,6 +6031,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     int cache_offset,
     atlas_token_callback callback, void* user_data)
 {
+    profile_reset();
     if (!m || !input_ids || !callback || n_input < 1 || max_new_tokens < 1)
         return -1;
     if (n_input >= max_seq_len) {
@@ -6012,8 +6102,12 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
 
     {
         const float* x = embed_buf + (int64_t)(n_new - 1) * H;
+        P_START(rmsnorm);
         atlas_rmsnorm_f32(x, norm_w, h_norm, H, 1e-6f);
+        P_ACCUM(rmsnorm);
+        P_START(lmhead);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
+        P_ACCUM(lmhead);
     }
 
     const int eos_id = m->eos_id;
@@ -6054,8 +6148,13 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
             return n_gen > 0 ? n_gen : -1;
         }
 
+        P_START(rmsnorm);
         atlas_rmsnorm_f32(h, norm_w, h_norm, H, 1e-6f);
+        P_ACCUM(rmsnorm);
+        P_START(lmhead);
         atlas_lmhead_gemv(m, h_norm, logits, 1);
+        P_ACCUM(lmhead);
+        PROF_ADD_TOKENS(1);
 
         if (n_gen < min_new_tokens) {
             if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
@@ -6074,7 +6173,9 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     atlas_vfree((uint8_t*)h_norm);
     atlas_vfree((uint8_t*)logits);
     atlas_vfree((uint8_t*)context);
+    PROF_ADD_TOKENS(1);
 
+    profile_print();
     return n_gen;
 }
 
