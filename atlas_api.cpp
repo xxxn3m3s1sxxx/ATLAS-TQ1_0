@@ -1929,6 +1929,13 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         float* f32_row = (float*)malloc(input_dim * sizeof(float));
         for (int r = 0; r < t.row_dim; r++) {
             for (int c = 0; c < t.packed_cols; c++) {
+                if (packed[r * t.packed_cols + c] == 121) {
+                    int col_start = c * 5;
+                    for (int t2 = 0; t2 < 5 && col_start + t2 < input_dim; t2++) {
+                        f32_row[col_start + t2] = 0.0f;
+                    }
+                    continue;
+                }
                 const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
                 for (int t2 = 0; t2 < 5; t2++) {
                     int col = c * 5 + t2;
@@ -1962,6 +1969,13 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
             int pos = 0;
             int sum = 0;
             for (int c = 0; c < t.packed_cols; c++) {
+                if (packed[r * t.packed_cols + c] == 121) {
+                    for (int t2 = 0; t2 < 5 && pos < input_dim; t2++) {
+                        i8[r * input_dim + pos] = 0;
+                        pos++;
+                    }
+                    continue;
+                }
                 const int8_t* l = tq1_decode[packed[r * t.packed_cols + c]];
                 for (int t2 = 0; t2 < 5; t2++) {
                     int col = c * 5 + t2;
@@ -3320,6 +3334,15 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
                 const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
                 int8_t* row = decode_buf + sub * input_dim;
                 for (int c = 0; c < packed_cols; c++) {
+                    if (w[c] == 121) {
+                        int col_base = c * 5;
+                        for (int t = 0; t < 5; t++) {
+                            int col = col_base + t;
+                            if (col >= input_dim) break;
+                            row[col] = 0;
+                        }
+                        continue;
+                    }
                     const int8_t* l = tq1_decode[w[c]];
                     for (int t = 0; t < 5; t++) {
                         int col = c * 5 + t;
@@ -3481,11 +3504,17 @@ static void matmul_tq1_block_fused_f32(int rows, int input_dim, int packed_cols,
         #pragma omp for
         #endif
         for (int ur = 0; ur < rows_packed; ur++) {
+            int null_byte_val = 121;
             for (int sub = 0; sub < 4; sub++) {
                 const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
                 int8_t* row = decode_buf + sub * input_dim;
                 int c = 0;
                 for (; c < packed_cols - 1; c++) {
+                    if (w[c] == null_byte_val) {
+                        int col = c * 5;
+                        row[col] = 0; row[col+1] = 0; row[col+2] = 0; row[col+3] = 0; row[col+4] = 0;
+                        continue;
+                    }
                     const int8_t* l = tq1_decode[w[c]];
                     int col = c * 5;
                     uint32_t v4 = (uint8_t)l[0] | ((uint32_t)(uint8_t)l[1] << 8) |
