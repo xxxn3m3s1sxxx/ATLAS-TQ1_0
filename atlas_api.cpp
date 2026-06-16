@@ -2134,8 +2134,7 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
 // ─── v2.8.0: Convert FFN int8 tensors to int4 (ttype=8) in-place ───
 // Halves memory bandwidth for FFN matmuls. Clip int8→int4, pack 2/byte.
 ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
-    // Split-mode: FFN int4 even when use_f32_matmul is true.
-    // QKV stays in f32_bypass for attention precision; FFN gets int4 bandwidth halving.
+    if (m->use_f32_matmul) return; // f32_bypass: full precision FFN, no int4
     int total = 0;
     for (size_t i = 0; i < m->tensors.size(); i++) {
         auto& t = m->tensors[i];
@@ -2159,11 +2158,9 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         int cols = (int)((ds - 2 - (int64_t)rows * 4) / rows);
         if (cols <= 0 || cols > 1000000) continue;
         
-        // Find actual max abs value for proper rescaling to int4 range [-7,7].
-        // ttype=3 weights from atlas_decompress_ttype5 span [-127,127] (per-tensor uniform scale).
-        // Naive clip to [-7,7] loses ~16× precision. We rescale: compute factor=7/max_abs,
-        // pack weights in [-7,7], and multiply fp16 scale by 127/factor = 127*max_abs/7
-        // so that dequant: weight_i4 * new_scale = weight_i8 * original_scale.
+        // Rescale int8 FFN weights to use full int4 range [-7,7].
+        // w_i4 = round(w_i8 * 7/max_abs), stored_scale = original_scale * max_abs/7
+        // so dequant: w_i4 * stored_scale = w_i8 * original_scale
         int n_vals = rows * cols;
         int i4_max = 7;
         int max_abs = 0;
@@ -2171,9 +2168,10 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
             int v = (int)i8[j]; if (v < 0) v = -v;
             if (v > max_abs) max_abs = v;
         }
-        float rescale = (max_abs > i4_max) ? (float)i4_max / (float)max_abs : 1.0f;
+        float pack_rescale = (max_abs > i4_max) ? (float)i4_max / (float)max_abs : 1.0f;
+        float scale_rescale = (max_abs > i4_max) ? (float)max_abs / (float)i4_max : 1.0f;
         uint16_t new_s16 = (max_abs > i4_max)
-            ? fp32_to_fp16(scale * rescale)  // kernel: weight_true = w_i4 / stored_scale, so stored_scale' = scale * 7/max_abs
+            ? fp32_to_fp16(scale * scale_rescale)
             : s16;
         
         int packed_cols = (cols + 1) / 2;
@@ -2195,8 +2193,8 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         for (int r = 0; r < rows; r++) {
             int sum = 0;
             for (int c = 0; c < cols; c += 2) {
-                float f0 = (float)i8[r * cols + c] * rescale;
-                float f1 = (c + 1 < cols) ? (float)i8[r * cols + c + 1] * rescale : 0.0f;
+                float f0 = (float)i8[r * cols + c] * pack_rescale;
+                float f1 = (c + 1 < cols) ? (float)i8[r * cols + c + 1] * pack_rescale : 0.0f;
                 int v0 = (int)(f0 >= 0.0f ? f0 + 0.5f : f0 - 0.5f);
                 int v1 = (int)(f1 >= 0.0f ? f1 + 0.5f : f1 - 0.5f);
                 
@@ -4976,7 +4974,7 @@ static void forward_layer_internal(
             get_tq1_packed(tu, wp, rows, dim, pc, scale);
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
         }
-    } else if (tg.ttype == 8) {  // Split-mode: int4 FFN even with f32_bypass
+    } else if (tg.ttype == 8 && !m->use_f32_matmul) {
         uint16_t gs16; memcpy(&gs16, tg.data, 2); float g_scale = fp16_to_fp32(gs16);
         uint16_t us16; memcpy(&us16, tu.data, 2); float u_scale = fp16_to_fp32(us16);
         int g_cols = tg.packed_cols * 2;
@@ -5391,7 +5389,7 @@ static void forward_layer_internal(
                 }
             }
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
-        } else if (td.ttype == 8) {  // Split-mode: int4 FFN even with f32_bypass
+        } else if (td.ttype == 8 && !m->use_f32_matmul) {
             uint16_t d16; memcpy(&d16, td.data, 2); float d_scale = fp16_to_fp32(d16);
             int d_cols = td.packed_cols * 2;
             const uint8_t* d_pw = td.data + 2;
