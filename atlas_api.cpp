@@ -99,6 +99,7 @@ static int check_avx2(void) {
 }
 #else
 #include <cpuid.h>
+#include <x86intrin.h>
 static int check_avx2(void) {
     unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
@@ -333,6 +334,16 @@ struct ProfileAccum {
     double t_rmsnorm = 0;
     double t_qkv = 0;
     double t_attention = 0;
+    // v2.12.0b: attention sub-section wall times
+    double t_attn_prep = 0;    // QK-Norm + RoPE + KV cache store
+    double t_attn_scores = 0;  // score computation (K dequant + Q·K)
+    double t_attn_softmax = 0; // causal mask + softmax
+    double t_attn_weighted = 0;// weighted sum (V dequant + accumulate)
+    // v2.12.0b: RDTSC micro-probes for dequant breakdown (per-thread)
+    uint64_t t_attn_block_cycles = 0;  // fp16 scale load per block
+    uint64_t t_attn_nibble_cycles = 0; // nibble unpack + sign extend
+    uint64_t t_attn_scale_cycles = 0;  // scale multiply 
+    uint64_t t_attn_fma_cycles = 0;    // FMA with query/value
     double t_o_proj = 0;  // O projection matmul + residual
     double t_ffn_gate_up = 0;
     double t_silu_down = 0;  // SiLU + down projection matmul + residual
@@ -348,6 +359,15 @@ static thread_local ProfileAccum g_prof;
 #define P_RESTART(name) _prof_##name = atlas_now()
 #define PROF_ADD_LAYERS(n) g_prof.n_layers += (n)
 #define PROF_ADD_TOKENS(n) g_prof.n_tokens += (n)
+
+// RDTSC micro-probes for int4 dequant breakdown
+#define TSC_START() uint64_t _tsc = __rdtsc()
+#define TSC_ACCUM(name) g_prof.t_attn_##name += (__rdtsc() - _tsc)
+#define TSC_RESTART(name) do { \
+    uint64_t _tsc_end = __rdtsc(); \
+    g_prof.t_attn_##name += (_tsc_end - _tsc); \
+    _tsc = _tsc_end; \
+} while(0)
 
 static void profile_reset() { g_prof = ProfileAccum(); }
 
@@ -365,9 +385,32 @@ static void profile_print() {
             1000.0 * g_prof.t_rmsnorm / (g_prof.n_layers * g_prof.n_tokens));
     fprintf(stderr, "  QKV matmul    %7.3fs (%5.1f%%)\n",
             g_prof.t_qkv, pct(g_prof.t_qkv));
-    fprintf(stderr, "  Attention     %7.3fs (%5.1f%%) — avg %.3fms/layer\n",
-            g_prof.t_attention, pct(g_prof.t_attention),
-            1000.0 * g_prof.t_attention / (g_prof.n_layers * g_prof.n_tokens));
+    double t_attn_detail = g_prof.t_attn_prep + g_prof.t_attn_scores + g_prof.t_attn_softmax + g_prof.t_attn_weighted;
+    if (t_attn_detail > 0.001) {
+        fprintf(stderr, "  Attention     %7.3fs (%5.1f%%) [prep %.3f scores %.3f smax %.3f weighted %.3f]\n",
+                g_prof.t_attention, pct(g_prof.t_attention),
+                g_prof.t_attn_prep, g_prof.t_attn_scores,
+                g_prof.t_attn_softmax, g_prof.t_attn_weighted);
+        uint64_t tot_cyc = g_prof.t_attn_block_cycles + g_prof.t_attn_nibble_cycles
+                         + g_prof.t_attn_scale_cycles + g_prof.t_attn_fma_cycles;
+        if (tot_cyc > 0) {
+            auto pct_cyc = [tot_cyc](uint64_t c) { return 100.0 * (double)c / (double)tot_cyc; };
+            fprintf(stderr, "    ├ dequant micro (main thread cycles): %.0fM total\n",
+                    (double)tot_cyc / 1e6);
+            fprintf(stderr, "    ├ block scale load: %llu (%5.1f%%)\n",
+                    g_prof.t_attn_block_cycles, pct_cyc(g_prof.t_attn_block_cycles));
+            fprintf(stderr, "    ├ nibble unpack:   %llu (%5.1f%%)\n",
+                    g_prof.t_attn_nibble_cycles, pct_cyc(g_prof.t_attn_nibble_cycles));
+            fprintf(stderr, "    ├ scale multiply:  %llu (%5.1f%%)\n",
+                    g_prof.t_attn_scale_cycles, pct_cyc(g_prof.t_attn_scale_cycles));
+            fprintf(stderr, "    └ FMA:             %llu (%5.1f%%)\n",
+                    g_prof.t_attn_fma_cycles, pct_cyc(g_prof.t_attn_fma_cycles));
+        }
+    } else {
+        fprintf(stderr, "  Attention     %7.3fs (%5.1f%%) — avg %.3fms/layer\n",
+                g_prof.t_attention, pct(g_prof.t_attention),
+                1000.0 * g_prof.t_attention / (g_prof.n_layers * g_prof.n_tokens));
+    }
     fprintf(stderr, "  O proj        %7.3fs (%5.1f%%)\n",
             g_prof.t_o_proj, pct(g_prof.t_o_proj));
     fprintf(stderr, "  FFN gate+up   %7.3fs (%5.1f%%)\n",
@@ -384,6 +427,9 @@ static void profile_print() {
 #define P_START(name)
 #define P_ACCUM(name)
 #define P_RESTART(name)
+#define TSC_START()
+#define TSC_ACCUM(name)
+#define TSC_RESTART(name)
 #define PROF_ADD_LAYERS(n)
 #define PROF_ADD_TOKENS(n)
 static void profile_reset() {}
@@ -2673,6 +2719,7 @@ ATLAS_API void atlas_attention_f32(
     float* scores = scores_buf;
 
     for (int b = 0; b < B; b++) {
+        P_START(attn_prep);
         int pos = positions[b];
         float* qb = q + b * n_heads * head_dim;
         float* kb = k + b * n_kv_heads * head_dim;
@@ -2778,7 +2825,9 @@ ATLAS_API void atlas_attention_f32(
                 }
             }
         }
+        P_ACCUM(attn_prep);
 
+        P_START(attn_scores);
         #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
             int kh = h / n_rep;
@@ -2791,23 +2840,29 @@ ATLAS_API void atlas_attention_f32(
                     int blk_start = blk * KV_BLOCK_SIZE;
                     int blk_end = blk_start + KV_BLOCK_SIZE;
                     if (blk_end > head_dim) blk_end = head_dim;
+                    TSC_START();
                     uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
                     float scale = fp16_to_fp32(sr);
                     __m256 scale_v = _mm256_set1_ps(scale);
+                    TSC_RESTART(block_cycles);
                     const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
                     int j = blk_start;
                     for (; j + 8 <= blk_end; j += 8) {
                         int nib_off = (j - blk_start) / 2;
+                        TSC_RESTART(nibble_cycles);
                         int32_t pw; memcpy(&pw, nb + nib_off, 4);
                         __m128i pack = _mm_cvtsi32_si128(pw);
                         __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
                         __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
                         __m128i inter = _mm_unpacklo_epi8(lo, hi);
                         inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                        TSC_RESTART(scale_cycles);
                         __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
                         __m256 qv = _mm256_loadu_ps(qh + j);
+                        TSC_RESTART(fma_cycles);
                         sum_v = _mm256_fmadd_ps(qv, wf, sum_v);
                     }
+                    TSC_ACCUM(fma_cycles);
                     for (; j < blk_end; j++) {
                         int nib_off = (j - blk_start) / 2;
                         int shft = ((j - blk_start) & 1) ? 4 : 0;
@@ -2820,7 +2875,9 @@ ATLAS_API void atlas_attention_f32(
                 scores[h * max_seq + s] = sum * inv_sqrt_d;
             }
         }
+        P_ACCUM(attn_scores);
 
+        P_START(attn_softmax);
         // Causal mask + softmax per head (ring_start + s = actual position)
         #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
@@ -2841,6 +2898,8 @@ ATLAS_API void atlas_attention_f32(
             float inv_sum = 1.0f / fmaxf(sum, 1e-10f);
             for (int s = 0; s < max_seq; s++) sh[s] *= inv_sum;
         }
+        P_ACCUM(attn_softmax);
+        P_START(attn_weighted);
         // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
         #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
@@ -2886,6 +2945,7 @@ ATLAS_API void atlas_attention_f32(
                 }
             }
         }
+        P_ACCUM(attn_weighted);
     }
 }
 
