@@ -59,15 +59,11 @@ void atlas_matmul_i4_vnni(int rows, int cols,
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
 
     #ifdef _OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(dynamic, 64)
     #endif
     for (int r = 0; r < rows; r++) {
         const uint8_t* pw = packed_weights + (int64_t)r * cols / 2;
         int sum_w = row_sums[r];
-
-        if (r + 2 < rows) {
-            _mm_prefetch((const char*)(packed_weights + (int64_t)(r + 2) * cols / 2), _MM_HINT_T1);
-        }
 
         for (int t = 0; t < n_tokens; t++) {
             const uint8_t* a = act_u8 + (int64_t)t * cols;

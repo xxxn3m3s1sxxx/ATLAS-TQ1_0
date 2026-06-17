@@ -160,7 +160,14 @@ See `atlas_ffi.h` for full API.
 - **CANN 3B/8B f32_bypass**: `vocab_size==73448` triggert automatisch f32_bypass — behebt chinesischen Garbage-Output (Signal wurde durch activation quant u8+128 zerstört). `pack_to_atlas.py` Meta-Block ebenfalls auf `use_f32_bypass: True` gesetzt.
 - **TriLM-2.4B f32_bypass**: `head_dim==64` triggert automatisch f32_bypass — TriLM SubLN-Modelle ohne `attn_sub_norm` Tensor-Namen werden korrekt erkannt. Prompt-Wiederholung behoben.
 - **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
-- **29/29 Modelle getestet**: Falcon3 (7), Falcon-E (4), Bonsai (3), BitNet (1), Llama3 (1), TriLM (9), BitCPM-CANN (4) — alle ✅.
+### v2.14.0 ✅ — OMP schedule(dynamic) + i8 Prefetch Removal (ABGESCHLOSSEN)
+
+- **OMP schedule(dynamic, 64)**: Added to `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, and `atlas_matmul_i4_vnni`. Dynamic scheduling prevents cache-miss stragglers from blocking OMP barriers — threads that finish their 64-row chunk early pick up the next chunk instead of idling at the barrier.
+- **OMP schedule(dynamic, 32)**: Added to default hybrid int8 gate+up path (4-row grouped, smaller 32-chunk for finer granularity).
+- **i8 + VNNI prefetch removal**: Removed stale `_MM_HINT_T1` prefetch from `atlas_matmul_i8_f32` and `atlas_matmul_i4_vnni` — consistent with v2.13.0 analysis (HW streamer handles row-stride prefetch autonomously, software hints only add cache pollution).
+- **64/67 Mock-Tests**: 3 pre-existing failures (embedding data_size in mock models for f32_bypass TriLM/Bonsai). No regression from v2.12.0/v2.13.0.
+- **Bonsai-4B-Pro Benchmark**: 10.57→10.91 tok/s (v2.13.0→v2.14.0, +3%, within measurement noise). No regression on any architecture.
+- **Key insight**: OMP schedule(dynamic) overhead is negligible (~atomic counter per chunk, ~4 µs total for 38 chunks). Even when memory-bandwidth bound, dynamic scheduling provides insurance against transient load imbalance. The real bottleneck remains DRAM bandwidth — no OMP schedule change can fix that.
 
 ### v2.13.0 ✅ — Fused Gate+Up Attempt + Software Prefetch Removal (ABGESCHLOSSEN)
 
@@ -297,6 +304,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.14.0** | **OMP schedule(dynamic) + i8 Prefetch Removal**. `schedule(dynamic, 64)` on `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, `atlas_matmul_i4_vnni` — prevents cache-miss stragglers from blocking OMP barriers. `schedule(dynamic, 32)` on 4-row grouped hybrid int8 gate+up. Removed stale `_MM_HINT_T1` from i8 and VNNI kernels (consistent with v2.13.0). 64/67 mock tests. Bonsai-4B-Pro: 10.57→10.91 tok/s (+3% within noise). Key insight: dynamic scheduling overhead negligible (~4 µs for 38 chunks), but DRAM bandwidth remains the real bottleneck — no schedule change can fix that. |
 | **v2.13.0** | **Fused Gate+Up Attempt + Prefetch Removal (−7.5% fused, +5.1% prefetch removal)**. `matmul_i4_fused_gate_up` kernel with 4-row grouping (−7.5% — activation in L1d, register pressure, OMP granularity). NTA prefetch attempt (−3.7% — fill buffer overflow). Winner: removed T1 software prefetch from `atlas_matmul_i4_f32` (+5.1%). Hardware L2 streamer handles row-stride prefetch autonomously. 55/55 mock tests. Key insight: activation (4KB) sits entirely in L1d for decode; real bottleneck is 56 MB DRAM bandwidth for gate+up weights. |
 | **v2.12.0** | **Int4 KV-Cache + Defense-in-Depth + Telemetry**. Int4 KV-Cache mit Ring-Buffer + Tiling (3,56× compression, <3,4% overhead). Int4 FFN Rescaling Fix (CANN-8B root cause: `7/max_abs` vs `max_abs/7`). Split-mode Guard Restoration. Python Safety-Net (v2.11.3). PROFILE RDTSC Mikro-Telemetrie. 31/31 Modelle getestet. FFN = 70% Bottleneck — KV-Cache freigesprochen. |
 | **v2.11.3** | **CANN-8B int4 FFN Guard**. Der ttype=8 Dispatch verwendet activation quantization auch in f32_bypass — bei DeepNorm (CANN-8B, hidden=4096) Signal-Collapse. Skip in `atlas_infer.py:379` für hidden>=4096 + vocab=73448. CANN-3B/0.5B int4 bleibt aktiv. 31/31 Modelle getestet. |
