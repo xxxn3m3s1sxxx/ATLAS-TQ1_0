@@ -372,7 +372,13 @@ class AtlasModel:
                     if _HAS_TTYPE7_DECOMPRESS:
                         dll.atlas_decompress_ttype7(self.model_ptr)
                     dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
-                    if _HAS_FFN_I4:
+                    # v2.11.3: Skip int4 FFN for CANN-8B (hidden=4096) — int4 matmul kernel
+                    # produces wrong results with large row dimensions (16384+ rows in down_proj).
+                    # The ttype=8 dispatch always uses activation quantization even in f32_bypass
+                    # mode, which corrupts DeepNorm signal for large hidden sizes.
+                    # Note: _is_cann not yet set here, use raw vocab_size check (CANN=73448)
+                    skip_i4 = self.hidden >= 4096 and self.vocab_size == 73448
+                    if _HAS_FFN_I4 and not skip_i4:
                         dll.atlas_quantize_ffn_to_i4(self.model_ptr)
                     dll.atlas_prefetch_int8(self.model_ptr)
                 else:

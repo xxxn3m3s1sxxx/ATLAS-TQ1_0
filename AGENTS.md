@@ -162,6 +162,11 @@ See `atlas_ffi.h` for full API.
 - **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
 - **29/29 Modelle getestet**: Falcon3 (7), Falcon-E (4), Bonsai (3), BitNet (1), Llama3 (1), TriLM (9), BitCPM-CANN (4) — alle ✅.
 
+### v2.11.3 ✅ — CANN-8B int4 FFN Guard (ABGESCHLOSSEN, kein C++ Build)
+- **CANN-8B int4 FFN deaktiviert**: Der ttype=8 Dispatch in `forward_layer_internal` verwendet immer activation quantization, auch im f32_bypass-Mode. Bei DeepNorm-Architekturen (CANN-8B, hidden=4096) wird das Signal zerstört. Fix: `atlas_infer.py:379` überspringt `atlas_quantize_ffn_to_i4` für hidden>=4096 + vocab=73448.
+- **CANN-3B/0.5B**: int4 FFN bleibt aktiv (hidden=2560/1024, kein Signal-Collapse). ✅ Beide getestet.
+- **31/31 Modelle getestet**: CANN-8B "Paris." korrekt, CANN-3B "Paris." korrekt. 29 weitere per Regression.
+
 ### v2.10.6 ✅ — OOM Error Propagation (Signal Chain) (ABGESCHLOSSEN)
 - **`ensure_cache` → `bool`**: Allocate both k/v caches before freeing old, `cache_max_seq_len` updated only on success. Safe partial free on failure.
 - **`ensure_buffers` → `bool`**: All 7 scratch buffers allocated before freeing old, `max_batch` updated only on success. Safe partial free on failure.
@@ -273,6 +278,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.11.3** | **CANN-8B int4 FFN Guard**. Der ttype=8 Dispatch verwendet activation quantization auch in f32_bypass — bei DeepNorm (CANN-8B, hidden=4096) Signal-Collapse. Skip in `atlas_infer.py:379` für hidden>=4096 + vocab=73448. CANN-3B/0.5B int4 bleibt aktiv. 31/31 Modelle getestet. |
 | **v2.11.2** | **Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix**. CANN 3B/8B f32_bypass via vocab=73448. TriLM-2.4B f32_bypass via head_dim=64. Llama3 Base: kein Chat-Template. 29/29 Modelle getestet. |
 | **v2.11.1** | **Kernel Cleanup + tritplane3 Dok**. `ternary_tensors`-Infrastruktur entfernt (pre-ternarized path in `quantize_tq1_block_scaled`, `extract_ternary_and_fp32`, lookup + pre-shuffle in packer). `docs/double-quant.md`: Warum tritplane3 + TQ1.0 Signal-Collapse produziert (48% Gesamtfehler), per-row int8 als einzig stabile Brücke. `pack_to_atlas.py`: 92 Zeilen entfernt. Benchmark bestätigt: Bonsai-1.7B (7.8 tok/s), Bonsai-4B (3.0 tok/s), tritplane→per-row int8 (7.1-8.4 tok/s). |
 | **v2.11.0** | **Falcon-E Edge + TriLM Full Series + CI Hardening**. Falcon-E 1B/3B Base+Instruct TQ1.0 (BitNet 1.58 arch). TriLM 99M–560M added (9-model series). CANN dual EOS, thread_local block scales, relaxed QK-Norm guard. README: TriLM, Falcon-E, Llama3-8B-1.58 entries. CI: sanitizer-build (ASan+UBSan), coverage gates, pip cache, fail-fast, macOS fix, release_to_hf.py Falcon-E support. 58/58 mock tests across 9 architectures. |
