@@ -160,6 +160,16 @@ See `atlas_ffi.h` for full API.
 - **CANN 3B/8B f32_bypass**: `vocab_size==73448` triggert automatisch f32_bypass — behebt chinesischen Garbage-Output (Signal wurde durch activation quant u8+128 zerstört). `pack_to_atlas.py` Meta-Block ebenfalls auf `use_f32_bypass: True` gesetzt.
 - **TriLM-2.4B f32_bypass**: `head_dim==64` triggert automatisch f32_bypass — TriLM SubLN-Modelle ohne `attn_sub_norm` Tensor-Namen werden korrekt erkannt. Prompt-Wiederholung behoben.
 - **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
+### v2.16.0 ✅ — Triangular Tiled Weighted Sum (WEIGHTED SUM TILING GELIEFERT)
+
+- **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d).
+- **B=1024 weighted sum improvement**: **57.7s → 89.7s baseline** (−35.7%). Scores unchanged (286.9s, within noise of v2.15.0).
+- **Total prefill improvement**: **656.1s → 908.4s baseline** (−27.8%). Combined scores + weighted sum tiling.
+- **Bonsai-4B-Pro decode**: 12.02 tok/s median (within noise of v2.15.0 12.65). Weighted sum is negligible at B=1.
+- **Softmax causal mask redundancy removed**: SKIP/PARTIAL positions carry `-1e9f` from scores buffer initialization — no `ring_start + s` computation or `attn_pos > pos` branch in max-reduction pass.
+- **64/67 Mock-Tests**: Same 3 pre-existing f32_bypass failures. No regression from v2.15.0.
+- **Key insight**: Weighted sum is V-cache bandwidth bound. Tiling eliminates ~49% of V-cache reads (future position tiles) and uses the remaining tiles' V-cache from L1d. Output-init once per tile avoids redundant zero-initialization.
+
 ### v2.15.0 ✅ — Triangular Tiled Attention (ATTENTION TILING GELIEFERT)
 
 - **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens.
@@ -305,6 +315,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.16.0** | **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d). B=1024: weighted sum 57.7s (−35.7% from baseline). Total 656.1s (−27.8% from baseline). 64/67 mock tests. |
 | **v2.15.0** | **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens. Per-query thread-local scores buffer initialized to -1e9f — SKIP/PARTIAL stay masked. B=1024: scores 292s (−43.1%), total 664s (−26.9%). Bonsai-4B-Pro decode: 12.65 tok/s (+16%). 64/67 mock tests. |
 | **v2.14.0** | **OMP schedule(dynamic) + i8 Prefetch Removal**. `schedule(dynamic, 64)` on `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, `atlas_matmul_i4_vnni` — prevents cache-miss stragglers from blocking OMP barriers. `schedule(dynamic, 32)` on 4-row grouped hybrid int8 gate+up. Removed stale `_MM_HINT_T1` from i8 and VNNI kernels (consistent with v2.13.0). 64/67 mock tests. Bonsai-4B-Pro: 10.57→10.91 tok/s (+3% within noise). Key insight: dynamic scheduling overhead negligible (~4 µs for 38 chunks), but DRAM bandwidth remains the real bottleneck — no schedule change can fix that. |
 | **v2.13.0** | **Fused Gate+Up Attempt + Prefetch Removal (−7.5% fused, +5.1% prefetch removal)**. `matmul_i4_fused_gate_up` kernel with 4-row grouping (−7.5% — activation in L1d, register pressure, OMP granularity). NTA prefetch attempt (−3.7% — fill buffer overflow). Winner: removed T1 software prefetch from `atlas_matmul_i4_f32` (+5.1%). Hardware L2 streamer handles row-stride prefetch autonomously. 55/55 mock tests. Key insight: activation (4KB) sits entirely in L1d for decode; real bottleneck is 56 MB DRAM bandwidth for gate+up weights. |
