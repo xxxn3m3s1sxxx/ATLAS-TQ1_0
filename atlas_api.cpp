@@ -2517,10 +2517,10 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
         const uint8_t* pw = packed_weights + r * cols / 2;
         int sum_w = row_sums[r];
 
-        // Cross-row prefetch: next 2 weight rows in L2
-        if (r + 2 < rows) {
-            _mm_prefetch((const char*)(packed_weights + (r + 2) * cols / 2), _MM_HINT_T1);
-        }
+        // v2.13.0: Let hardware streamer handle row-stride prefetch.
+        // T1/NTA software prefetch adds no benefit (confirmed A/B).
+        // The L2 streamer on Kaby Lake detects 2048-byte strides after
+        // 2-3 rows and auto-prefetches row+1/row+2 into L2.
 
         for (int t = 0; t < n_tokens; t++) {
             const uint8_t* a = act_u8 + t * cols;

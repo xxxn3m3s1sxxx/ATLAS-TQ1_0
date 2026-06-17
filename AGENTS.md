@@ -162,6 +162,14 @@ See `atlas_ffi.h` for full API.
 - **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
 - **29/29 Modelle getestet**: Falcon3 (7), Falcon-E (4), Bonsai (3), BitNet (1), Llama3 (1), TriLM (9), BitCPM-CANN (4) — alle ✅.
 
+### v2.13.0 ✅ — Fused Gate+Up Attempt + Software Prefetch Removal (ABGESCHLOSSEN)
+
+- **Fused gate+up kernel attempted (−7.5%, reverted)**: `matmul_i4_fused_gate_up` with 4-row grouping and 8 YMM accumulators. Slower because activation is already in L1d (4KB → zero-cost reload) and fused kernel increases register pressure + coarsens OMP granularity (14336→3584 iterations). Reverted to v2.12.0.
+- **NTA prefetch attempted (−3.7%, reverted)**: `_MM_HINT_NTA` at row+4. Worse because NTA fill buffers (10 per core) overflow with 32 cache lines per row.
+- **Software prefetch removed (+5.1%, shipping)**: Deleted the `_MM_HINT_T1` prefetch of row+2 from `atlas_matmul_i4_f32`. The Kaby Lake L2 streamer detects the 2048-byte row stride after 2-3 rows and auto-prefetches row+1/row+2 — software prefetch was polluting L2 with streaming data that's never reused.
+- **Key insight**: For decode (B=1), activation (4KB) fits entirely in L1d — reload is free. The real bottleneck is DRAM bandwidth for the 56 MB of gate+up weights. The hardware prefetcher already handles sequential row access optimally; software hints only add cache pollution.
+- **55/55 Mock-Tests grün**: Keine Regression. v2.13.0 = v2.12.0 + prefetch removal only.
+
 ### v2.12.0 ✅ — Int4 KV-Cache + Defense-in-Depth + Telemetry (ABGESCHLOSSEN)
 
 - **Int4 KV-Cache**: KV-Cache von fp16 auf int4 (per-block fp16 scale, KV_BLOCK_SIZE=16). 3,56× Speicherkompression bei vernachlässigbarem Performance-Impact. Ring-Buffer + paralleles Tiling in der Attention.
@@ -289,6 +297,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.13.0** | **Fused Gate+Up Attempt + Prefetch Removal (−7.5% fused, +5.1% prefetch removal)**. `matmul_i4_fused_gate_up` kernel with 4-row grouping (−7.5% — activation in L1d, register pressure, OMP granularity). NTA prefetch attempt (−3.7% — fill buffer overflow). Winner: removed T1 software prefetch from `atlas_matmul_i4_f32` (+5.1%). Hardware L2 streamer handles row-stride prefetch autonomously. 55/55 mock tests. Key insight: activation (4KB) sits entirely in L1d for decode; real bottleneck is 56 MB DRAM bandwidth for gate+up weights. |
 | **v2.12.0** | **Int4 KV-Cache + Defense-in-Depth + Telemetry**. Int4 KV-Cache mit Ring-Buffer + Tiling (3,56× compression, <3,4% overhead). Int4 FFN Rescaling Fix (CANN-8B root cause: `7/max_abs` vs `max_abs/7`). Split-mode Guard Restoration. Python Safety-Net (v2.11.3). PROFILE RDTSC Mikro-Telemetrie. 31/31 Modelle getestet. FFN = 70% Bottleneck — KV-Cache freigesprochen. |
 | **v2.11.3** | **CANN-8B int4 FFN Guard**. Der ttype=8 Dispatch verwendet activation quantization auch in f32_bypass — bei DeepNorm (CANN-8B, hidden=4096) Signal-Collapse. Skip in `atlas_infer.py:379` für hidden>=4096 + vocab=73448. CANN-3B/0.5B int4 bleibt aktiv. 31/31 Modelle getestet. |
 | **v2.11.2** | **Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix**. CANN 3B/8B f32_bypass via vocab=73448. TriLM-2.4B f32_bypass via head_dim=64. Llama3 Base: kein Chat-Template. 29/29 Modelle getestet. |
