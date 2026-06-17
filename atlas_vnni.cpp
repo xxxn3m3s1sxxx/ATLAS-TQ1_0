@@ -58,65 +58,61 @@ void atlas_matmul_i4_vnni(int rows, int cols,
     const __m256i c8 = _mm256_set1_epi8(8);
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
 
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 64)
-    #endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t* pw = packed_weights + (int64_t)r * cols / 2;
-        int sum_w = row_sums[r];
+    const int TILE_B = 8;
+    for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
+        int t_end = t0 + TILE_B;
+        if (t_end > n_tokens) t_end = n_tokens;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 64)
+        #endif
+        for (int r = 0; r < rows; r++) {
+            const uint8_t* pw = packed_weights + (int64_t)r * cols / 2;
+            int sum_w = row_sums[r];
 
-        for (int t = 0; t < n_tokens; t++) {
-            const uint8_t* a = act_u8 + (int64_t)t * cols;
-            int c = 0;
-            int dot = 0;
-            __m512i acc = _mm512_setzero_si512();
+            for (int t = t0; t < t_end; t++) {
+                const uint8_t* a = act_u8 + (int64_t)t * cols;
+                int c = 0;
+                int dot = 0;
+                __m512i acc = _mm512_setzero_si512();
 
-            // Process 64 elements per iteration
-            for (; c + 64 <= cols; c += 64) {
-                int pc = c / 2; // 64 nibbles = 32 bytes
-                // Nibble-unpack: 32 packed bytes → 2× sign-extended int8 vectors (256-bit)
-                __m256i packed = _mm256_loadu_si256((const __m256i*)(pw + pc));
-                __m256i low  = _mm256_and_si256(packed, mask_0f);
-                __m256i high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_0f);
-                // Sign-extend 4-bit to int8: (nibble ^ 8) - 8
-                __m256i w_low_s  = _mm256_sub_epi8(_mm256_xor_si256(low,  c8), c8);
-                __m256i w_high_s = _mm256_sub_epi8(_mm256_xor_si256(high, c8), c8);
-                // Interleave low/high → contiguous [w0..w63]
-                __m256i wt_lo = _mm256_unpacklo_epi8(w_low_s, w_high_s);
-                __m256i wt_hi = _mm256_unpackhi_epi8(w_low_s, w_high_s);
-                __m256i w_lo  = _mm256_permute2f128_si256(wt_lo, wt_hi, 0x20);
-                __m256i w_hi  = _mm256_permute2f128_si256(wt_lo, wt_hi, 0x31);
-                // Combine → 512-bit weights vector (signed int8)
-                __m512i w512 = _mm512_inserti64x4(_mm512_castsi256_si512(w_lo), w_hi, 1);
-                // Load 64 activation bytes (uint8)
-                __m512i a512 = _mm512_loadu_si512((const __m512i*)(a + c));
-                // VNNI: uint8(act) × int8(w) → int32 accumulate
-                acc = _mm512_dpbusd_epi32(acc, a512, w512);
+                for (; c + 64 <= cols; c += 64) {
+                    int pc = c / 2;
+                    __m256i packed = _mm256_loadu_si256((const __m256i*)(pw + pc));
+                    __m256i low  = _mm256_and_si256(packed, mask_0f);
+                    __m256i high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_0f);
+                    __m256i w_low_s  = _mm256_sub_epi8(_mm256_xor_si256(low,  c8), c8);
+                    __m256i w_high_s = _mm256_sub_epi8(_mm256_xor_si256(high, c8), c8);
+                    __m256i wt_lo = _mm256_unpacklo_epi8(w_low_s, w_high_s);
+                    __m256i wt_hi = _mm256_unpackhi_epi8(w_low_s, w_high_s);
+                    __m256i w_lo  = _mm256_permute2f128_si256(wt_lo, wt_hi, 0x20);
+                    __m256i w_hi  = _mm256_permute2f128_si256(wt_lo, wt_hi, 0x31);
+                    __m512i w512 = _mm512_inserti64x4(_mm512_castsi256_si512(w_lo), w_hi, 1);
+                    __m512i a512 = _mm512_loadu_si512((const __m512i*)(a + c));
+                    acc = _mm512_dpbusd_epi32(acc, a512, w512);
+                }
+
+                __m256i lo = _mm512_castsi512_si256(acc);
+                __m256i hi = _mm512_extracti64x4_epi64(acc, 1);
+                __m256i s256 = _mm256_add_epi32(lo, hi);
+                __m128i l128 = _mm256_castsi256_si128(s256);
+                __m128i h128 = _mm256_extracti128_si256(s256, 1);
+                __m128i s128 = _mm_add_epi32(l128, h128);
+                s128 = _mm_hadd_epi32(s128, s128);
+                s128 = _mm_hadd_epi32(s128, s128);
+                dot = _mm_cvtsi128_si32(s128);
+
+                for (; c < cols; c++) {
+                    int packed_idx = ((int64_t)r * cols + c) / 2;
+                    int nibble = (c & 1)
+                        ? (packed_weights[packed_idx] >> 4)
+                        : (packed_weights[packed_idx] & 0x0F);
+                    int8_t w_val = (int8_t)((nibble ^ 8) - 8);
+                    dot += (int)a[c] * (int)w_val;
+                }
+
+                int result = dot - 128 * sum_w;
+                output[(int64_t)t * rows + r] = (float)result;
             }
-
-            // Horizontal sum of 16 int32 values
-            __m256i lo = _mm512_castsi512_si256(acc);
-            __m256i hi = _mm512_extracti64x4_epi64(acc, 1);
-            __m256i s256 = _mm256_add_epi32(lo, hi);
-            __m128i l128 = _mm256_castsi256_si128(s256);
-            __m128i h128 = _mm256_extracti128_si256(s256, 1);
-            __m128i s128 = _mm_add_epi32(l128, h128);
-            s128 = _mm_hadd_epi32(s128, s128);
-            s128 = _mm_hadd_epi32(s128, s128);
-            dot = _mm_cvtsi128_si32(s128);
-
-            // Tail (< 64 elements): scalar nibble-unpack
-            for (; c < cols; c++) {
-                int packed_idx = ((int64_t)r * cols + c) / 2;
-                int nibble = (c & 1)
-                    ? (packed_weights[packed_idx] >> 4)
-                    : (packed_weights[packed_idx] & 0x0F);
-                int8_t w_val = (int8_t)((nibble ^ 8) - 8);
-                dot += (int)a[c] * (int)w_val;
-            }
-
-            int result = dot - 128 * sum_w;
-            output[(int64_t)t * rows + r] = (float)result;
         }
     }
 }

@@ -2436,49 +2436,49 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                                     const int32_t* __restrict__ row_sums,
                                     float* __restrict__ output,
                                     int n_tokens) {
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 64)
-    #endif
-    for (int r = 0; r < rows; r++) {
-        const int8_t* w = weights + r * input_dim;
-        int sum_w = row_sums[r];
+    const int TILE_B = 8;
+    for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
+        int t_end = t0 + TILE_B;
+        if (t_end > n_tokens) t_end = n_tokens;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 64)
+        #endif
+        for (int r = 0; r < rows; r++) {
+            const int8_t* w = weights + r * input_dim;
+            int sum_w = row_sums[r];
 
-        for (int t = 0; t < n_tokens; t++) {
-            const uint8_t* a = act_u8 + t * input_dim;
+            for (int t = t0; t < t_end; t++) {
+                const uint8_t* a = act_u8 + t * input_dim;
 
-            int c = 0;
-            int dot = 0;
+                int c = 0;
+                int dot = 0;
 
-            // AVX2: 32 bytes per iteration → 16 pairs via maddubs → 8 int32 via madd
-            __m256i acc = _mm256_setzero_si256();
+                __m256i acc = _mm256_setzero_si256();
 
-            for (; c + 32 <= input_dim; c += 32) {
-                __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
-                __m256i wi = _mm256_loadu_si256((const __m256i*)(w + c));
-                __m256i prod16 = _mm256_maddubs_epi16(au, wi);
-                __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
-                acc = _mm256_add_epi32(acc, prod32);
+                for (; c + 32 <= input_dim; c += 32) {
+                    __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
+                    __m256i wi = _mm256_loadu_si256((const __m256i*)(w + c));
+                    __m256i prod16 = _mm256_maddubs_epi16(au, wi);
+                    __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+                    acc = _mm256_add_epi32(acc, prod32);
+                }
+
+                __m128i lo = _mm256_castsi256_si128(acc);
+                __m128i hi = _mm256_extracti128_si256(acc, 1);
+                __m128i sum128 = _mm_add_epi32(lo, hi);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                dot = _mm_cvtsi128_si32(sum128);
+
+                for (; c < input_dim; c++) {
+                    dot += (int)a[c] * (int)w[c];
+                }
+
+                int result = dot - 128 * sum_w;
+                output[t * rows + r] = (float)result;
             }
-
-            // Horizontal sum of acc
-            __m128i lo = _mm256_castsi256_si128(acc);
-            __m128i hi = _mm256_extracti128_si256(acc, 1);
-            __m128i sum128 = _mm_add_epi32(lo, hi);
-            sum128 = _mm_hadd_epi32(sum128, sum128);
-            sum128 = _mm_hadd_epi32(sum128, sum128);
-            dot = _mm_cvtsi128_si32(sum128);
-
-            // Tail (less than 32 elements)
-            for (; c < input_dim; c++) {
-                dot += (int)a[c] * (int)w[c];
-            }
-
-            // Undo 128 offset: dot' = dot - 128 * Σ w_i
-            int result = dot - 128 * sum_w;
-            output[t * rows + r] = (float)result;
         }
     }
-
 }
 
 // ─── int4×uint8 matmul: nibble unpack + vpmaddubs + sign-extend ──────
@@ -2492,94 +2492,81 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
                                     const int32_t* __restrict__ row_sums,
                                     float* __restrict__ output,
                                     int n_tokens) {
-    // v2.10.0: VNNI fast path — skips AVX2 nibble-unpack + vpmaddubsw chain
     if (atlas_vnni_available()) {
         atlas_matmul_i4_vnni(rows, cols, packed_weights, act_u8, row_sums, output, n_tokens);
         return;
     }
 
-    // Sign-extension for 4-bit nibble: freq = (nibble ^ 8) - 8
-    // Maps 0..15 → -8..+7 with signed overflow for val >= 8
-    // __m256i version: _mm256_sub_epi8(_mm256_xor_si256(v, c8), c8)
     const __m256i c8 = _mm256_set1_epi8(8);
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
 
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 64)
-    #endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t* pw = packed_weights + r * cols / 2;
-        int sum_w = row_sums[r];
+    const int TILE_B = 8;
+    for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
+        int t_end = t0 + TILE_B;
+        if (t_end > n_tokens) t_end = n_tokens;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 64)
+        #endif
+        for (int r = 0; r < rows; r++) {
+            const uint8_t* pw = packed_weights + r * cols / 2;
+            int sum_w = row_sums[r];
 
-        for (int t = 0; t < n_tokens; t++) {
-            const uint8_t* a = act_u8 + t * cols;
+            for (int t = t0; t < t_end; t++) {
+                const uint8_t* a = act_u8 + t * cols;
 
-            int c = 0;
-            int dot = 0;
-            __m256i acc = _mm256_setzero_si256();
+                int c = 0;
+                int dot = 0;
+                __m256i acc = _mm256_setzero_si256();
 
-            // Process 64 elements per iteration: 32 packed bytes → 2×32 int8 weights
-            for (; c + 64 <= cols; c += 64) {
-                int pc = c / 2;
-                __m256i packed = _mm256_loadu_si256((const __m256i*)(pw + pc));
+                for (; c + 64 <= cols; c += 64) {
+                    int pc = c / 2;
+                    __m256i packed = _mm256_loadu_si256((const __m256i*)(pw + pc));
 
-                // Low nibbles: mask lower 4 bits of each byte
-                __m256i low = _mm256_and_si256(packed, mask_0f);
-                // High nibbles: shift right 4 bits per 16-bit word, then mask
-                __m256i high = _mm256_and_si256(
-                    _mm256_srli_epi16(packed, 4), mask_0f);
+                    __m256i low = _mm256_and_si256(packed, mask_0f);
+                    __m256i high = _mm256_and_si256(
+                        _mm256_srli_epi16(packed, 4), mask_0f);
 
-                // Sign-extend 4-bit to int8: (nibble ^ 8) - 8
-                __m256i w_low_s = _mm256_sub_epi8(
-                    _mm256_xor_si256(low, c8), c8);
-                __m256i w_high_s = _mm256_sub_epi8(
-                    _mm256_xor_si256(high, c8), c8);
+                    __m256i w_low_s = _mm256_sub_epi8(
+                        _mm256_xor_si256(low, c8), c8);
+                    __m256i w_high_s = _mm256_sub_epi8(
+                        _mm256_xor_si256(high, c8), c8);
 
-                // Interleave low/high back to contiguous: [v0,v1,v2,...,v63]
-                // _mm256_unpack* operates per 128-bit lane, so lanes need fixing:
-                // unpacklo → [v0..v15](lane0) + [v32..v47](lane1)
-                // unpackhi → [v16..v31](lane0) + [v48..v63](lane1)
-                __m256i w_tmp_lo = _mm256_unpacklo_epi8(w_low_s, w_high_s);
-                __m256i w_tmp_hi = _mm256_unpackhi_epi8(w_low_s, w_high_s);
-                // permute2f128: 0x20 = lane0(v0..v15) + lane0(v16..v31) = [v0..v31]
-                //              0x31 = lane1(v32..v47) + lane1(v48..v63) = [v32..v63]
-                __m256i w_lo = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x20);
-                __m256i w_hi = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x31);
+                    __m256i w_tmp_lo = _mm256_unpacklo_epi8(w_low_s, w_high_s);
+                    __m256i w_tmp_hi = _mm256_unpackhi_epi8(w_low_s, w_high_s);
+                    __m256i w_lo = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x20);
+                    __m256i w_hi = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x31);
 
-                // activations[c..c+31] × weights[0..31]
-                __m256i a0 = _mm256_loadu_si256((const __m256i*)(a + c));
-                __m256i p16_0 = _mm256_maddubs_epi16(a0, w_lo);
-                __m256i p32_0 = _mm256_madd_epi16(p16_0, ones16);
-                acc = _mm256_add_epi32(acc, p32_0);
+                    __m256i a0 = _mm256_loadu_si256((const __m256i*)(a + c));
+                    __m256i p16_0 = _mm256_maddubs_epi16(a0, w_lo);
+                    __m256i p32_0 = _mm256_madd_epi16(p16_0, ones16);
+                    acc = _mm256_add_epi32(acc, p32_0);
 
-                // activations[c+32..c+63] × weights[32..63]
-                __m256i a1 = _mm256_loadu_si256((const __m256i*)(a + c + 32));
-                __m256i p16_1 = _mm256_maddubs_epi16(a1, w_hi);
-                __m256i p32_1 = _mm256_madd_epi16(p16_1, ones16);
-                acc = _mm256_add_epi32(acc, p32_1);
+                    __m256i a1 = _mm256_loadu_si256((const __m256i*)(a + c + 32));
+                    __m256i p16_1 = _mm256_maddubs_epi16(a1, w_hi);
+                    __m256i p32_1 = _mm256_madd_epi16(p16_1, ones16);
+                    acc = _mm256_add_epi32(acc, p32_1);
+                }
+
+                __m128i lo = _mm256_castsi256_si128(acc);
+                __m128i hi = _mm256_extracti128_si256(acc, 1);
+                __m128i sum128 = _mm_add_epi32(lo, hi);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                sum128 = _mm_hadd_epi32(sum128, sum128);
+                dot = _mm_cvtsi128_si32(sum128);
+
+                for (; c < cols; c++) {
+                    int packed_idx = (r * cols + c) / 2;
+                    int nibble = (c & 1)
+                        ? (packed_weights[packed_idx] >> 4)
+                        : (packed_weights[packed_idx] & 0x0F);
+                    int8_t w_val = (int8_t)((nibble ^ 8) - 8);
+                    dot += (int)a[c] * (int)w_val;
+                }
+
+                int result = dot - 128 * sum_w;
+                output[t * rows + r] = (float)result;
             }
-
-            // Horizontal sum of acc
-            __m128i lo = _mm256_castsi256_si128(acc);
-            __m128i hi = _mm256_extracti128_si256(acc, 1);
-            __m128i sum128 = _mm_add_epi32(lo, hi);
-            sum128 = _mm_hadd_epi32(sum128, sum128);
-            sum128 = _mm_hadd_epi32(sum128, sum128);
-            dot = _mm_cvtsi128_si32(sum128);
-
-            // Tail (< 64 elements): nibble unpack + sign-extend scalar
-            for (; c < cols; c++) {
-                int packed_idx = (r * cols + c) / 2;
-                int nibble = (c & 1)
-                    ? (packed_weights[packed_idx] >> 4)
-                    : (packed_weights[packed_idx] & 0x0F);
-                int8_t w_val = (int8_t)((nibble ^ 8) - 8);
-                dot += (int)a[c] * (int)w_val;
-            }
-
-            int result = dot - 128 * sum_w;
-            output[t * rows + r] = (float)result;
         }
     }
 }
@@ -2818,65 +2805,138 @@ ATLAS_API void atlas_attention_f32(
         P_ACCUM(attn_prep);
 
         P_START(attn_scores);
-        #pragma omp parallel for
-        for (int h = 0; h < n_heads; h++) {
-            int kh = h / n_rep;
-            for (int s = 0; s < ring_len; s++) {
-                int cache_idx = (ring_start + s) % max_seq_len;
-                const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+
+        const int TILE_S = 32;
+
+        {
+
+            __m256 neg_inf = _mm256_set1_ps(-1e9f);
+            int total = n_heads * max_seq;
+            int i = 0;
+            for (; i + 8 <= total; i += 8)
+                _mm256_storeu_ps(scores + i, neg_inf);
+            for (; i < total; i++)
+                scores[i] = -1e9f;
+        }
+
+        for (int s0 = 0; s0 < ring_len; s0 += TILE_S) {
+            int s1 = s0 + TILE_S;
+            if (s1 > ring_len) s1 = ring_len;
+            int key_pos_start = ring_start + s0;
+            int key_pos_end = ring_start + s1 - 1;
+
+            if (key_pos_start > pos) break;
+
+            bool all_past = (key_pos_end <= pos);
+
+            #pragma omp parallel for
+            for (int h = 0; h < n_heads; h++) {
+                int kh = h / n_rep;
                 const float* qh = qb + h * head_dim;
-                __m256 sum_v = _mm256_setzero_ps();
-                for (int blk = 0; blk < n_blk; blk++) {
-                    int blk_start = blk * KV_BLOCK_SIZE;
-                    int blk_end = blk_start + KV_BLOCK_SIZE;
-                    if (blk_end > head_dim) blk_end = head_dim;
-                    TSC_START();
-                    uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
-                    float scale = fp16_to_fp32(sr);
-                    __m256 scale_v = _mm256_set1_ps(scale);
-                    TSC_RESTART(block_cycles);
-                    const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
-                    int j = blk_start;
-                    for (; j + 8 <= blk_end; j += 8) {
-                        int nib_off = (j - blk_start) / 2;
-                        TSC_RESTART(nibble_cycles);
-                        int32_t pw; memcpy(&pw, nb + nib_off, 4);
-                        __m128i pack = _mm_cvtsi32_si128(pw);
-                        __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
-                        __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
-                        __m128i inter = _mm_unpacklo_epi8(lo, hi);
-                        inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
-                        TSC_RESTART(scale_cycles);
-                        __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
-                        __m256 qv = _mm256_loadu_ps(qh + j);
-                        TSC_RESTART(fma_cycles);
-                        sum_v = _mm256_fmadd_ps(qv, wf, sum_v);
+                float* sh = scores + h * max_seq;
+
+                if (all_past) {
+                    for (int s = s0; s < s1; s++) {
+                        int cache_idx = (ring_start + s) % max_seq_len;
+                        const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                        __m256 sum_v = _mm256_setzero_ps();
+                        for (int blk = 0; blk < n_blk; blk++) {
+                            int blk_start = blk * KV_BLOCK_SIZE;
+                            int blk_end = blk_start + KV_BLOCK_SIZE;
+                            if (blk_end > head_dim) blk_end = head_dim;
+                            TSC_START();
+                            uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                            float scale = fp16_to_fp32(sr);
+                            __m256 scale_v = _mm256_set1_ps(scale);
+                            TSC_RESTART(block_cycles);
+                            const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                            int j = blk_start;
+                            for (; j + 8 <= blk_end; j += 8) {
+                                int nib_off = (j - blk_start) / 2;
+                                TSC_RESTART(nibble_cycles);
+                                int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                __m128i pack = _mm_cvtsi32_si128(pw);
+                                __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                                __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                                __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                                inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                                TSC_RESTART(scale_cycles);
+                                __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                                __m256 qv = _mm256_loadu_ps(qh + j);
+                                TSC_RESTART(fma_cycles);
+                                sum_v = _mm256_fmadd_ps(qv, wf, sum_v);
+                            }
+                            TSC_ACCUM(fma_cycles);
+                            for (; j < blk_end; j++) {
+                                int nib_off = (j - blk_start) / 2;
+                                int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                int nib = (nb[nib_off] >> shft) & 0x0F;
+                                sum_v = _mm256_add_ps(sum_v, _mm256_set1_ps(qh[j] * (float)((nib ^ 8) - 8) * scale));
+                            }
+                        }
+                        float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
+                                  + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
+                        sh[s] = sum * inv_sqrt_d;
                     }
-                    TSC_ACCUM(fma_cycles);
-                    for (; j < blk_end; j++) {
-                        int nib_off = (j - blk_start) / 2;
-                        int shft = ((j - blk_start) & 1) ? 4 : 0;
-                        int nib = (nb[nib_off] >> shft) & 0x0F;
-                        sum_v = _mm256_add_ps(sum_v, _mm256_set1_ps(qh[j] * (float)((nib ^ 8) - 8) * scale));
+                } else {
+                    for (int s = s0; s < s1; s++) {
+                        int attn_pos = ring_start + s;
+                        if (attn_pos <= pos) {
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            const float* qh = qb + h * head_dim;
+                            __m256 sum_v = _mm256_setzero_ps();
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                TSC_START();
+                                uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                __m256 scale_v = _mm256_set1_ps(scale);
+                                TSC_RESTART(block_cycles);
+                                const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                int j = blk_start;
+                                for (; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    TSC_RESTART(nibble_cycles);
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    __m128i pack = _mm_cvtsi32_si128(pw);
+                                    __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                                    __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                                    __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                                    inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                                    TSC_RESTART(scale_cycles);
+                                    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                                    __m256 qv = _mm256_loadu_ps(qh + j);
+                                    TSC_RESTART(fma_cycles);
+                                    sum_v = _mm256_fmadd_ps(qv, wf, sum_v);
+                                }
+                                TSC_ACCUM(fma_cycles);
+                                for (; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    sum_v = _mm256_add_ps(sum_v, _mm256_set1_ps(qh[j] * (float)((nib ^ 8) - 8) * scale));
+                                }
+                            }
+                            float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
+                                      + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
+                            sh[s] = sum * inv_sqrt_d;
+                        }
                     }
                 }
-                float sum = sum_v[0] + sum_v[1] + sum_v[2] + sum_v[3]
-                          + sum_v[4] + sum_v[5] + sum_v[6] + sum_v[7];
-                scores[h * max_seq + s] = sum * inv_sqrt_d;
             }
         }
         P_ACCUM(attn_scores);
 
         P_START(attn_softmax);
-        // Causal mask + softmax per head (ring_start + s = actual position)
         #pragma omp parallel for
         for (int h = 0; h < n_heads; h++) {
             float* sh = scores + h * max_seq;
             float max_val = -1e9f;
             for (int s = 0; s < max_seq; s++) {
-                int attn_pos = ring_start + s;
-                float val = (attn_pos > pos) ? -1e9f : sh[s];
-                sh[s] = val;
+                float val = sh[s];
                 if (val > max_val) max_val = val;
             }
             float sum = 0.0f;
@@ -5220,21 +5280,25 @@ static void forward_layer_internal(
         get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
         int rows = g_rows, dim_w = g_dim_v;
         int rows_packed = rows / 4;
+        const int GATE_TILE_B = 8;
 
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic, 32)
-        #endif
-        for (int ur = 0; ur < rows_packed; ur++) {
-            const int8_t* gw4 = gw + ur * 4 * dim_w;
-            const int8_t* uw4 = uw + ur * 4 * dim_w;
-            int32_t g_off[4] = {128 * grs[ur*4+0], 128 * grs[ur*4+1],
-                                128 * grs[ur*4+2], 128 * grs[ur*4+3]};
-            int32_t u_off[4] = {128 * urs[ur*4+0], 128 * urs[ur*4+1],
-                                128 * urs[ur*4+2], 128 * urs[ur*4+3]};
+        for (int t0 = 0; t0 < B; t0 += GATE_TILE_B) {
+            int t_end = t0 + GATE_TILE_B;
+            if (t_end > B) t_end = B;
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(dynamic, 32)
+            #endif
+            for (int ur = 0; ur < rows_packed; ur++) {
+                const int8_t* gw4 = gw + ur * 4 * dim_w;
+                const int8_t* uw4 = uw + ur * 4 * dim_w;
+                int32_t g_off[4] = {128 * grs[ur*4+0], 128 * grs[ur*4+1],
+                                    128 * grs[ur*4+2], 128 * grs[ur*4+3]};
+                int32_t u_off[4] = {128 * urs[ur*4+0], 128 * urs[ur*4+1],
+                                    128 * urs[ur*4+2], 128 * urs[ur*4+3]};
 
-            for (int b = 0; b < B; b++) {
-                const uint8_t* a = m->buf_i8 + b * ffn_dim;
-                float deq = max_abs[b] / 127.0f;
+                for (int b = t0; b < t_end; b++) {
+                    const uint8_t* a = m->buf_i8 + b * ffn_dim;
+                    float deq = max_abs[b] / 127.0f;
 
                 float g_val[4], u_val[4];
                 for (int sub = 0; sub < 4; sub++) {
@@ -5293,6 +5357,7 @@ static void forward_layer_internal(
                 u_out[3 * rows_packed + ur] = u_val[3];
             }
         }
+    }
     }
     P_ACCUM(ffn_gate_up);
     P_START(silu_down);
