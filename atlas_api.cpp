@@ -2950,47 +2950,97 @@ ATLAS_API void atlas_attention_f32(
         }
         P_ACCUM(attn_softmax);
         P_START(attn_weighted);
-        // Weighted sum: output[h, d] = sum_s scores[h, s] * v_cache[kh, s, d]
-        #pragma omp parallel for
-        for (int h = 0; h < n_heads; h++) {
-            int kh = h / n_rep;
-            float* sh = scores + h * max_seq;
-            float* out_h = output + b * n_heads * head_dim + h * head_dim;
-            for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
-            for (int s = 0; s < max_seq; s++) {
-                int cache_idx = (ring_start + s) % max_seq_len;
-                const uint8_t* v_pos = v_cache
-                    + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
-                float score = sh[s];
-                __m256 sv = _mm256_set1_ps(score);
-                int d = 0;
-                for (int blk = 0; blk < n_blk; blk++) {
-                    int blk_start = blk * KV_BLOCK_SIZE;
-                    int blk_end = blk_start + KV_BLOCK_SIZE;
-                    if (blk_end > head_dim) blk_end = head_dim;
-                    uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
-                    float scale = fp16_to_fp32(sr);
-                    __m256 scale_v = _mm256_set1_ps(scale);
-                    const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
-                    for (int j = blk_start; j + 8 <= blk_end; j += 8) {
-                        int nib_off = (j - blk_start) / 2;
-                        int32_t pw; memcpy(&pw, nb + nib_off, 4);
-                        __m128i pack = _mm_cvtsi32_si128(pw);
-                        __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
-                        __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
-                        __m128i inter = _mm_unpacklo_epi8(lo, hi);
-                        inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
-                        __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
-                        __m256 out_v = _mm256_loadu_ps(out_h + j);
-                        out_v = _mm256_fmadd_ps(sv, wf, out_v);
-                        _mm256_storeu_ps(out_h + j, out_v);
+        {
+            const int TILE_S = 32;
+            for (int s0 = 0; s0 < ring_len; s0 += TILE_S) {
+                int s1 = s0 + TILE_S;
+                if (s1 > ring_len) s1 = ring_len;
+                int key_pos_start = ring_start + s0;
+                int key_pos_end = ring_start + s1 - 1;
+                if (key_pos_start > pos) break;
+                bool all_past = (key_pos_end <= pos);
+                #pragma omp parallel for
+                for (int h = 0; h < n_heads; h++) {
+                    int kh = h / n_rep;
+                    float* sh = scores + h * max_seq;
+                    float* out_h = output + b * n_heads * head_dim + h * head_dim;
+                    if (s0 == 0) {
+                        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
                     }
-                    for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
-                        int nib_off = (j - blk_start) / 2;
-                        int shft = ((j - blk_start) & 1) ? 4 : 0;
-                        int nib = (nb[nib_off] >> shft) & 0x0F;
-                        float vv = (float)((nib ^ 8) - 8) * scale;
-                        out_h[j] += score * vv;
+                    if (all_past) {
+                        for (int s = s0; s < s1; s++) {
+                            float score = sh[s];
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* v_pos = v_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            __m256 sv = _mm256_set1_ps(score);
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                __m256 scale_v = _mm256_set1_ps(scale);
+                                const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                for (int j = blk_start; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    __m128i pack = _mm_cvtsi32_si128(pw);
+                                    __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                                    __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                                    __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                                    inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                                    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                                    __m256 out_v = _mm256_loadu_ps(out_h + j);
+                                    out_v = _mm256_fmadd_ps(sv, wf, out_v);
+                                    _mm256_storeu_ps(out_h + j, out_v);
+                                }
+                                for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    float vv = (float)((nib ^ 8) - 8) * scale;
+                                    out_h[j] += score * vv;
+                                }
+                            }
+                        }
+                    } else {
+                        for (int s = s0; s < s1; s++) {
+                            int attn_pos = ring_start + s;
+                            if (attn_pos > pos) continue;
+                            float score = sh[s];
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* v_pos = v_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            __m256 sv = _mm256_set1_ps(score);
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                __m256 scale_v = _mm256_set1_ps(scale);
+                                const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                for (int j = blk_start; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    __m128i pack = _mm_cvtsi32_si128(pw);
+                                    __m128i lo = _mm_and_si128(pack, _mm_set1_epi8(0x0F));
+                                    __m128i hi = _mm_and_si128(_mm_srli_epi16(pack, 4), _mm_set1_epi8(0x0F));
+                                    __m128i inter = _mm_unpacklo_epi8(lo, hi);
+                                    inter = _mm_sub_epi8(_mm_xor_si128(inter, _mm_set1_epi8(8)), _mm_set1_epi8(8));
+                                    __m256 wf = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(inter)), scale_v);
+                                    __m256 out_v = _mm256_loadu_ps(out_h + j);
+                                    out_v = _mm256_fmadd_ps(sv, wf, out_v);
+                                    _mm256_storeu_ps(out_h + j, out_v);
+                                }
+                                for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    float vv = (float)((nib ^ 8) - 8) * scale;
+                                    out_h[j] += score * vv;
+                                }
+                            }
+                        }
                     }
                 }
             }
