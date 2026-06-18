@@ -11,6 +11,9 @@
 #include <mutex>
 #ifndef __aarch64__
 #include <immintrin.h>
+extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
+    const int8_t* weights, const uint8_t* act_u8,
+    const float* max_abs, float scale, float* output, int B);
 #endif
 
 // ARM64 NEON kernel declarations (atlas_kernel_arm64.cpp)
@@ -3269,6 +3272,11 @@ static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
 static void matmul_ternary_add_reorder(int rows, int input_dim,
     const int8_t* weights, const uint8_t* act_u8,
     const float* max_abs, float scale, float* output, int B) {
+    #ifdef __aarch64__
+    atlas_matmul_ternary_f32_arm64(rows, input_dim, weights,
+        act_u8, max_abs, scale, output, B);
+    return;
+    #endif
     int rows_packed = rows / 4;
     #ifdef _OPENMP
     #pragma omp parallel for if(rows_packed > 4)

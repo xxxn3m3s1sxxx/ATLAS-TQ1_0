@@ -473,3 +473,66 @@ extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
     atlas_tq1_fused_f32_arm64(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Ternary-add matmul (no quant, pure sign) — NEON
+// ═══════════════════════════════════════════════════════════════════════
+// ARM64 equivalent of matmul_ternary_add_reorder in atlas_api.cpp.
+//
+// act_u8: uint8 [+128 offset] activations. weights: int8 {-1,0,+1}.
+// XOR act_u8 with 0x80 → centered int8 = val-128.
+// vdotq_s32(w, centered_act) = sum(w * (val-128)).
+// No row_sum correction needed (built into the XOR trick).
+//
+// x86 pipeline: sub_epi8(-128) → sign_epi8 ×2 → cvtepi8_epi16 ×2 →
+//   madd_epi16 ×2 → add_epi32 ×4 → hadd_epi32 ×3 = 11 instructions.
+// NEON: veorq_s8 + vdotq_s32 ×2 + vaddvq_s32 = 4 instructions.
+extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
+    const int8_t* weights, const uint8_t* act_u8,
+    const float* max_abs, float scale, float* output, int B) {
+
+    int rows_packed = rows / 4;
+    int8x16_t xor_mask = vdupq_n_s8(-128);
+
+    for (int ur = 0; ur < rows_packed; ur++) {
+        for (int b = 0; b < B; b++) {
+            const uint8_t* a = act_u8 + b * input_dim;
+            float out4[4];
+
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * input_dim;
+
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+
+                int c = 0;
+                for (; c + 32 <= input_dim; c += 32) {
+                    uint8x16_t a0 = vld1q_u8(a + c);
+                    uint8x16_t a1 = vld1q_u8(a + c + 16);
+                    int8x16_t w0 = vld1q_s8(w + c);
+                    int8x16_t w1 = vld1q_s8(w + c + 16);
+
+                    int8x16_t s0 = veorq_s8(vreinterpretq_s8_u8(a0), xor_mask);
+                    int8x16_t s1 = veorq_s8(vreinterpretq_s8_u8(a1), xor_mask);
+
+                    acc0 = vdotq_s32(acc0, w0, s0);
+                    acc1 = vdotq_s32(acc1, w1, s1);
+                }
+
+                int32_t dot = vaddvq_s32(acc0) + vaddvq_s32(acc1);
+
+                for (; c < input_dim; c++) {
+                    dot += ((int)a[c] - 128) * (int)w[c];
+                }
+
+                out4[sub] = (float)dot * max_abs[b] / (127.0f * scale);
+            }
+
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+}
