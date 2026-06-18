@@ -1,4 +1,4 @@
-﻿// atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
+// atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
 // atlas_ffi.h is the pure C API contract for FFI consumers (standalone reference)
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +37,17 @@ extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
 extern "C" void atlas_matmul_i4_f32(int rows, int cols,
     const uint8_t* packed_weights, const uint8_t* act_u8,
     const int32_t* row_sums, float* output, int n_tokens);
+extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
+    const int8_t* gw, const int8_t* uw,
+    const float* act_f32, int act_stride,
+    float* buf_gate, float* buf_up,
+    int B, float g_scale, float u_scale);
+extern "C" void atlas_fused_gate_up_default_neon(int rows, int dim_w,
+    const int8_t* gw, const int8_t* uw,
+    const uint8_t* act_u8,
+    const float* max_abs, int B,
+    float* buf_gate, float* buf_up,
+    float g_scale, float u_scale);
 #endif
 #include <omp.h>
 
@@ -5656,7 +5667,6 @@ static void forward_layer_internal(
         quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
         matmul_i4_reorder_deq(tg.row_dim, g_cols, g_pw, g_rs, m->buf_i8, max_abs, g_scale, m->buf_act, m->buf_gate, B);
         matmul_i4_reorder_deq(tu.row_dim, u_cols, u_pw, u_rs, m->buf_i8, max_abs, u_scale, m->buf_act, m->buf_up, B);
-#ifndef __aarch64__
     } else if (m->use_ternary_matmul) {
 
         // Ternary-add FFN: vpsignb, no multiplication, no row_sums correction
@@ -5669,6 +5679,7 @@ static void forward_layer_internal(
         int rows = g_rows, dim_w = g_dim_v;
         int rows_packed = rows / 4;
 
+#ifndef __aarch64__
         #ifdef _OPENMP
         #pragma omp parallel for
         #endif
@@ -5748,6 +5759,10 @@ static void forward_layer_internal(
                 u_out[3 * rows_packed + ur] = u_val[3];
             }
         }
+#else
+        atlas_matmul_ternary_f32_arm64(rows, dim_w, gw, m->buf_i8, max_abs, g_scale, m->buf_gate, B);
+        atlas_matmul_ternary_f32_arm64(rows, dim_w, uw, m->buf_i8, max_abs, u_scale, m->buf_up, B);
+#endif
     } else if (m->use_f32_matmul) {
         // Full-precision FFN: f32 activations × int8 weights, no activation quantization
         if (tg.ttype == 11 && tu.ttype == 11) {
@@ -5769,6 +5784,7 @@ static void forward_layer_internal(
             get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
             get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
             int rows = g_rows, dim_w = g_dim_v;
+#ifndef __aarch64__
             int rows_packed = rows / 4;
 
             #ifdef _OPENMP
@@ -5816,6 +5832,10 @@ static void forward_layer_internal(
                     u_out[3 * rows_packed + ur] = u_val[3];
                 }
             }
+#else
+            atlas_fused_gate_up_f32_neon(rows, dim_w, gw, uw, m->buf_act, ffn_dim,
+                m->buf_gate, m->buf_up, B, g_scale, u_scale);
+#endif
         }
         #ifdef ATLAS_DEBUG_MODE
         if (B <= 6 && H == 2048) {
@@ -5841,6 +5861,7 @@ static void forward_layer_internal(
         get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
         get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
         int rows = g_rows, dim_w = g_dim_v;
+#ifndef __aarch64__
         int rows_packed = rows / 4;
         const int GATE_TILE_B = 8;
 
@@ -5920,8 +5941,11 @@ static void forward_layer_internal(
             }
         }
     }
-    }
+#else
+        atlas_fused_gate_up_default_neon(rows, dim_w, gw, uw, m->buf_i8, max_abs, B,
+            m->buf_gate, m->buf_up, g_scale, u_scale);
 #endif
+    }
     P_ACCUM(ffn_gate_up);
     P_START(silu_down);
 

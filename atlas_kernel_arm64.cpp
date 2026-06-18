@@ -541,73 +541,6 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
 // Replaces x86 _mm256_maddubs_epi16 + correction loop.
 // XOR-0x80 trick: converts uint8 [+128 offset] activations to centered int8,
 // so vdotq_s32 gives corrected dot product directly — no 128*row_sums needed.
-ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
-                                     const uint8_t* __restrict__ packed_weights,
-                                     const uint8_t* __restrict__ act_u8,
-                                     const int32_t* __restrict__ row_sums,
-                                     float* __restrict__ output,
-                                     int n_tokens) {
-    (void)row_sums;
-    const int TILE_B = 8;
-    uint8x16_t mask_0f = vdupq_n_u8(0x0F);
-    int8x16_t c8 = vdupq_n_s8(8);
-    uint8x16_t xor_80 = vdupq_n_u8(0x80);
-
-    for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
-        int t_end = t0 + TILE_B;
-        if (t_end > n_tokens) t_end = n_tokens;
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (int r = 0; r < rows; r++) {
-            const uint8_t* pw = packed_weights + r * cols / 2;
-            for (int t = t0; t < t_end; t++) {
-                const uint8_t* a = act_u8 + t * cols;
-                int c = 0;
-                int32x4_t acc = vdupq_n_s32(0);
-
-                for (; c + 32 <= cols; c += 32) {
-                    int pc = c / 2;
-                    uint8x16_t packed = vld1q_u8(pw + pc);
-
-                    uint8x16_t lo = vandq_u8(packed, mask_0f);
-                    uint8x16_t hi = vshrq_n_u8(packed, 4);
-
-                    int8x16_t w_lo = vsubq_s8(
-                        veorq_s8(vreinterpretq_s8_u8(lo), c8), c8);
-                    int8x16_t w_hi = vsubq_s8(
-                        veorq_s8(vreinterpretq_s8_u8(hi), c8), c8);
-
-                    int8x16x2_t w = vzipq_s8(w_lo, w_hi);
-
-                    uint8x16_t act0 = vld1q_u8(a + c);
-                    uint8x16_t act1 = vld1q_u8(a + c + 16);
-                    int8x16_t act0_i8 = vreinterpretq_s8_u8(
-                        veorq_u8(act0, xor_80));
-                    int8x16_t act1_i8 = vreinterpretq_s8_u8(
-                        veorq_u8(act1, xor_80));
-
-                    acc = vdotq_s32(acc, w.val[0], act0_i8);
-                    acc = vdotq_s32(acc, w.val[1], act1_i8);
-                }
-
-                int dot = vaddvq_s32(acc);
-
-                for (; c < cols; c++) {
-                    int packed_idx = (r * cols + c) / 2;
-                    int nibble = (c & 1)
-                        ? (packed_weights[packed_idx] >> 4)
-                        : (packed_weights[packed_idx] & 0x0F);
-                    int8_t w_val = (int8_t)((nibble ^ 8) - 8);
-                    dot += ((int)a[c] ^ 0x80) * (int)w_val;
-                }
-
-                output[t * rows + r] = (float)dot;
-            }
-        }
-    }
-}
-
-// atlas_matmul_i4_f32: int4×uint8 matmul (nibble unpack + XOR-0x80 + vdotq_s32)
-// Same signature as x86 version; XOR-0x80 eliminates row_sums correction.
 extern "C" void atlas_matmul_i4_f32(int rows, int cols,
     const uint8_t* packed_weights, const uint8_t* act_u8,
     const int32_t* row_sums, float* output, int n_tokens) {
@@ -652,6 +585,169 @@ extern "C" void atlas_matmul_i4_f32(int rows, int cols,
             }
 
             output[t * rows + r] = (float)dot;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Fused gate+up (f32 bypass): f32 activations × int8 weights, no quant
+// ═══════════════════════════════════════════════════════════════════════
+// ARM64 equivalent of the x86 inline loop in the f32_bypass else branch.
+// Same 4-row grouped reorder output layout as x86.
+extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
+    const int8_t* gw, const int8_t* uw,
+    const float* act_f32, int act_stride,
+    float* buf_gate, float* buf_up,
+    int B, float g_scale, float u_scale) {
+
+    int rows_packed = rows / 4;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        const int8_t* gw4 = gw + ur * 4 * dim_w;
+        const int8_t* uw4 = uw + ur * 4 * dim_w;
+
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * act_stride;
+            float g_val[4], u_val[4];
+
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* wg = gw4 + sub * dim_w;
+                const int8_t* wu = uw4 + sub * dim_w;
+                float32x4_t g_acc = vdupq_n_f32(0);
+                float32x4_t u_acc = vdupq_n_f32(0);
+
+                int c = 0;
+                for (; c + 16 <= dim_w; c += 16) {
+                    float32x4_t a0 = vld1q_f32(a + c);
+                    float32x4_t a1 = vld1q_f32(a + c + 4);
+                    float32x4_t a2 = vld1q_f32(a + c + 8);
+                    float32x4_t a3 = vld1q_f32(a + c + 12);
+
+                    int8x16_t wgv = vld1q_s8(wg + c);
+                    int8x16_t wuv = vld1q_s8(wu + c);
+
+                    int16x8_t wg16  = vmovl_s8(vget_low_s8(wgv));
+                    int16x8_t wg16h = vmovl_s8(vget_high_s8(wgv));
+                    int16x8_t wu16  = vmovl_s8(vget_low_s8(wuv));
+                    int16x8_t wu16h = vmovl_s8(vget_high_s8(wuv));
+
+                    float32x4_t g_wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg16)));
+                    float32x4_t g_wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg16)));
+                    float32x4_t g_wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wg16h)));
+                    float32x4_t g_wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wg16h)));
+
+                    float32x4_t u_wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu16)));
+                    float32x4_t u_wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu16)));
+                    float32x4_t u_wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu16h)));
+                    float32x4_t u_wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu16h)));
+
+                    g_acc = vfmaq_f32(g_acc, a0, g_wf0);
+                    g_acc = vfmaq_f32(g_acc, a1, g_wf1);
+                    g_acc = vfmaq_f32(g_acc, a2, g_wf2);
+                    g_acc = vfmaq_f32(g_acc, a3, g_wf3);
+
+                    u_acc = vfmaq_f32(u_acc, a0, u_wf0);
+                    u_acc = vfmaq_f32(u_acc, a1, u_wf1);
+                    u_acc = vfmaq_f32(u_acc, a2, u_wf2);
+                    u_acc = vfmaq_f32(u_acc, a3, u_wf3);
+                }
+
+                float gs = vaddvq_f32(g_acc);
+                float us = vaddvq_f32(u_acc);
+
+                for (; c < dim_w; c++) {
+                    gs += a[c] * wg[c];
+                    us += a[c] * wu[c];
+                }
+
+                g_val[sub] = gs / g_scale;
+                u_val[sub] = us / u_scale;
+            }
+
+            float* g_out = buf_gate + b * rows;
+            float* u_out = buf_up + b * rows;
+            g_out[0 * rows_packed + ur] = g_val[0];
+            g_out[1 * rows_packed + ur] = g_val[1];
+            g_out[2 * rows_packed + ur] = g_val[2];
+            g_out[3 * rows_packed + ur] = g_val[3];
+            u_out[0 * rows_packed + ur] = u_val[0];
+            u_out[1 * rows_packed + ur] = u_val[1];
+            u_out[2 * rows_packed + ur] = u_val[2];
+            u_out[3 * rows_packed + ur] = u_val[3];
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Fused gate+up (default quantized): uint8 activations × int8 weights
+// ═══════════════════════════════════════════════════════════════════════
+// ARM64 equivalent of the x86 default inline loop (vpmaddubsw + row_sums
+// correction). XOR-0x80 trick eliminates the 128*row_sums subtraction.
+extern "C" void atlas_fused_gate_up_default_neon(int rows, int dim_w,
+    const int8_t* gw, const int8_t* uw,
+    const uint8_t* act_u8,
+    const float* max_abs, int B,
+    float* buf_gate, float* buf_up,
+    float g_scale, float u_scale) {
+
+    int rows_packed = rows / 4;
+    int8x16_t xor_mask = vdupq_n_s8(-128);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 32)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        const int8_t* gw4 = gw + ur * 4 * dim_w;
+        const int8_t* uw4 = uw + ur * 4 * dim_w;
+
+        for (int b = 0; b < B; b++) {
+            const uint8_t* a = act_u8 + b * dim_w;
+            float deq = max_abs[b] / 127.0f;
+
+            float g_val[4], u_val[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* wg = gw4 + sub * dim_w;
+                const int8_t* wu = uw4 + sub * dim_w;
+
+                int32x4_t g_acc = vdupq_n_s32(0);
+                int32x4_t u_acc = vdupq_n_s32(0);
+
+                int c = 0;
+                for (; c + 16 <= dim_w; c += 16) {
+                    uint8x16_t av = vld1q_u8(a + c);
+                    int8x16_t gv = vld1q_s8(wg + c);
+                    int8x16_t uv = vld1q_s8(wu + c);
+                    int8x16_t av_s = veorq_s8(vreinterpretq_s8_u8(av), xor_mask);
+                    g_acc = vdotq_s32(g_acc, gv, av_s);
+                    u_acc = vdotq_s32(u_acc, uv, av_s);
+                }
+
+                int g_dot = vaddvq_s32(g_acc);
+                int u_dot = vaddvq_s32(u_acc);
+
+                for (; c < dim_w; c++) {
+                    int8_t av = (int8_t)(a[c] ^ 0x80);
+                    g_dot += (int)av * (int)wg[c];
+                    u_dot += (int)av * (int)wu[c];
+                }
+
+                g_val[sub] = (float)g_dot * deq / g_scale;
+                u_val[sub] = (float)u_dot * deq / u_scale;
+            }
+
+            float* g_out = buf_gate + b * rows;
+            float* u_out = buf_up + b * rows;
+            g_out[0 * rows_packed + ur] = g_val[0];
+            g_out[1 * rows_packed + ur] = g_val[1];
+            g_out[2 * rows_packed + ur] = g_val[2];
+            g_out[3 * rows_packed + ur] = g_val[3];
+            u_out[0 * rows_packed + ur] = u_val[0];
+            u_out[1 * rows_packed + ur] = u_val[1];
+            u_out[2 * rows_packed + ur] = u_val[2];
+            u_out[3 * rows_packed + ur] = u_val[3];
         }
     }
 }
