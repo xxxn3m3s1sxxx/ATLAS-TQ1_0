@@ -9,7 +9,9 @@
 #include <vector>
 #include <string>
 #include <mutex>
-#ifndef __aarch64__
+#ifdef __aarch64__
+#include <arm_neon.h>
+#else
 #include <immintrin.h>
 extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
     const int8_t* weights, const uint8_t* act_u8,
