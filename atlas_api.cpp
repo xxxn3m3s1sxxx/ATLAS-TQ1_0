@@ -12,6 +12,26 @@
 #ifndef __aarch64__
 #include <immintrin.h>
 #endif
+
+// ARM64 NEON kernel declarations (atlas_kernel_arm64.cpp)
+// Called when __aarch64__ is defined (Apple Silicon, ARMv8.2-A+ dotprod).
+#ifdef __aarch64__
+extern "C" void atlas_matmul_i8_f32(int rows, int cols,
+    const int8_t* weights, const uint8_t* act_u8,
+    const int32_t* row_sums, float* output, int n_tokens);
+extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32, float* output, int B);
+extern "C" void atlas_tq1_fused_f32_arm64(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32, float* output, int B);
+extern "C" void atlas_tq2_arm64(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32, float* output, int B);
+extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* act_f32, float* output, int B);
+#endif
 #include <omp.h>
 
 // Debug logging: compile with -DATLAS_DEBUG_MODE for runtime probes
@@ -3678,6 +3698,11 @@ static void matmul_tq1_block_fused_f32(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32,
     float* output, int B) {
+    #ifdef __aarch64__
+    atlas_tq1_fused_f32_arm64(rows, input_dim, packed_cols,
+        tensor_data, block_size, n_blocks, act_f32, output, B);
+    return;
+    #endif
     #ifdef ATLAS_DEBUG_MODE
     double t0 = atlas_now();
     #endif
@@ -3820,6 +3845,11 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32,
     float* output, int B) {
+    #ifdef __aarch64__
+    atlas_tq1_fused_s8_arm64(rows, input_dim, packed_cols,
+        tensor_data, block_size, n_blocks, act_f32, output, B);
+    return;
+    #endif
     #ifdef ATLAS_DEBUG_MODE
     double t0 = atlas_now();
     #endif
@@ -4046,6 +4076,11 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
 static void matmul_tq2(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32, float* output, int B) {
+    #ifdef __aarch64__
+    atlas_tq2_arm64(rows, input_dim, packed_cols,
+        tensor_data, block_size, n_blocks, act_f32, output, B);
+    return;
+    #endif
     // skip flags byte so ttype=5 layout aligns (scales at +3, packed at +3+rows*n_blocks*2)
     const uint8_t* w5 = tensor_data + 1;
     matmul_tq1_block_fused_s8(rows, input_dim, packed_cols,
@@ -4056,6 +4091,11 @@ static void matmul_tq2(int rows, int input_dim, int packed_cols,
 static void matmul_tq2_f32(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32, float* output, int B) {
+    #ifdef __aarch64__
+    atlas_tq2_f32_arm64(rows, input_dim, packed_cols,
+        tensor_data, block_size, n_blocks, act_f32, output, B);
+    return;
+    #endif
     const uint8_t* w5 = tensor_data + 1;
     matmul_tq1_block_fused_f32(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
