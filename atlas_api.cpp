@@ -3751,8 +3751,7 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
     #ifdef __aarch64__
     atlas_matmul_ternary_f32_arm64(rows, input_dim, weights,
         act_u8, max_abs, scale, output, B);
-    return;
-    #endif
+    #else
     int rows_packed = rows / 4;
     #ifdef _OPENMP
     #pragma omp parallel for if(rows_packed > 4)
@@ -3797,6 +3796,7 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
             dst[3 * rows_packed + ur] = out4[3];
         }
     }
+    #endif
 }
 
 // ─── Fused TQ1 decode + int32 dot product for packed weights ──────────
@@ -4187,8 +4187,7 @@ static void matmul_tq1_block_fused_f32(int rows, int input_dim, int packed_cols,
     #ifdef __aarch64__
     atlas_tq1_fused_f32_arm64(rows, input_dim, packed_cols,
         tensor_data, block_size, n_blocks, act_f32, output, B);
-    return;
-    #endif
+    #else
     #ifdef ATLAS_DEBUG_MODE
     double t0 = atlas_now();
     #endif
@@ -4312,6 +4311,7 @@ static void matmul_tq1_block_fused_f32(int rows, int input_dim, int packed_cols,
             }
         }
     }
+    #endif
     #ifdef ATLAS_DEBUG_MODE
     double elapsed = atlas_now() - t0;
     if (elapsed > 0.1) {
@@ -4334,8 +4334,7 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
     #ifdef __aarch64__
     atlas_tq1_fused_s8_arm64(rows, input_dim, packed_cols,
         tensor_data, block_size, n_blocks, act_f32, output, B);
-    return;
-    #endif
+    #else
     #ifdef ATLAS_DEBUG_MODE
     double t0 = atlas_now();
     #endif
@@ -4548,6 +4547,7 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
             }
         }
     }
+    #endif
     #ifdef ATLAS_DEBUG_MODE
     double elapsed = atlas_now() - t0;
     if (elapsed > 0.1) {
@@ -4565,12 +4565,12 @@ static void matmul_tq2(int rows, int input_dim, int packed_cols,
     #ifdef __aarch64__
     atlas_tq2_arm64(rows, input_dim, packed_cols,
         tensor_data, block_size, n_blocks, act_f32, output, B);
-    return;
-    #endif
+    #else
     // skip flags byte so ttype=5 layout aligns (scales at +3, packed at +3+rows*n_blocks*2)
     const uint8_t* w5 = tensor_data + 1;
     matmul_tq1_block_fused_s8(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
+    #endif
 }
 
 // ─── v2.10.4: F32 bypass wrapper for ttype=10 ──────────────────────
@@ -4580,11 +4580,11 @@ static void matmul_tq2_f32(int rows, int input_dim, int packed_cols,
     #ifdef __aarch64__
     atlas_tq2_f32_arm64(rows, input_dim, packed_cols,
         tensor_data, block_size, n_blocks, act_f32, output, B);
-    return;
-    #endif
+    #else
     const uint8_t* w5 = tensor_data + 1;
     matmul_tq1_block_fused_f32(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
+    #endif
 }
 
 // ─── TQ1 encode: 5 ternary values → 1 byte (Base-3) ────────────────
