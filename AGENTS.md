@@ -31,7 +31,7 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 | TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
 | TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
 | TriLM-3.9B | 0.84 GB | 32 | 3072 | 9216 | 24 | 24 | 50688 | Llama (head_dim=128, no SubLN) |
-| Llama3-8B-1.58-100B-tokens | 4.11 GB | 32 | 4096 | 14336 | 32 | 8 | 131072 | Llama3 (GQA, QK-Norm) |
+| Llama3-8B-1.58-100B-tokens | 3.27 GB | 32 | 4096 | 14336 | 32 | 8 | 128256 | Llama3 (GQA, QK-Norm, Instruct chat template) |
 | BitCPM-CANN-0.5B | 0.22 GB | 24 | 1024 | 4096 | 16 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
 | BitCPM-CANN-1B | 0.83 GB | 28 | 2048 | 6144 | 16 | 2 | 73448 | Llama (LongRoPE) |
 | BitCPM-CANN-3B | 1.35 GB | 32 | 2560 | 10240 | 32 | 2 | 73448 | Llama (LongRoPE) |
@@ -42,7 +42,7 @@ BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_
 Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
 TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU. f32 bypass auto-detected via head_dim=64 (v2.11.2+).  
 TriLM 3.9B: `head_dim=128`, `rope_theta=10K`, Llama arch, MHA (no GQA), SwiGLU. Auto-detected by packer via head_dim threshold.
-Llama3 (Base Model): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=131072. No chat template (Base model). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer.
+Llama3-8B-1.58 (Instruct, from HF1BitLLM): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=128256. Llama3 chat template (`<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer. Finetuned 100B tokens from `Meta-Llama-3-8B-Instruct`.
 BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`. 9.7 tok/s on i7-7700T (28L/2048H).
 BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). f32 bypass (auto-detected via vocab=73448). T=0: "Paris." coherent, T=0.7: coherent.
 BitCPM-CANN-0.5B: `head_dim=64`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. Tie Embeddings, V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Tiny — 24L/1024H/4096I, 0.22 GB.
@@ -229,7 +229,7 @@ See `atlas_ffi.h` for full API.
 
 ### v2.10.3 ✅ — Bug Hunt Round 2+3 + Llama3-Support (ABGESCHLOSSEN)
 - **12 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json), Bug #6 (xoshiro_state global → thread_local), Bug #7 (g_has_avx512_vnni Init-Race), Bug #8 (EOS sentinel=0 konfligiert mit Token-ID 0), Bug #9 (fehlende BitNet-Stops in generate_c/_cpp_decode/generate), Bug #10 (silent except:pass → warn).
-- **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=131072. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Base Model (no chat template). T=0 argmax: Prompt repetition. T=0.7: coherent.
+- **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=128256. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Instruct model (Llama3 chat template). T=0 argmax: stable (correct "Paris."). T=0.7: unstable sampling (model-inherent).
 - **v6 added_tokens Support**: C++ preencode scannt longest-first via sortierte `added_specs`. Decode per ID-Nachschlag. Preencode integriert in `tokenize_to_ids()`.
 - **`rope_interleaved_set` Flag**: Neues Struct-Feld. Config-JSON setzt es → Heuristik in `ensure_layer_idx` feuert nicht. Default `true` (interleaved). Qwen3/Bonsai setzen auf `false` (half-split).
 - **39/39 Mock-Tests grün**: 7 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant, Llama3, Bonsai). E2E v6 tokenizer roundtrip mit added_tokens.
@@ -393,7 +393,7 @@ See `atlas_ffi.h` for full API.
   - Falcon3: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation: `<|assistant|>\n`.
   - BitCPM-CANN/Qwen3/Bonsai: `<|im_start|>role\n{content}<|im_end|>\n` (ChatML). Generation: `<|im_start|>assistant\n`.
   - BitNet: `{Role}: {content}<|eot_id|>\n` — generation: `Assistant: `. EOS `<|eot_id|>` = 128009.
-  - Llama3 (Base Model): No chat template. Generation: `{prompt}`. Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
+  - Llama3 (Instruct): Chat template `<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`. T=0 argmax stabil, T=0.7 Sampling instabil (Modell-Limit, 1.58 Bit). Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
   - **CANN EOS tokens**: Both `</s>` (ID 2) and `<|im_end|>` (ID 73440) act as end-of-sequence. Python stop_tokens catches both.
 - **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
 - **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).

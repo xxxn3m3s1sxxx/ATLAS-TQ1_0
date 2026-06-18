@@ -1213,11 +1213,26 @@ class AtlasModel:
                     result += '<think>\n\n</think>\n\n'
             return result
 
-        # Llama3 (Base Model): no chat template — use raw content
+        # Llama3: <|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
+        # Instruct variant (has chat_template in tokenizer_config.json):
+        # wraps messages in Llama3 chat format.
+        # Base variant (no chat_template): returns raw content.
         if self._is_llama3:
+            if not self._chat_template:
+                # Base Model: no chat template — use raw content
+                if add_generation_prompt:
+                    return messages[-1].get('content', '') if messages else ""
+                return "\n".join(m.get('content', '') for m in messages if m.get('content'))
+            # Instruct: apply Llama3 chat template
+            result = ""
+            for i, msg in enumerate(messages):
+                role = msg['role']
+                content = msg.get('content', '')
+                prefix = "<|begin_of_text|>" if i == 0 else ""
+                result += f"{prefix}<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
             if add_generation_prompt:
-                return messages[-1].get('content', '') if messages else ""
-            return "\n".join(m.get('content', '') for m in messages if m.get('content'))
+                result += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            return result
 
         # BitNet: Role: content<|eot_id|> (per tokenizer_config.json Jinja2 template)
         if self._is_bitnet:
