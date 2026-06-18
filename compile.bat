@@ -16,6 +16,7 @@ set CC=clang++
 if "%1"=="debug" goto build_debug
 if "%1"=="test" goto build_test
 if "%1"=="coverage" goto build_coverage
+if "%1"=="arm64" goto build_arm64
 
 :build_release
 echo [Atlas] Compiling atlas.dll (release)...
@@ -34,6 +35,17 @@ if %ERRORLEVEL% EQU 0 (
     echo [Atlas] WARNING -- atlas.exe build failed (CLI unavailable)
     echo [Atlas] atlas_cli.cpp is optional — DLL build succeeded
 )
+goto :eof
+
+:build_arm64
+echo [Atlas] Compiling atlas.dylib (ARM64 NEON, macOS Apple Silicon)...
+echo [Atlas] Requires: Xcode CLT (clang with arm64 target)
+echo.
+echo   clang++ -shared -o atlas.dylib atlas_api.cpp atlas_kernel_arm64.cpp ^
+echo     -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fopenmp
+echo.
+echo [Atlas] NOTE: Compile on macOS with the command above.
+echo [Atlas] atlas_vnni.cpp is x86-only and excluded on ARM64.
 goto :eof
 
 :build_debug

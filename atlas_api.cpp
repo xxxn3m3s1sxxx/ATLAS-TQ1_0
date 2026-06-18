@@ -9,7 +9,9 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#ifndef __aarch64__
 #include <immintrin.h>
+#endif
 #include <omp.h>
 
 // Debug logging: compile with -DATLAS_DEBUG_MODE for runtime probes
@@ -20,6 +22,8 @@
 #endif
 
 // VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
+// ARM64: not needed (NEON SDOT replaces AVX-VNNI paths).
+#ifndef __aarch64__
 extern "C" int atlas_vnni_available(void);
 extern "C" int atlas_matmul_block_vnni(const int8_t* act, const int8_t* row, int blk_end, int blk_start);
 extern "C" void atlas_matmul_i4_vnni(int rows, int cols,
@@ -28,6 +32,7 @@ extern "C" void atlas_matmul_i4_vnni(int rows, int cols,
                                      const int32_t* row_sums,
                                      float* output,
                                      int n_tokens);
+#endif
 
 #ifdef _WIN32
   #define ATLAS_API __declspec(dllexport)
@@ -2418,6 +2423,8 @@ ATLAS_API const uint8_t* atlas_tensor_data(AtlasModel* m, int idx, int* size) {
 }
 
 // ─── Matmul: int8 weights × uint8 activations → float32 output ──────────
+// ARM64 (AArch64): NEON vdotq_s32 version in atlas_kernel_arm64.cpp.
+#ifndef __aarch64__
 
 // ─── Matmul: int8 weights × int8 activations → float32 output ──────────
 // Uses _mm256_maddubs_epi16 with offset trick:
@@ -2481,7 +2488,11 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
     }
 }
 
+#endif // !__aarch64__
+
 // ─── int4×uint8 matmul: nibble unpack + vpmaddubs + sign-extend ──────
+// ARM64: provided by atlas_kernel_arm64.cpp (NEON vqtbl1q_u8 + vdotq_s32).
+#ifndef __aarch64__
 // weights: packed int4 (2 per byte), cols = input_dim (padded to even)
 // act_u8: [n_tokens × cols] uint8 (+128 offset) quantized activations
 // row_sums: [rows] int32 sum of each sign-extended int4 weight row
@@ -2571,30 +2582,17 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
     }
 }
 
+#endif // !__aarch64__ (int4 matmul)
+
 // ─── Norm: float16 tensor → RMSNorm ────────────────────────────────────
 // Performs: output[i] = x[i] * weight[i] * rms(mean(x^2) + eps)
 // Where weight is loaded from atlas tensor (float16)
 ATLAS_API void atlas_rmsnorm_f32(const float* x, const uint8_t* weight_f16,
                                   float* output, int n, float eps) {
     float ss = 0.0f;
-    int i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 xv = _mm256_loadu_ps(x + i);
-        __m256 x2 = _mm256_mul_ps(xv, xv);
-        ss += x2[0] + x2[1] + x2[2] + x2[3] + x2[4] + x2[5] + x2[6] + x2[7];
-    }
-    for (; i < n; i++) ss += x[i] * x[i];
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
     float rms = 1.0f / sqrtf(ss / n + eps);
-
-    __m256 rv = _mm256_set1_ps(rms);
-    for (i = 0; i + 8 <= n; i += 8) {
-        __m128i w8 = _mm_loadu_si128((const __m128i*)(weight_f16 + i * 2));
-        __m256 w32 = _mm256_cvtph_ps(w8);
-        __m256 xv = _mm256_loadu_ps(x + i);
-        __m256 r = _mm256_mul_ps(_mm256_mul_ps(xv, rv), w32);
-        _mm256_storeu_ps(output + i, r);
-    }
-    for (; i < n; i++) {
+    for (int i = 0; i < n; i++) {
         uint16_t w;
         memcpy(&w, weight_f16 + i * 2, 2);
         output[i] = x[i] * rms * fp16_to_fp32(w);

@@ -4,6 +4,7 @@
 *.exe
 *.so
 *.dll
+*.dylib
 *.i8
 __pycache__/
 *.pyc
