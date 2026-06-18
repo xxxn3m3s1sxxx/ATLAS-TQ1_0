@@ -7,6 +7,7 @@ on:
     paths:
       - "atlas_api.cpp"
       - "atlas_vnni.cpp"
+      - "atlas_kernel_arm64.cpp"
       - "atlas_ffi.h"
       - "atlas_infer.py"
       - "compile.bat"
@@ -198,4 +199,37 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: atlas-macOS
+          path: libatlas.so
+
+  build-macos-arm64:
+    if: github.event_name != 'release'
+    needs: sanitizer-build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
+      - name: Install LLVM/Clang
+        run: brew install llvm libomp
+      - name: Install test deps
+        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+      - name: Build (ARM64 NEON)
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
+          echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+      - name: Generate test fixtures
+        run: python tests/generate_test_fixtures.py tests/
+      - name: Test
+        run: |
+          python tests/ci_smoke.py
+          python -m pytest tests/test_dll.py -v
+          python -m pytest tests/test_fixtures.py -v
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlas-macOS-ARM64
           path: libatlas.so

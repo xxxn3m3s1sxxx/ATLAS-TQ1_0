@@ -99,3 +99,40 @@ jobs:
         with:
           files: atlas-linux-x86_64.tar.gz
           fail_on_unmatched_files: true
+
+  build-macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang + OpenMP
+        run: brew install llvm libomp
+
+      - name: Build shared library (ARM64 NEON)
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
+
+      - name: Build CLI
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
+          $LLVM_PREFIX/bin/clang++ -o atlas atlas_cli.cpp -O2 -std=c++17 -ldl
+
+      - name: Smoke test — generate mock model
+        run: |
+          python3 -m pip install numpy pytest -q
+          python3 tests/create_mock_model.py tests/mock.atlas
+
+      - name: Smoke test — load + generate
+        run: |
+          DYLD_LIBRARY_PATH=$PWD python3 -m pytest tests/test_mock_model.py -q --no-header
+
+      - name: Create Release Tar
+        run: |
+          tar czf atlas-macos-arm64.tar.gz libatlas.so atlas atlas_ffi.h
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: atlas-macos-arm64.tar.gz
+          fail_on_unmatched_files: true
