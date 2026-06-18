@@ -34,6 +34,9 @@ extern "C" void atlas_tq2_arm64(int rows, int input_dim, int packed_cols,
 extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* act_f32, float* output, int B);
+extern "C" void atlas_matmul_i4_f32(int rows, int cols,
+    const uint8_t* packed_weights, const uint8_t* act_u8,
+    const int32_t* row_sums, float* output, int n_tokens);
 #endif
 #include <omp.h>
 

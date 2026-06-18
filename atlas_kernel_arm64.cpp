@@ -536,3 +536,72 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
         }
     }
 }
+
+// ─── int4×uint8 matmul: nibble unpack + vdotq_s32 (ARM64 NEON) ──────────
+// Replaces x86 _mm256_maddubs_epi16 + correction loop.
+// XOR-0x80 trick: converts uint8 [+128 offset] activations to centered int8,
+// so vdotq_s32 gives corrected dot product directly — no 128*row_sums needed.
+ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
+                                     const uint8_t* __restrict__ packed_weights,
+                                     const uint8_t* __restrict__ act_u8,
+                                     const int32_t* __restrict__ row_sums,
+                                     float* __restrict__ output,
+                                     int n_tokens) {
+    (void)row_sums;
+    const int TILE_B = 8;
+    uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+    int8x16_t c8 = vdupq_n_s8(8);
+    uint8x16_t xor_80 = vdupq_n_u8(0x80);
+
+    for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
+        int t_end = t0 + TILE_B;
+        if (t_end > n_tokens) t_end = n_tokens;
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int r = 0; r < rows; r++) {
+            const uint8_t* pw = packed_weights + r * cols / 2;
+            for (int t = t0; t < t_end; t++) {
+                const uint8_t* a = act_u8 + t * cols;
+                int c = 0;
+                int32x4_t acc = vdupq_n_s32(0);
+
+                for (; c + 32 <= cols; c += 32) {
+                    int pc = c / 2;
+                    uint8x16_t packed = vld1q_u8(pw + pc);
+
+                    uint8x16_t lo = vandq_u8(packed, mask_0f);
+                    uint8x16_t hi = vshrq_n_u8(packed, 4);
+
+                    int8x16_t w_lo = vsubq_s8(
+                        veorq_s8(vreinterpretq_s8_u8(lo), c8), c8);
+                    int8x16_t w_hi = vsubq_s8(
+                        veorq_s8(vreinterpretq_s8_u8(hi), c8), c8);
+
+                    int8x16x2_t w = vzipq_s8(w_lo, w_hi);
+
+                    uint8x16_t act0 = vld1q_u8(a + c);
+                    uint8x16_t act1 = vld1q_u8(a + c + 16);
+                    int8x16_t act0_i8 = vreinterpretq_s8_u8(
+                        veorq_u8(act0, xor_80));
+                    int8x16_t act1_i8 = vreinterpretq_s8_u8(
+                        veorq_u8(act1, xor_80));
+
+                    acc = vdotq_s32(acc, w.val[0], act0_i8);
+                    acc = vdotq_s32(acc, w.val[1], act1_i8);
+                }
+
+                int dot = vaddvq_s32(acc);
+
+                for (; c < cols; c++) {
+                    int packed_idx = (r * cols + c) / 2;
+                    int nibble = (c & 1)
+                        ? (packed_weights[packed_idx] >> 4)
+                        : (packed_weights[packed_idx] & 0x0F);
+                    int8_t w_val = (int8_t)((nibble ^ 8) - 8);
+                    dot += ((int)a[c] ^ 0x80) * (int)w_val;
+                }
+
+                output[t * rows + r] = (float)dot;
+            }
+        }
+    }
+}
