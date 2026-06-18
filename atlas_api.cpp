@@ -1,4 +1,4 @@
-// atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
+﻿// atlas_api.cpp — C-exported DLL for TQ1.0 inference acceleration
 // atlas_ffi.h is the pure C API contract for FFI consumers (standalone reference)
 #include <cstdint>
 #include <cstdio>
@@ -468,15 +468,55 @@ static void profile_print() {}
 #endif
 
 static inline float fp16_to_fp32(uint16_t h) {
+#ifndef __aarch64__
     float r;
-    __m128i h4 = _mm_cvtsi32_si128((int)(unsigned)h);  // zero-extend to 32-bit
-    __m128 f4 = _mm_cvtph_ps(h4);                       // F16C: fp16→fp32
+    __m128i h4 = _mm_cvtsi32_si128((int)(unsigned)h);
+    __m128 f4 = _mm_cvtph_ps(h4);
     _mm_store_ss(&r, f4);
     return r;
+#else
+    uint32_t sign = (h >> 15) & 1;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+        exp++; mant &= 0x3FF;
+    } else if (exp == 31) {
+        return sign ? -INFINITY : INFINITY;
+    }
+    exp = exp + 127 - 15;
+    mant <<= 13;
+    uint32_t result = (sign << 31) | (exp << 23) | mant;
+    float r; memcpy(&r, &result, 4);
+    return r;
+#endif
 }
 static inline uint16_t fp32_to_fp16(float v) {
+#ifndef __aarch64__
     __m128 f4 = _mm_set_ss(v);
     return (uint16_t)(unsigned)_mm_extract_epi16(_mm_cvtps_ph(f4, 0), 0);
+#else
+    uint32_t u; memcpy(&u, &v, 4);
+    uint32_t sign = (u >> 31) & 1;
+    int32_t exp = (u >> 23) & 0xFF;
+    uint32_t mant = u & 0x7FFFFF;
+    if (exp == 0) {
+        return sign ? 0x8000 : 0;
+    } else if (exp == 255) {
+        return sign ? 0xFC00 : 0x7C00;
+    }
+    exp = exp - 127 + 15;
+    if (exp >= 31) {
+        return sign ? 0xFC00 : 0x7C00;
+    } else if (exp <= 0) {
+        if (exp < -10) return sign ? 0x8000 : 0;
+        mant = (mant | 0x800000) >> (1 - exp);
+        exp = 0;
+    }
+    uint16_t result = (sign << 15) | ((uint16_t)exp << 10) | (mant >> 13);
+    return result;
+#endif
 }
 
 // ─── Tensor info ────────────────────────────────────────────────────────
@@ -2681,6 +2721,7 @@ ATLAS_API void atlas_rope_f32(float* q, float* k, int n_heads, int n_kv_heads,
 // v_cache: [n_kv_heads, max_seq] uint8_t — int4 V cache (per-block fp16 scale)
 // output: [B, n_heads * head_dim] float32
 // q_norm_w, k_norm_w: [head_dim] uint8 fp16 RMSNorm weights (QK-Norm, Qwen3), NULL = skip
+#ifndef __aarch64__
 ATLAS_API void atlas_attention_f32(
     float* q, float* k, float* v, const int* positions,
     uint8_t* k_cache, uint8_t* v_cache,
@@ -3072,8 +3113,417 @@ ATLAS_API void atlas_attention_f32(
         P_ACCUM(attn_weighted);
     }
 }
+#else
+// ARM64 NEON version of atlas_attention_f32
+// Uses NEON intrinsics for int4 V-cache decode + f32 FMA
+ATLAS_API void atlas_attention_f32(
+    float* q, float* k, float* v, const int* positions,
+    uint8_t* k_cache, uint8_t* v_cache,
+    int max_seq_len, int seq_now, int B,
+    int n_heads, int n_kv_heads, int head_dim,
+    float rope_theta, float rope_scale, float* output,
+    const uint8_t* q_norm_w, const uint8_t* k_norm_w,
+    int base_seq_len, bool interleaved_rope) {
 
-// ─── Helper: quantize float32 activations → uint8 (+128 offset) ────────
+    int n_rep = n_heads / n_kv_heads;
+    float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+    float ctx_scale = base_seq_len > 0 ? (float)max_seq_len / (float)base_seq_len : 1.0f;
+    if (ctx_scale < 1.0f) ctx_scale = 1.0f;
+    float total_scale = rope_scale;
+    if (ctx_scale > 1.001f) total_scale *= ctx_scale;
+    float eff_theta = rope_theta;
+    if (total_scale > 1.001f) {
+        eff_theta *= powf(total_scale, (float)head_dim / (float)(head_dim - 2));
+    }
+
+    int ring_start = seq_now > max_seq_len ? seq_now - max_seq_len : 0;
+    int ring_len = seq_now > max_seq_len ? max_seq_len : seq_now;
+
+    int max_seq = ring_len;
+    static thread_local float* scores_buf = nullptr;
+    static thread_local size_t scores_cap = 0;
+    size_t needed = (size_t)n_heads * max_seq;
+    if (needed > scores_cap) {
+        free(scores_buf);
+        scores_cap = needed;
+        scores_buf = (float*)malloc(scores_cap * sizeof(float));
+        if (!scores_buf) { scores_cap = 0; return; }
+    }
+    float* scores = scores_buf;
+
+    for (int b = 0; b < B; b++) {
+        P_START(attn_prep);
+        int pos = positions[b];
+        float* qb = q + b * n_heads * head_dim;
+        float* kb = k + b * n_kv_heads * head_dim;
+        float* vb = v + b * n_kv_heads * head_dim;
+
+        if (q_norm_w) {
+            for (int h = 0; h < n_heads; h++) {
+                float* qh = qb + h * head_dim;
+                float ss = 0.0f;
+                for (int d = 0; d < head_dim; d++) ss += qh[d] * qh[d];
+                float rms = 1.0f / sqrtf(ss / head_dim + 1e-6f);
+                for (int d = 0; d < head_dim; d++) {
+                    uint16_t w16; memcpy(&w16, q_norm_w + d * 2, 2);
+                    qh[d] *= rms * fp16_to_fp32(w16);
+                }
+            }
+        }
+        if (k_norm_w) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                float* kh = kb + h * head_dim;
+                float ss = 0.0f;
+                for (int d = 0; d < head_dim; d++) ss += kh[d] * kh[d];
+                float rms = 1.0f / sqrtf(ss / head_dim + 1e-6f);
+                for (int d = 0; d < head_dim; d++) {
+                    uint16_t w16; memcpy(&w16, k_norm_w + d * 2, 2);
+                    kh[d] *= rms * fp16_to_fp32(w16);
+                }
+            }
+        }
+
+        // RoPE on Q
+        for (int h = 0; h < n_heads; h++) {
+            float* qh = qb + h * head_dim;
+            for (int i = 0; i < head_dim / 2; i++) {
+                float freq = 1.0f / powf(eff_theta, 2.0f * i / head_dim);
+                float c = cosf(pos * freq), s = sinf(pos * freq);
+                if (interleaved_rope) {
+                    float a = qh[2*i], b0 = qh[2*i+1];
+                    qh[2*i]   = a * c - b0 * s;
+                    qh[2*i+1] = a * s + b0 * c;
+                } else {
+                    int jj = i + head_dim / 2;
+                    float a = qh[i], b0 = qh[jj];
+                    qh[i] = a * c - b0 * s;
+                    qh[jj] = a * s + b0 * c;
+                }
+            }
+        }
+        // RoPE on K
+        for (int h = 0; h < n_kv_heads; h++) {
+            float* kh = kb + h * head_dim;
+            for (int i = 0; i < head_dim / 2; i++) {
+                float freq = 1.0f / powf(eff_theta, 2.0f * i / head_dim);
+                float c = cosf(pos * freq), s = sinf(pos * freq);
+                if (interleaved_rope) {
+                    float a = kh[2*i], b0 = kh[2*i+1];
+                    kh[2*i]   = a * c - b0 * s;
+                    kh[2*i+1] = a * s + b0 * c;
+                } else {
+                    int jj = i + head_dim / 2;
+                    float a = kh[i], b0 = kh[jj];
+                    kh[i] = a * c - b0 * s;
+                    kh[jj] = a * s + b0 * c;
+                }
+            }
+        }
+
+        // Store K, V into int4 cache
+        int n_blk = (head_dim + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+        int pos_bytes = kv_pos_bytes(head_dim);
+        for (int h = 0; h < n_kv_heads; h++) {
+            float* k_row = kb + h * head_dim;
+            float* v_row = vb + h * head_dim;
+            int cache_pos = pos % max_seq_len;
+            uint8_t* kc = k_cache + (size_t)h * max_seq_len * pos_bytes + (size_t)cache_pos * pos_bytes;
+            uint8_t* vc = v_cache + (size_t)h * max_seq_len * pos_bytes + (size_t)cache_pos * pos_bytes;
+            for (int blk = 0; blk < n_blk; blk++) {
+                int blk_start = blk * KV_BLOCK_SIZE;
+                int blk_end = blk_start + KV_BLOCK_SIZE;
+                if (blk_end > head_dim) blk_end = head_dim;
+                float max_abs_k = 0.0f, max_abs_v = 0.0f;
+                for (int d = blk_start; d < blk_end; d++) {
+                    float ak = fabsf(k_row[d]); if (ak > max_abs_k) max_abs_k = ak;
+                    float av = fabsf(v_row[d]); if (av > max_abs_v) max_abs_v = av;
+                }
+                float scale_k = (max_abs_k > 1e-10f) ? max_abs_k / 7.0f : 1.0f;
+                float scale_v = (max_abs_v > 1e-10f) ? max_abs_v / 7.0f : 1.0f;
+                uint16_t sk = fp32_to_fp16(scale_k), sv = fp32_to_fp16(scale_v);
+                memcpy(kc + blk * KV_BYTES_PER_BLOCK, &sk, 2);
+                memcpy(vc + blk * KV_BYTES_PER_BLOCK, &sv, 2);
+                float inv_sk = 1.0f / scale_k, inv_sv = 1.0f / scale_v;
+                int ne = blk_end - blk_start;
+                for (int i = 0; i < ne; i += 2) {
+                    int d = blk_start + i;
+                    int vk0 = (int)(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
+                    int vk1 = (int)(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
+                    kc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vk0 & 0x0F) | ((vk1 & 0x0F) << 4);
+                    int vv0 = (int)(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
+                    int vv1 = (int)(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
+                    vc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vv0 & 0x0F) | ((vv1 & 0x0F) << 4);
+                }
+            }
+        }
+        P_ACCUM(attn_prep);
+
+        P_START(attn_scores);
+        {
+            for (int i = 0; i < n_heads * max_seq; i++)
+                scores[i] = -1e9f;
+        }
+
+        const int TILE_S = 32;
+        float32x4_t zero = vdupq_n_f32(0.0f);
+
+        for (int s0 = 0; s0 < ring_len; s0 += TILE_S) {
+            int s1 = s0 + TILE_S;
+            if (s1 > ring_len) s1 = ring_len;
+            int key_pos_start = ring_start + s0;
+            int key_pos_end = ring_start + s1 - 1;
+
+            if (key_pos_start > pos) break;
+
+            bool all_past = (key_pos_end <= pos);
+
+            #pragma omp parallel for
+            for (int h = 0; h < n_heads; h++) {
+                int kh = h / n_rep;
+                const float* qh = qb + h * head_dim;
+                float* sh = scores + h * max_seq;
+
+                if (all_past) {
+                    for (int s = s0; s < s1; s++) {
+                        int cache_idx = (ring_start + s) % max_seq_len;
+                        const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                        float32x4_t sum_lo = zero, sum_hi = zero;
+                        for (int blk = 0; blk < n_blk; blk++) {
+                            int blk_start = blk * KV_BLOCK_SIZE;
+                            int blk_end = blk_start + KV_BLOCK_SIZE;
+                            if (blk_end > head_dim) blk_end = head_dim;
+                            uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                            float scale = fp16_to_fp32(sr);
+                            float32x4_t scale_v = vdupq_n_f32(scale);
+                            const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                            int j = blk_start;
+                            for (; j + 8 <= blk_end; j += 8) {
+                                int nib_off = (j - blk_start) / 2;
+                                int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                uint32x4_t pw_v = vdupq_n_u32(0);
+                                pw_v = vsetq_lane_u32((uint32_t)pw, pw_v, 0);
+                                uint8x16_t v16 = vreinterpretq_u8_u32(pw_v);
+                                uint8x8_t v8 = vget_low_u8(v16);
+                                uint8x8_t lo = vand_u8(v8, vdup_n_u8(0x0F));
+                                uint8x8_t hi = vshr_n_u8(v8, 4);
+                                int8x8_t inter = vzip_s8(vreinterpret_s8_u8(lo), vreinterpret_s8_u8(hi)).val[0];
+                                inter = vsub_s8(veor_s8(inter, vdup_n_s8(8)), vdup_n_s8(8));
+                                int16x8_t i16 = vmovl_s8(inter);
+                                float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16)));
+                                float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16)));
+                                wf_lo = vmulq_f32(wf_lo, scale_v);
+                                wf_hi = vmulq_f32(wf_hi, scale_v);
+                                float32x4_t q_lo = vld1q_f32(qh + j);
+                                float32x4_t q_hi = vld1q_f32(qh + j + 4);
+                                sum_lo = vfmaq_f32(sum_lo, q_lo, wf_lo);
+                                sum_hi = vfmaq_f32(sum_hi, q_hi, wf_hi);
+                            }
+                            for (; j < blk_end; j++) {
+                                int nib_off = (j - blk_start) / 2;
+                                int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                int nib = (nb[nib_off] >> shft) & 0x0F;
+                                float32x4_t tv = vdupq_n_f32(qh[j] * (float)((nib ^ 8) - 8) * scale);
+                                sum_lo = vaddq_f32(sum_lo, tv);
+                                sum_hi = vaddq_f32(sum_hi, tv);
+                            }
+                        }
+                        float sum = vaddvq_f32(sum_lo) + vaddvq_f32(sum_hi);
+                        sh[s] = sum * inv_sqrt_d;
+                    }
+                } else {
+                    for (int s = s0; s < s1; s++) {
+                        int attn_pos = ring_start + s;
+                        if (attn_pos <= pos) {
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* k_pos = k_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            float32x4_t sum_lo = zero, sum_hi = zero;
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                uint16_t sr; memcpy(&sr, k_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                float32x4_t scale_v = vdupq_n_f32(scale);
+                                const uint8_t* nb = k_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                int j = blk_start;
+                                for (; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    uint32x4_t pw_v = vdupq_n_u32(0);
+                                    pw_v = vsetq_lane_u32((uint32_t)pw, pw_v, 0);
+                                    uint8x16_t v16 = vreinterpretq_u8_u32(pw_v);
+                                    uint8x8_t v8 = vget_low_u8(v16);
+                                    uint8x8_t lo = vand_u8(v8, vdup_n_u8(0x0F));
+                                    uint8x8_t hi = vshr_n_u8(v8, 4);
+                                    int8x8_t inter = vzip_s8(vreinterpret_s8_u8(lo), vreinterpret_s8_u8(hi)).val[0];
+                                    inter = vsub_s8(veor_s8(inter, vdup_n_s8(8)), vdup_n_s8(8));
+                                    int16x8_t i16 = vmovl_s8(inter);
+                                    float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16)));
+                                    float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16)));
+                                    wf_lo = vmulq_f32(wf_lo, scale_v);
+                                    wf_hi = vmulq_f32(wf_hi, scale_v);
+                                    float32x4_t q_lo = vld1q_f32(qh + j);
+                                    float32x4_t q_hi = vld1q_f32(qh + j + 4);
+                                    sum_lo = vfmaq_f32(sum_lo, q_lo, wf_lo);
+                                    sum_hi = vfmaq_f32(sum_hi, q_hi, wf_hi);
+                                }
+                                for (; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    float32x4_t tv = vdupq_n_f32(qh[j] * (float)((nib ^ 8) - 8) * scale);
+                                    sum_lo = vaddq_f32(sum_lo, tv);
+                                    sum_hi = vaddq_f32(sum_hi, tv);
+                                }
+                            }
+                            float sum = vaddvq_f32(sum_lo) + vaddvq_f32(sum_hi);
+                            sh[s] = sum * inv_sqrt_d;
+                        }
+                    }
+                }
+            }
+        }
+        P_ACCUM(attn_scores);
+
+        P_START(attn_softmax);
+        #pragma omp parallel for
+        for (int h = 0; h < n_heads; h++) {
+            float* sh = scores + h * max_seq;
+            float max_val = -1e9f;
+            for (int s = 0; s < max_seq; s++) {
+                float val = sh[s];
+                if (val > max_val) max_val = val;
+            }
+            float sum = 0.0f;
+            for (int s = 0; s < max_seq; s++) {
+                float e = expf(sh[s] - max_val);
+                sh[s] = e;
+                sum += e;
+            }
+            float inv_sum = 1.0f / fmaxf(sum, 1e-10f);
+            for (int s = 0; s < max_seq; s++) sh[s] *= inv_sum;
+        }
+        P_ACCUM(attn_softmax);
+        P_START(attn_weighted);
+        {
+            const int TILE_S = 32;
+            for (int s0 = 0; s0 < ring_len; s0 += TILE_S) {
+                int s1 = s0 + TILE_S;
+                if (s1 > ring_len) s1 = ring_len;
+                int key_pos_start = ring_start + s0;
+                int key_pos_end = ring_start + s1 - 1;
+                if (key_pos_start > pos) break;
+                bool all_past = (key_pos_end <= pos);
+                #pragma omp parallel for
+                for (int h = 0; h < n_heads; h++) {
+                    int kh = h / n_rep;
+                    float* sh = scores + h * max_seq;
+                    float* out_h = output + b * n_heads * head_dim + h * head_dim;
+                    if (s0 == 0) {
+                        for (int d = 0; d < head_dim; d++) out_h[d] = 0.0f;
+                    }
+                    if (all_past) {
+                        for (int s = s0; s < s1; s++) {
+                            float score = sh[s];
+                            float32x4_t sv = vdupq_n_f32(score);
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* v_pos = v_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                float32x4_t scale_v = vdupq_n_f32(scale);
+                                const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                for (int j = blk_start; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    uint32x4_t pw_v = vdupq_n_u32(0);
+                                    pw_v = vsetq_lane_u32((uint32_t)pw, pw_v, 0);
+                                    uint8x16_t v16 = vreinterpretq_u8_u32(pw_v);
+                                    uint8x8_t v8 = vget_low_u8(v16);
+                                    uint8x8_t lo = vand_u8(v8, vdup_n_u8(0x0F));
+                                    uint8x8_t hi = vshr_n_u8(v8, 4);
+                                    int8x8_t inter = vzip_s8(vreinterpret_s8_u8(lo), vreinterpret_s8_u8(hi)).val[0];
+                                    inter = vsub_s8(veor_s8(inter, vdup_n_s8(8)), vdup_n_s8(8));
+                                    int16x8_t i16 = vmovl_s8(inter);
+                                    float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16)));
+                                    float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16)));
+                                    wf_lo = vmulq_f32(wf_lo, scale_v);
+                                    wf_hi = vmulq_f32(wf_hi, scale_v);
+                                    float32x4_t out_lo = vld1q_f32(out_h + j);
+                                    float32x4_t out_hi = vld1q_f32(out_h + j + 4);
+                                    out_lo = vfmaq_f32(out_lo, sv, wf_lo);
+                                    out_hi = vfmaq_f32(out_hi, sv, wf_hi);
+                                    vst1q_f32(out_h + j, out_lo);
+                                    vst1q_f32(out_h + j + 4, out_hi);
+                                }
+                                for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    float vv = (float)((nib ^ 8) - 8) * scale;
+                                    out_h[j] += score * vv;
+                                }
+                            }
+                        }
+                    } else {
+                        for (int s = s0; s < s1; s++) {
+                            int attn_pos = ring_start + s;
+                            if (attn_pos > pos) continue;
+                            float score = sh[s];
+                            float32x4_t sv = vdupq_n_f32(score);
+                            int cache_idx = (ring_start + s) % max_seq_len;
+                            const uint8_t* v_pos = v_cache + (size_t)kh * max_seq_len * pos_bytes + (size_t)cache_idx * pos_bytes;
+                            for (int blk = 0; blk < n_blk; blk++) {
+                                int blk_start = blk * KV_BLOCK_SIZE;
+                                int blk_end = blk_start + KV_BLOCK_SIZE;
+                                if (blk_end > head_dim) blk_end = head_dim;
+                                uint16_t sr; memcpy(&sr, v_pos + blk * KV_BYTES_PER_BLOCK, 2);
+                                float scale = fp16_to_fp32(sr);
+                                float32x4_t scale_v = vdupq_n_f32(scale);
+                                const uint8_t* nb = v_pos + blk * KV_BYTES_PER_BLOCK + 2;
+                                for (int j = blk_start; j + 8 <= blk_end; j += 8) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int32_t pw; memcpy(&pw, nb + nib_off, 4);
+                                    uint32x4_t pw_v = vdupq_n_u32(0);
+                                    pw_v = vsetq_lane_u32((uint32_t)pw, pw_v, 0);
+                                    uint8x16_t v16 = vreinterpretq_u8_u32(pw_v);
+                                    uint8x8_t v8 = vget_low_u8(v16);
+                                    uint8x8_t lo = vand_u8(v8, vdup_n_u8(0x0F));
+                                    uint8x8_t hi = vshr_n_u8(v8, 4);
+                                    int8x8_t inter = vzip_s8(vreinterpret_s8_u8(lo), vreinterpret_s8_u8(hi)).val[0];
+                                    inter = vsub_s8(veor_s8(inter, vdup_n_s8(8)), vdup_n_s8(8));
+                                    int16x8_t i16 = vmovl_s8(inter);
+                                    float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16)));
+                                    float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16)));
+                                    wf_lo = vmulq_f32(wf_lo, scale_v);
+                                    wf_hi = vmulq_f32(wf_hi, scale_v);
+                                    float32x4_t out_lo = vld1q_f32(out_h + j);
+                                    float32x4_t out_hi = vld1q_f32(out_h + j + 4);
+                                    out_lo = vfmaq_f32(out_lo, sv, wf_lo);
+                                    out_hi = vfmaq_f32(out_hi, sv, wf_hi);
+                                    vst1q_f32(out_h + j, out_lo);
+                                    vst1q_f32(out_h + j + 4, out_hi);
+                                }
+                                for (int j = blk_start + ((blk_end - blk_start) / 8) * 8; j < blk_end; j++) {
+                                    int nib_off = (j - blk_start) / 2;
+                                    int shft = ((j - blk_start) & 1) ? 4 : 0;
+                                    int nib = (nb[nib_off] >> shft) & 0x0F;
+                                    float vv = (float)((nib ^ 8) - 8) * scale;
+                                    out_h[j] += score * vv;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        P_ACCUM(attn_weighted);
+    }
+}
+#endif
 // act: [B, D] float32 → act_u8: [B, D] uint8, max_abs: [B] float32
 static void quantize_f32_to_u8(const float* act, int B, int D,
                                 float* max_abs_out, uint8_t* act_u8_out) {
@@ -3178,6 +3628,7 @@ ATLAS_API void atlas_reset_cache(void* model) {
 }
 
 // ─── Helper: horizontal sum of __m256 float ──────────────────────────
+#ifndef __aarch64__
 static inline float hsum_ps(__m256 v) {
     __m128 l = _mm256_castps256_ps128(v);
     __m128 h = _mm256_extractf128_ps(v, 1);
@@ -3186,11 +3637,13 @@ static inline float hsum_ps(__m256 v) {
     l = _mm_hadd_ps(l, l);
     return _mm_cvtss_f32(l);
 }
+#endif
 
 // ─── v2.7.0: TurboQuant fused matmul kernel (2-bit packed, K_tile=32) ───
 // Fused 2-bit unpack (SSE4.1) + f32×f32 FMA (AVX2) with g128 block-scaling.
 // No intermediate int8 buffer — decode on-the-fly in registers.
 // ttype=7 tensor_data layout: [block_size:1][n_blocks:2][scales:N_blocks*2][packed:rows*packed_cols]
+#ifndef __aarch64__
 static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const float* activations, float* output, int B) {
@@ -3264,6 +3717,7 @@ static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
         }
     }
 }
+#endif
 
 // ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
 // act_u8: [B, input_dim] uint8 quantized activations [1, 255]
@@ -3332,6 +3786,7 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
 // Uses the +128 offset trick:
 //   sum(act_u8[i] * w[i]) → dot = sum(act_u8[i] * lut[t]) - 128 * sum_w
 //   result = dot / (127.0 * scale)  -- dequant scale applied by caller
+#ifndef __aarch64__
 static void matmul_tq1_packed_reorder(int rows, int input_dim,
     const uint8_t* packed, int packed_cols,
     const uint8_t* act_u8, const float* max_abs,
@@ -3415,6 +3870,7 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
         free(decode_buf);
     }
 }
+#endif
 
 // ─── Gate activation: SiLU (default) vs ReLU² (BitNet) ────────────
 static inline float gate_activation(float g, bool use_relu2) {
@@ -4353,6 +4809,7 @@ ATLAS_API void atlas_convert_to_tq2(void* model_ptr) {
 // weights: [rows, input_dim] int8 weights
 // scale: per-tensor dequant scale
 // output: [B, rows] reordered float output
+#ifndef __aarch64__
 static void matmul_f32_reorder(int rows, int input_dim,
     const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
     float scale, float* __restrict__ output, int B) {
@@ -4491,6 +4948,7 @@ static void matmul_f32_per_row(int rows, int input_dim,
         }
     }
 }
+#endif
 
 
 
@@ -4783,7 +5241,9 @@ static void forward_layer_internal(
             get_tq1_packed(tv, w, rows, dim, pc, scale);
             matmul_tq1_packed_reorder(rows, dim, w, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
         }
+#ifndef __aarch64__
     } else if (m->use_ternary_matmul) {
+
         // Ternary-add path: vpsignb, no multiplication, no row_sums
         quantize_f32_to_u8(m->buf_act, B, max_qkv_dim, max_abs, m->buf_i8);
         {
@@ -5087,6 +5547,7 @@ static void forward_layer_internal(
         if (f) { fwrite(m->buf_act, sizeof(float), B * H, f); fclose(f); }
     }
     #endif
+#endif
     float* x_norm2 = m->buf_act;
     P_ACCUM(rmsnorm);
     P_START(ffn_gate_up);
@@ -5195,7 +5656,9 @@ static void forward_layer_internal(
         quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
         matmul_i4_reorder_deq(tg.row_dim, g_cols, g_pw, g_rs, m->buf_i8, max_abs, g_scale, m->buf_act, m->buf_gate, B);
         matmul_i4_reorder_deq(tu.row_dim, u_cols, u_pw, u_rs, m->buf_i8, max_abs, u_scale, m->buf_act, m->buf_up, B);
+#ifndef __aarch64__
     } else if (m->use_ternary_matmul) {
+
         // Ternary-add FFN: vpsignb, no multiplication, no row_sums correction
         quantize_f32_to_u8(m->buf_act, B, ffn_dim, max_abs, m->buf_i8);
 
@@ -5458,6 +5921,7 @@ static void forward_layer_internal(
         }
     }
     }
+#endif
     P_ACCUM(ffn_gate_up);
     P_START(silu_down);
 
@@ -6012,6 +6476,8 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
     const int32_t* offs = m->lm_head_offsets;
     const float* scales = m->lm_head_scales;
 
+    #ifndef __aarch64__
+    // x86 path: _mm256_maddubs_epi16 + offset correction
     #ifdef _OPENMP
     #pragma omp parallel for
     #endif
@@ -6049,6 +6515,44 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
             output[b * V + r] = (float)dot * (max_abs[b] / 127.0f) * s;
         }
     }
+    #else
+    // ARM64 NEON path: XOR-0x80 + vdotq_s32 (eliminates offset subtraction)
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (int r = 0; r < V; r++) {
+        const int8_t* wr = w + r * H;
+        float s = scales[r];
+
+        for (int b = 0; b < B; b++) {
+            const uint8_t* a = act_u8 + b * H;
+            int c = 0;
+            int32x4_t acc = vdupq_n_s32(0);
+            uint8x16_t xor_80 = vdupq_n_u8(0x80);
+
+            for (; c + 32 <= H; c += 32) {
+                uint8x16_t au0 = vld1q_u8(a + c);
+                uint8x16_t au1 = vld1q_u8(a + c + 16);
+                int8x16_t wv0 = vld1q_s8(wr + c);
+                int8x16_t wv1 = vld1q_s8(wr + c + 16);
+
+                int8x16_t a0 = vreinterpretq_s8_u8(veorq_u8(au0, xor_80));
+                int8x16_t a1 = vreinterpretq_s8_u8(veorq_u8(au1, xor_80));
+
+                acc = vdotq_s32(acc, a0, wv0);
+                acc = vdotq_s32(acc, a1, wv1);
+            }
+
+            int32_t dot = vaddvq_s32(acc);
+
+            for (; c < H; c++) {
+                dot += ((int)a[c] ^ 0x80) * (int)wr[c];
+            }
+
+            output[b * V + r] = (float)dot * (max_abs[b] / 127.0f) * s;
+        }
+    }
+    #endif
 
     atlas_vfree((uint8_t*)act_u8);
     atlas_vfree((uint8_t*)max_abs);

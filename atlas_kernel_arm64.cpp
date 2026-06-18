@@ -605,3 +605,53 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
         }
     }
 }
+
+// atlas_matmul_i4_f32: int4×uint8 matmul (nibble unpack + XOR-0x80 + vdotq_s32)
+// Same signature as x86 version; XOR-0x80 eliminates row_sums correction.
+extern "C" void atlas_matmul_i4_f32(int rows, int cols,
+    const uint8_t* packed_weights, const uint8_t* act_u8,
+    const int32_t* row_sums, float* output, int n_tokens) {
+    (void)row_sums;
+    int packed_cols = (cols + 1) / 2;
+    uint8x16_t xor_80 = vdupq_n_u8(0x80);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2)
+    #endif
+    for (int t = 0; t < n_tokens; t++) {
+        const uint8_t* a = act_u8 + t * cols;
+        for (int r = 0; r < rows; r++) {
+            const uint8_t* pw = packed_weights + r * packed_cols;
+            int32x4_t acc = vdupq_n_s32(0);
+            int c = 0;
+
+            for (; c + 32 <= cols; c += 32) {
+                int pc = c / 2;
+                uint8x16_t packed = vld1q_u8(pw + pc);
+                uint8x16_t lo = vandq_u8(packed, vdupq_n_u8(0x0F));
+                uint8x16_t hi = vshrq_n_u8(packed, 4);
+                int8x16x2_t zipped = vzipq_s8(
+                    vreinterpretq_s8_u8(lo),
+                    vreinterpretq_s8_u8(hi));
+                int8x16_t w0 = vsubq_s8(veorq_s8(zipped.val[0], vdupq_n_s8(8)), vdupq_n_s8(8));
+                int8x16_t w1 = vsubq_s8(veorq_s8(zipped.val[1], vdupq_n_s8(8)), vdupq_n_s8(8));
+                uint8x16_t au0 = vld1q_u8(a + c);
+                uint8x16_t au1 = vld1q_u8(a + c + 16);
+                int8x16_t act0 = vreinterpretq_s8_u8(veorq_u8(au0, xor_80));
+                int8x16_t act1 = vreinterpretq_s8_u8(veorq_u8(au1, xor_80));
+                acc = vdotq_s32(acc, act0, w0);
+                acc = vdotq_s32(acc, act1, w1);
+            }
+
+            int32_t dot = vaddvq_s32(acc);
+            for (; c < cols; c++) {
+                int pc = c / 2;
+                int nibble = (c & 1) ? (pw[pc] >> 4) : (pw[pc] & 0x0F);
+                int8_t w_val = (int8_t)((nibble ^ 8) - 8);
+                dot += ((int)a[c] ^ 0x80) * (int)w_val;
+            }
+
+            output[t * rows + r] = (float)dot;
+        }
+    }
+}
