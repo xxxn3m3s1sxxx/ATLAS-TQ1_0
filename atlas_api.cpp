@@ -111,7 +111,11 @@ extern "C" void atlas_matmul_i4_vnni(int rows, int cols,
       size_t total = hdr + size + (align - 1);
       size_t pages = (total + 4095) & ~4095;
       void* p = mmap(NULL, pages, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_POPULATE
+                     | MAP_POPULATE
+#endif
+                     , -1, 0);
       if (p == MAP_FAILED) return nullptr;
       uint8_t* base = (uint8_t*)p;
       uint8_t* data = (uint8_t*)(((uintptr_t)(base + hdr + align - 1)) & ~(align - 1));
@@ -132,6 +136,7 @@ extern "C" void atlas_matmul_i4_vnni(int rows, int cols,
 // ─── AVX2 CPUID check ─────────────────────────────────────────────────
 // Returns 1 if AVX2 is supported, 0 otherwise. Prints error to stderr.
 // Prevents SIGILL on pre-Haswell CPUs (before 2013).
+#ifndef __aarch64__
 #ifdef _WIN32
 #include <intrin.h>
 static int check_avx2(void) {
@@ -171,6 +176,7 @@ static int check_avx512_vnni(void) {
     return 0;
 }
 #endif
+#endif // !__aarch64__
 
 // --- Int4 KV cache block size ------------------------------------------------
 #define KV_BLOCK_SIZE 32
