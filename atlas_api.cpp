@@ -389,12 +389,7 @@ typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
 // Timer for debug profiling
 #if defined(ATLAS_DEBUG_MODE) || defined(PROFILE_MODE)
-static inline double atlas_now() {
-    LARGE_INTEGER c, f;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)f.QuadPart;
-}
+#include "atlas_timer.h"
 
 // ─── v2.12.0: Per-operation profiling accumulators ───
 // Tracks cumulative wall time across all layers + lm_head.
