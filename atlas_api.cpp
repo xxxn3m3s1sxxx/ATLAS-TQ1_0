@@ -62,20 +62,6 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
     const int8_t* weights, const uint8_t* act_u8,
     const float* max_abs, float scale, float* output, int B);
 
-// x86-only matmul stubs — should never be reached on ARM64
-static void matmul_turboquant_fused(int, int, int,
-    const uint8_t*, int, int,
-    const float*, float*, int) {
-    fprintf(stderr, "[ATLAS] ARM64: TurboQuant (ttype=7) not supported\n");
-    abort();
-}
-static void matmul_tq1_packed_reorder(int, int,
-    const uint8_t*, int,
-    const uint8_t*, const float*,
-    float, float*, int) {
-    fprintf(stderr, "[ATLAS] ARM64: TQ1-packed (ttype=0) not supported\n");
-    abort();
-}
 #endif
 #include <omp.h>
 
@@ -4114,6 +4100,7 @@ static void tq1_lut_prefill_kernel(int rows, int input_dim, int packed_cols,
 // Per-row per-block fp16 scales decoded from tensor_data header.
 // Each output row has its own set of n_blocks fp16 scales.
 // tensor_data layout: [block_size:1][n_blocks:2][scales: rows*n_blocks*2][packed_TQ1]
+#ifndef __aarch64__
 static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
     const uint8_t* tensor_data, int block_size, int n_blocks,
     const uint8_t* act_u8, const float* max_abs,
@@ -4260,6 +4247,8 @@ static void matmul_tq1_block_reorder(int rows, int input_dim, int packed_cols,
 
     free(block_scales);
 }
+#endif
+
 
 // VNNI kernel lives in atlas_vnni.cpp (compiled with target("avx10.2"))
 
