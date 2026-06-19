@@ -30,6 +30,7 @@
 // For per-operation breakdown in the three FFN kernel hot loops.
 // Call profile_print_arm64() from atlas_api.cpp after profile_print().
 #if defined(PROFILE_MODE) || defined(ATLAS_DEBUG_MODE)
+  #include <cstdio>
   #include "atlas_timer.h"
   static thread_local struct {
       uint64_t ffn_i4_unpack;     // nibble unpack + sign extend in matmul_i4
@@ -39,8 +40,8 @@
       uint64_t ffn_default_conv;  // XOR-0x80 conversion + load in fused default
       uint64_t ffn_default_fma;   // vdotq_s32 in fused default
   } g_prof_arm64;
-  #define ARM64_P_START()  uint64_t _arm64_tsc = atlas_cycles()
-  #define ARM64_P_ACCUM(f) g_prof_arm64.ffn_##f += (atlas_cycles() - _arm64_tsc)
+  #define ARM64_P_START()  { uint64_t _arm64_tsc = atlas_cycles();
+  #define ARM64_P_ACCUM(f) g_prof_arm64.ffn_##f += (atlas_cycles() - _arm64_tsc); }
   void profile_print_arm64() {
       uint64_t tot = g_prof_arm64.ffn_i4_unpack + g_prof_arm64.ffn_i4_fma
                    + g_prof_arm64.ffn_f32_conv + g_prof_arm64.ffn_f32_fma
