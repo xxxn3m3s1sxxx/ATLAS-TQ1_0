@@ -2,6 +2,12 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_profiling:
+        description: 'Enable ARM64 FFN micro-profiling (-DPROFILE_MODE)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [master]
     paths:
@@ -232,7 +238,8 @@ jobs:
       - name: Build (ARM64 NEON)
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
-          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -D__aarch64__ -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
+          PROFILE_FLAG="${{ inputs.enable_profiling == true && '-DPROFILE_MODE' || '' }}"
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -D__aarch64__ $PROFILE_FLAG -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
           echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
           $LLVM_PREFIX/bin/clang++ -std=c++17 -O2 -c atlas_cli.cpp -o atlas_cli.o
       - name: Generate test fixtures
@@ -243,6 +250,24 @@ jobs:
           python -m pytest tests/test_dll.py -v
           python -m pytest tests/test_fixtures.py -v
           python -c "import atlas_server; print('[CI] atlas_server.py OK')"
+      - name: Profiling benchmark
+        if: inputs.enable_profiling == true
+        run: |
+          python -c "
+from atlas_infer import AtlasModel
+m = AtlasModel('tests/falcon3-v6.atlas')
+out = m.generate_c('What is the capital of France?', max_new=50, temp=0.7, top_k=40, max_seq_len=256)
+print('Output:', out)
+" 2> profiling_stderr.txt
+          echo "=== PROFILING OUTPUT ==="
+          cat profiling_stderr.txt
+          [ -s profiling_stderr.txt ] || echo "[WARN] No profiling output in stderr"
+      - name: Upload profiling artifact
+        if: inputs.enable_profiling == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-arm64
+          path: profiling_stderr.txt
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
