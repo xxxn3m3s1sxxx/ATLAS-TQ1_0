@@ -5481,6 +5481,7 @@ static void forward_layer_internal(
             quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
         } else if (to.ttype == 11) {
+#ifndef __aarch64__
             // Per-row int8 O projection
             const uint16_t* o_rs_fp16 = (const uint16_t*)(to.data);
             const int8_t* ow = (const int8_t*)(to.data + to.row_dim * 2);
@@ -5491,6 +5492,7 @@ static void forward_layer_internal(
                 memset(m->buf_act + b * o11_dim + qd, 0, (o11_dim - qd) * sizeof(float));
             }
             matmul_f32_reorder_per_row(o11_rows, o11_dim, ow, m->buf_act, o_rs_fp16, m->buf_gate, B);
+#endif
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(to, w, rs, rows, dim, scale);
@@ -5774,6 +5776,7 @@ static void forward_layer_internal(
     } else if (m->use_f32_matmul) {
         // Full-precision FFN: f32 activations × int8 weights, no activation quantization
         if (tg.ttype == 11 && tu.ttype == 11) {
+#ifndef __aarch64__
             // Per-row int8 (ttype=11): gate and up separately
             const uint16_t* g_rs_fp16 = (const uint16_t*)(tg.data);
             const int8_t* gw = (const int8_t*)(tg.data + tg.row_dim * 2);
@@ -5786,6 +5789,7 @@ static void forward_layer_internal(
             }
             matmul_f32_per_row(tg.row_dim, dim11, gw, m->buf_act, ffn_dim, g_rs_fp16, m->buf_gate, B);
             matmul_f32_per_row(tu.row_dim, dim11, uw, m->buf_act, ffn_dim, u_rs_fp16, m->buf_up, B);
+#endif
         } else {
             int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
             int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
@@ -6131,6 +6135,7 @@ static void forward_layer_internal(
             quantize_f32_to_u8(m->buf_act, B, down_dim, max_abs, m->buf_i8);
             matmul_i4_reorder_deq(td.row_dim, d_cols, d_pw, d_rs, m->buf_i8, max_abs, d_scale, m->buf_act, m->buf_gate, B);
         } else if (td.ttype == 11) {
+#ifndef __aarch64__
             // Per-row int8 down_proj (ttype=11)
             const uint16_t* d_rs_fp16 = (const uint16_t*)(td.data);
             const int8_t* dw = (const int8_t*)(td.data + td.row_dim * 2);
@@ -6179,6 +6184,7 @@ static void forward_layer_internal(
             fprintf(stderr, "\n");
             }
             #endif
+#endif
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(td, w, rs, rows, dim, scale);
