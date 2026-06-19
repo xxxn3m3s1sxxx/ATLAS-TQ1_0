@@ -5418,7 +5418,6 @@ static void forward_layer_internal(
             get_tq1_packed(tv, w, rows, dim, pc, scale);
             matmul_tq1_packed_reorder(rows, dim, w, pc, m->buf_i8, max_abs, scale, m->buf_up, B);
         }
-#ifndef __aarch64__
     } else if (m->use_ternary_matmul) {
 
         // Ternary-add path: vpsignb, no multiplication, no row_sums
@@ -5639,7 +5638,6 @@ static void forward_layer_internal(
             quantize_f32_to_u8(m->buf_act, B, dim, max_abs, m->buf_i8);
             matmul_tq1_packed_reorder(rows, dim, wp, pc, m->buf_i8, max_abs, scale, m->buf_gate, B);
         } else if (to.ttype == 11) {
-#ifndef __aarch64__
             // Per-row int8 O projection
             const uint16_t* o_rs_fp16 = (const uint16_t*)(to.data);
             const int8_t* ow = (const int8_t*)(to.data + to.row_dim * 2);
@@ -5650,7 +5648,6 @@ static void forward_layer_internal(
                 memset(m->buf_act + b * o11_dim + qd, 0, (o11_dim - qd) * sizeof(float));
             }
             matmul_f32_reorder_per_row(o11_rows, o11_dim, ow, m->buf_act, o_rs_fp16, m->buf_gate, B);
-#endif
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(to, w, rs, rows, dim, scale);
@@ -5726,7 +5723,6 @@ static void forward_layer_internal(
         if (f) { fwrite(m->buf_act, sizeof(float), B * H, f); fclose(f); }
     }
     #endif
-#endif
     float* x_norm2 = m->buf_act;
     P_ACCUM(rmsnorm);
     P_START(ffn_gate_up);
