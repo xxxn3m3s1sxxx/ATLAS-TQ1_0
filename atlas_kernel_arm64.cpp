@@ -25,40 +25,46 @@
 #include <cstring>
 #include <arm_neon.h>
 
-// ─── Helper: fp16 → fp32 ──────────────────────────────────────────────
+// ─── Helper: fp16 → fp32 (NEON single-instruction FCVT) ────────────────
 static inline float fp16_to_fp32(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    if (exp == 0) {
-        if (mant == 0) return sign ? -0.0f : 0.0f;
-        while (!(mant & 0x400)) { mant <<= 1; exp--; }
-        exp++; mant &= 0x3FF;
-    } else if (exp == 31) {
-        return sign ? -INFINITY : INFINITY;
-    }
-    uint32_t f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-    float result;
-    memcpy(&result, &f, sizeof(result));
-    return result;
+    uint16x4_t uv = vld1_u16(&h);
+    return vgetq_lane_f32(vcvt_f32_f16(vreinterpret_f16_u16(uv)), 0);
 }
 
 // ─── TQ1 decode LUT (5 ternary trits per byte) ────────────────────────
-static int8_t tq1_decode[256][5];
+// Two layouts for different access patterns:
+//   tq1_decode[b][t] — byte-major (scalar per-byte access)
+//   tq1_lut[t][b]    — trit-major  (NEON TBL batch decode)
+alignas(128) static int8_t tq1_decode[256][5];
+alignas(128) static int8_t tq1_lut[5][256];
 static bool tq1_lut_initialized = false;
 
 static void init_tq1_decode_lut() {
     if (tq1_lut_initialized) return;
     for (int b = 0; b < 256; b++) {
         int t = b;
-        tq1_decode[b][0] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][1] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][2] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][3] = (int8_t)((t % 3) - 1); t /= 3;
-        tq1_decode[b][4] = (int8_t)((t % 3) - 1);
+        int8_t v0 = (int8_t)((t % 3) - 1); t /= 3;
+        int8_t v1 = (int8_t)((t % 3) - 1); t /= 3;
+        int8_t v2 = (int8_t)((t % 3) - 1); t /= 3;
+        int8_t v3 = (int8_t)((t % 3) - 1); t /= 3;
+        int8_t v4 = (int8_t)((t % 3) - 1);
+        tq1_decode[b][0] = v0; tq1_decode[b][1] = v1;
+        tq1_decode[b][2] = v2; tq1_decode[b][3] = v3; tq1_decode[b][4] = v4;
+        tq1_lut[0][b] = v0; tq1_lut[1][b] = v1;
+        tq1_lut[2][b] = v2; tq1_lut[3][b] = v3; tq1_lut[4][b] = v4;
     }
     tq1_lut_initialized = true;
 }
+
+// Batch decode shared buffers (removed — fused kernel decodes inline)
+// The tq1_decode_row function was replaced by decode_4packed + inline decode
+// in the fused kernel (v2.17.0). The function is kept for reference:
+// static inline void tq1_decode_row(...) — see git history for definition.
+
+
+
+
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // int8×uint8 matmul (row_sums correction eliminated via XOR-0x80 trick)
@@ -69,10 +75,10 @@ static void init_tq1_decode_lut() {
 // vdotq_s32(w, signed_act) = sum(w * (val-128)) = centered dot product.
 // So NO row_sums correction needed (x86 path's -128*row_sums is built in).
 extern "C" void atlas_matmul_i8_f32(int rows, int cols,
-    const int8_t* weights,
-    const uint8_t* act_u8,
-    const int32_t* row_sums,
-    float* output,
+    const int8_t* __restrict__ weights,
+    const uint8_t* __restrict__ act_u8,
+    const int32_t* __restrict__ row_sums,
+    float* __restrict__ output,
     int n_tokens) {
 
     (void)row_sums;
@@ -134,20 +140,35 @@ extern "C" void atlas_matmul_i8_f32(int rows, int cols,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TQ1 block-scaled fused matmul (symmetric int8 activations)
+// Fused decode + matmul: decode 4 packed TQ1 bytes (=20 ternary values)
+// into a local buffer, then vdotq_s32 / vfmaq_f32 immediately.
+// Eliminates the 4×input_dim decode_buf write+read L1 roundtrip.
+//
+// Per-block structure for g128 (128-value blocks):
+//   128 values / 20-per-chunk = 6 chunks + 8 scalar tail
+//   Each packed byte spans ≤2 blocks → max 2× decode per byte
 // ═══════════════════════════════════════════════════════════════════════
-// ARM64 equivalent of matmul_tq1_block_fused_s8 in atlas_api.cpp.
-//
-// act_s8: symmetric int8 [-127,127] (no +128 offset). Weights are {-1,0,+1}
-// from TQ1 decode. vdotq_s32(w, act) gives sum(w * act) directly —
-// NO XOR-0x80 trick needed (both operands already signed).
-//
-// Replaces _mm256_sign_epi8(act, w) → horizontal sum with vdotq_s32.
-// vdotq_s32 computes sum(act[0..3] * w[0..3]) in one instruction vs
-// x86's sign_epi8 + cvtepi8_epi16 + madd_epi16 + hadd_epi32 pipeline.
+// v2.17.0: fused decode+matmul for symmetric int8 activations
+static inline void decode_4packed(const uint8_t* src, int8_t* dst) {
+    uint32_t p32;
+    memcpy(&p32, src, 4);
+    uint8_t b0 = (uint8_t)(p32);
+    uint8_t b1 = (uint8_t)(p32 >> 8);
+    uint8_t b2 = (uint8_t)(p32 >> 16);
+    uint8_t b3 = (uint8_t)(p32 >> 24);
+    uint32_t v0; memcpy(&v0, tq1_decode[b0], 4);
+    uint32_t v1; memcpy(&v1, tq1_decode[b1], 4);
+    uint32_t v2; memcpy(&v2, tq1_decode[b2], 4);
+    uint32_t v3; memcpy(&v3, tq1_decode[b3], 4);
+    memcpy(dst,     &v0, 4); dst[4]  = tq1_decode[b0][4];
+    memcpy(dst + 5, &v1, 4); dst[9]  = tq1_decode[b1][4];
+    memcpy(dst + 10,&v2, 4); dst[14] = tq1_decode[b2][4];
+    memcpy(dst + 15,&v3, 4); dst[19] = tq1_decode[b3][4];
+}
+
 extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_cols,
-    const uint8_t* tensor_data, int block_size, int n_blocks,
-    const float* act_f32, float* output, int B) {
+    const uint8_t* __restrict__ tensor_data, int block_size, int n_blocks,
+    const float* __restrict__ act_f32, float* __restrict__ output, int B) {
 
     init_tq1_decode_lut();
     int rows_packed = rows / 4;
@@ -202,18 +223,6 @@ extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_col
             block_scales[i] = fp16_to_fp32(sr);
         }
 
-        // Thread-local decode buffer
-        static thread_local int8_t* tl_decode_buf = nullptr;
-        static thread_local size_t tl_decode_buf_cap = 0;
-        size_t need_db = (size_t)4 * input_dim;
-        if (need_db > tl_decode_buf_cap) {
-            free(tl_decode_buf);
-            tl_decode_buf = (int8_t*)malloc(need_db * sizeof(int8_t));
-            tl_decode_buf_cap = need_db;
-            memset(tl_decode_buf, 0, need_db * sizeof(int8_t));
-        }
-        int8_t* decode_buf = tl_decode_buf;
-
         // Act quant single-threaded (sequential across b)
         #ifdef _OPENMP
         #pragma omp single
@@ -238,42 +247,20 @@ extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_col
             }
         }
 
+        // FUSED KERNEL: decode-4-packed + vdotq_s32 per block
+        // No decode_buf — each 4-byte chunk decoded inline, consumed immediately
         #ifdef _OPENMP
         #pragma omp for
         #endif
         for (int ur = 0; ur < rows_packed; ur++) {
-            // Decode TQ1 weights for 4 rows
-            for (int sub = 0; sub < 4; sub++) {
-                const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
-                int8_t* row = decode_buf + sub * input_dim;
-                int c = 0;
-                for (; c < packed_cols - 1; c++) {
-                    const int8_t* l = tq1_decode[w[c]];
-                    int col = c * 5;
-                    uint32_t v4 = (uint8_t)l[0] | ((uint32_t)(uint8_t)l[1] << 8) |
-                                  ((uint32_t)(uint8_t)l[2] << 16) | ((uint32_t)(uint8_t)l[3] << 24);
-                    memcpy(row + col, &v4, 4);
-                    row[col + 4] = l[4];
-                }
-                {
-                    const int8_t* l = tq1_decode[w[c]];
-                    int col = c * 5;
-                    if (col < input_dim) row[col] = l[0];
-                    if (col + 1 < input_dim) row[col + 1] = l[1];
-                    if (col + 2 < input_dim) row[col + 2] = l[2];
-                    if (col + 3 < input_dim) row[col + 3] = l[3];
-                    if (col + 4 < input_dim) row[col + 4] = l[4];
-                }
-            }
-
             for (int b = 0; b < B; b++) {
                 const int8_t* act = act_s8 + b * input_dim;
                 float out4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
                 for (int sub = 0; sub < 4; sub++) {
+                    const uint8_t* row_packed = packed + (ur * 4 + sub) * packed_cols;
                     int shuffled_r = ur * 4 + sub;
                     const float* rscales = block_scales + shuffled_r * n_blocks;
-                    const int8_t* row = decode_buf + sub * input_dim;
 
                     for (int blk = 0; blk < n_blocks; blk++) {
                         int blk_start = blk * block_size;
@@ -282,24 +269,54 @@ extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_col
 
                         int32x4_t acc0 = vdupq_n_s32(0);
                         int32x4_t acc1 = vdupq_n_s32(0);
-
+                        int32_t tail_acc = 0;
                         int j = blk_start;
-                        for (; j + 32 <= blk_end; j += 32) {
-                            int8x16_t w0 = vld1q_s8(row + j);
-                            int8x16_t w1 = vld1q_s8(row + j + 16);
-                            int8x16_t a0 = vld1q_s8(act + j);
-                            int8x16_t a1 = vld1q_s8(act + j + 16);
 
-                            // Both operands signed: vdotq_s32 gives sum(w*act) directly.
-                            // No XOR trick needed (activations are symmetric [-127,127]).
-                            acc0 = vdotq_s32(acc0, w0, a0);
-                            acc1 = vdotq_s32(acc1, w1, a1);
+                        // Fused main loop: 4 packed bytes → 20 values
+                        // Process 40 values per outer iteration (2× decode+matmul)
+                        // for dual-accumulator ILP
+                        for (; j + 40 <= blk_end; j += 40) {
+                            int8_t w20a[20];
+                            decode_4packed(row_packed + j / 5, w20a);
+                            int8x16_t w16a = vld1q_s8(w20a);
+                            int8x16_t a16a = vld1q_s8(act + j);
+                            acc0 = vdotq_s32(acc0, w16a, a16a);
+                            tail_acc += (int32_t)act[j+16] * (int32_t)w20a[16];
+                            tail_acc += (int32_t)act[j+17] * (int32_t)w20a[17];
+                            tail_acc += (int32_t)act[j+18] * (int32_t)w20a[18];
+                            tail_acc += (int32_t)act[j+19] * (int32_t)w20a[19];
+
+                            int8_t w20b[20];
+                            decode_4packed(row_packed + (j + 20) / 5, w20b);
+                            int8x16_t w16b = vld1q_s8(w20b);
+                            int8x16_t a16b = vld1q_s8(act + j + 20);
+                            acc1 = vdotq_s32(acc1, w16b, a16b);
+                            tail_acc += (int32_t)act[j+36] * (int32_t)w20b[16];
+                            tail_acc += (int32_t)act[j+37] * (int32_t)w20b[17];
+                            tail_acc += (int32_t)act[j+38] * (int32_t)w20b[18];
+                            tail_acc += (int32_t)act[j+39] * (int32_t)w20b[19];
                         }
 
-                        int32_t dot = vaddvq_s32(acc0) + vaddvq_s32(acc1);
+                        int32_t dot = vaddvq_s32(acc0) + vaddvq_s32(acc1) + tail_acc;
+
+                        for (; j + 20 <= blk_end; j += 20) {
+                            int8_t w20[20];
+                            decode_4packed(row_packed + j / 5, w20);
+                            int8x16_t w16 = vld1q_s8(w20);
+                            int8x16_t a16 = vld1q_s8(act + j);
+                            acc0 = vdotq_s32(vdupq_n_s32(0), w16, a16);
+                            dot += vaddvq_s32(acc0);
+                            dot += (int32_t)act[j+16] * (int32_t)w20[16];
+                            dot += (int32_t)act[j+17] * (int32_t)w20[17];
+                            dot += (int32_t)act[j+18] * (int32_t)w20[18];
+                            dot += (int32_t)act[j+19] * (int32_t)w20[19];
+                        }
 
                         for (; j < blk_end; j++) {
-                            dot += (int32_t)act[j] * (int32_t)row[j];
+                            int pc = j / 5;
+                            int off = j % 5;
+                            uint8_t bv = row_packed[pc];
+                            dot += (int32_t)act[j] * (int32_t)tq1_decode[bv][off];
                         }
 
                         out4[sub] += (float)dot * rscales[blk];
@@ -318,14 +335,14 @@ extern "C" void atlas_tq1_fused_s8_arm64(int rows, int input_dim, int packed_col
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TQ1 block-scaled fused matmul (f32 bypass)
+// TQ1 block-scaled fused matmul with f32 bypass
 // ═══════════════════════════════════════════════════════════════════════
-// ARM64 equivalent of matmul_tq1_block_fused_f32.
-// Uses f32 activations directly (NO quantization).
-// Replaces _mm256_fmadd_ps with vfmaq_f32.
+// Same fused decode+matmul structure as s8 path but uses f32 activations
+// directly — vfmaq_f32 instead of vdotq_s32.
+// v2.17.0: fused decode+matmul, no decode_buf
 extern "C" void atlas_tq1_fused_f32_arm64(int rows, int input_dim, int packed_cols,
-    const uint8_t* tensor_data, int block_size, int n_blocks,
-    const float* act_f32, float* output, int B) {
+    const uint8_t* __restrict__ tensor_data, int block_size, int n_blocks,
+    const float* __restrict__ act_f32, float* __restrict__ output, int B) {
 
     init_tq1_decode_lut();
     int rows_packed = rows / 4;
@@ -360,52 +377,19 @@ extern "C" void atlas_tq1_fused_f32_arm64(int rows, int input_dim, int packed_co
             block_scales[i] = fp16_to_fp32(sr);
         }
 
-        static thread_local int8_t* tl_decode_buf = nullptr;
-        static thread_local size_t tl_decode_buf_cap = 0;
-        size_t need_db = (size_t)4 * input_dim;
-        if (need_db > tl_decode_buf_cap) {
-            free(tl_decode_buf);
-            tl_decode_buf = (int8_t*)malloc(need_db * sizeof(int8_t));
-            tl_decode_buf_cap = need_db;
-            memset(tl_decode_buf, 0, need_db * sizeof(int8_t));
-        }
-        int8_t* decode_buf = tl_decode_buf;
-
+        // FUSED KERNEL: decode-4-packed + vfmaq_f32 per block
         #ifdef _OPENMP
         #pragma omp for
         #endif
         for (int ur = 0; ur < rows_packed; ur++) {
-            for (int sub = 0; sub < 4; sub++) {
-                const uint8_t* w = packed + (ur * 4 + sub) * packed_cols;
-                int8_t* row = decode_buf + sub * input_dim;
-                int c = 0;
-                for (; c < packed_cols - 1; c++) {
-                    const int8_t* l = tq1_decode[w[c]];
-                    int col = c * 5;
-                    uint32_t v4 = (uint8_t)l[0] | ((uint32_t)(uint8_t)l[1] << 8) |
-                                  ((uint32_t)(uint8_t)l[2] << 16) | ((uint32_t)(uint8_t)l[3] << 24);
-                    memcpy(row + col, &v4, 4);
-                    row[col + 4] = l[4];
-                }
-                {
-                    const int8_t* l = tq1_decode[w[c]];
-                    int col = c * 5;
-                    if (col < input_dim) row[col] = l[0];
-                    if (col + 1 < input_dim) row[col + 1] = l[1];
-                    if (col + 2 < input_dim) row[col + 2] = l[2];
-                    if (col + 3 < input_dim) row[col + 3] = l[3];
-                    if (col + 4 < input_dim) row[col + 4] = l[4];
-                }
-            }
-
             for (int b = 0; b < B; b++) {
                 const float* act = act_f32 + b * input_dim;
                 float out4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
                 for (int sub = 0; sub < 4; sub++) {
+                    const uint8_t* row_packed = packed + (ur * 4 + sub) * packed_cols;
                     int shuffled_r = ur * 4 + sub;
                     const float* rscales = block_scales + shuffled_r * n_blocks;
-                    const int8_t* row = decode_buf + sub * input_dim;
 
                     for (int blk = 0; blk < n_blocks; blk++) {
                         int blk_start = blk * block_size;
@@ -414,28 +398,89 @@ extern "C" void atlas_tq1_fused_f32_arm64(int rows, int input_dim, int packed_co
 
                         float32x4_t vacc0 = vdupq_n_f32(0);
                         float32x4_t vacc1 = vdupq_n_f32(0);
-
+                        float tail_acc = 0.0f;
                         int j = blk_start;
-                        for (; j + 8 <= blk_end; j += 8) {
-                            // Load 8 int8 ternary weights, sign-extend to f32
-                            int8x8_t w8 = vld1_s8(row + j);
-                            int16x8_t w16 = vmovl_s8(w8);
-                            float32x4_t wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16)));
-                            float32x4_t wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)));
 
-                            // Load f32 activations
+                        // Fused main loop: 4 packed bytes → 20 f32 weights
+                        // Process 40 values per outer iteration with dual-acc ILP
+                        for (; j + 40 <= blk_end; j += 40) {
+                            int8_t w20a[20];
+                            decode_4packed(row_packed + j / 5, w20a);
+                            int8x16_t w16a = vld1q_s8(w20a);
+                            int16x8_t w16a_lo = vmovl_s8(vget_low_s8(w16a));
+                            int16x8_t w16a_hi = vmovl_s8(vget_high_s8(w16a));
+                            float32x4_t wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16a_lo)));
+                            float32x4_t wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16a_lo)));
+                            float32x4_t wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16a_hi)));
+                            float32x4_t wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16a_hi)));
                             float32x4_t af0 = vld1q_f32(act + j);
                             float32x4_t af1 = vld1q_f32(act + j + 4);
-
-                            // FMA: acc += af * wf
+                            float32x4_t af2 = vld1q_f32(act + j + 8);
+                            float32x4_t af3 = vld1q_f32(act + j + 12);
                             vacc0 = vfmaq_f32(vacc0, af0, wf0);
                             vacc1 = vfmaq_f32(vacc1, af1, wf1);
+                            vacc0 = vfmaq_f32(vacc0, af2, wf2);
+                            vacc1 = vfmaq_f32(vacc1, af3, wf3);
+                            tail_acc += act[j+16] * (float)w20a[16];
+                            tail_acc += act[j+17] * (float)w20a[17];
+                            tail_acc += act[j+18] * (float)w20a[18];
+                            tail_acc += act[j+19] * (float)w20a[19];
+
+                            int8_t w20b[20];
+                            decode_4packed(row_packed + (j + 20) / 5, w20b);
+                            int8x16_t w16b = vld1q_s8(w20b);
+                            int16x8_t w16b_lo = vmovl_s8(vget_low_s8(w16b));
+                            int16x8_t w16b_hi = vmovl_s8(vget_high_s8(w16b));
+                            float32x4_t wf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16b_lo)));
+                            float32x4_t wf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16b_lo)));
+                            float32x4_t wf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16b_hi)));
+                            float32x4_t wf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16b_hi)));
+                            float32x4_t af4 = vld1q_f32(act + j + 20);
+                            float32x4_t af5 = vld1q_f32(act + j + 24);
+                            float32x4_t af6 = vld1q_f32(act + j + 28);
+                            float32x4_t af7 = vld1q_f32(act + j + 32);
+                            vacc0 = vfmaq_f32(vacc0, af4, wf4);
+                            vacc1 = vfmaq_f32(vacc1, af5, wf5);
+                            vacc0 = vfmaq_f32(vacc0, af6, wf6);
+                            vacc1 = vfmaq_f32(vacc1, af7, wf7);
+                            tail_acc += act[j+36] * (float)w20b[16];
+                            tail_acc += act[j+37] * (float)w20b[17];
+                            tail_acc += act[j+38] * (float)w20b[18];
+                            tail_acc += act[j+39] * (float)w20b[19];
                         }
 
-                        float dot = vaddvq_f32(vacc0) + vaddvq_f32(vacc1);
+                        float dot = vaddvq_f32(vacc0) + vaddvq_f32(vacc1) + tail_acc;
+
+                        for (; j + 20 <= blk_end; j += 20) {
+                            int8_t w20[20];
+                            decode_4packed(row_packed + j / 5, w20);
+                            int8x16_t w16 = vld1q_s8(w20);
+                            int16x8_t w16_lo = vmovl_s8(vget_low_s8(w16));
+                            int16x8_t w16_hi = vmovl_s8(vget_high_s8(w16));
+                            float32x4_t wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16_lo)));
+                            float32x4_t wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_lo)));
+                            float32x4_t wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16_hi)));
+                            float32x4_t wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16_hi)));
+                            float32x4_t af0 = vld1q_f32(act + j);
+                            float32x4_t af1 = vld1q_f32(act + j + 4);
+                            float32x4_t af2 = vld1q_f32(act + j + 8);
+                            float32x4_t af3 = vld1q_f32(act + j + 12);
+                            float d0 = vaddvq_f32(vfmaq_f32(vdupq_n_f32(0), af0, wf0));
+                            float d1 = vaddvq_f32(vfmaq_f32(vdupq_n_f32(0), af1, wf1));
+                            float d2 = vaddvq_f32(vfmaq_f32(vdupq_n_f32(0), af2, wf2));
+                            float d3 = vaddvq_f32(vfmaq_f32(vdupq_n_f32(0), af3, wf3));
+                            dot += d0 + d1 + d2 + d3;
+                            dot += act[j+16] * (float)w20[16];
+                            dot += act[j+17] * (float)w20[17];
+                            dot += act[j+18] * (float)w20[18];
+                            dot += act[j+19] * (float)w20[19];
+                        }
 
                         for (; j < blk_end; j++) {
-                            dot += act[j] * (float)row[j];
+                            int pc = j / 5;
+                            int off = j % 5;
+                            uint8_t bv = row_packed[pc];
+                            dot += act[j] * (float)tq1_decode[bv][off];
                         }
 
                         out4[sub] += dot * rscales[blk];
@@ -456,8 +501,8 @@ extern "C" void atlas_tq1_fused_f32_arm64(int rows, int input_dim, int packed_co
 // TQ2 wrapper (delegates to fused_s8 with flags byte skip)
 // ═══════════════════════════════════════════════════════════════════════
 extern "C" void atlas_tq2_arm64(int rows, int input_dim, int packed_cols,
-    const uint8_t* tensor_data, int block_size, int n_blocks,
-    const float* act_f32, float* output, int B) {
+    const uint8_t* __restrict__ tensor_data, int block_size, int n_blocks,
+    const float* __restrict__ act_f32, float* __restrict__ output, int B) {
     const uint8_t* w5 = tensor_data + 1;
     atlas_tq1_fused_s8_arm64(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
@@ -467,8 +512,8 @@ extern "C" void atlas_tq2_arm64(int rows, int input_dim, int packed_cols,
 // TQ2 f32 bypass wrapper (delegates to fused_f32 with flags byte skip)
 // ═══════════════════════════════════════════════════════════════════════
 extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
-    const uint8_t* tensor_data, int block_size, int n_blocks,
-    const float* act_f32, float* output, int B) {
+    const uint8_t* __restrict__ tensor_data, int block_size, int n_blocks,
+    const float* __restrict__ act_f32, float* __restrict__ output, int B) {
     const uint8_t* w5 = tensor_data + 1;
     atlas_tq1_fused_f32_arm64(rows, input_dim, packed_cols,
         w5, block_size, n_blocks, act_f32, output, B);
@@ -488,8 +533,8 @@ extern "C" void atlas_tq2_f32_arm64(int rows, int input_dim, int packed_cols,
 //   madd_epi16 ×2 → add_epi32 ×4 → hadd_epi32 ×3 = 11 instructions.
 // NEON: veorq_s8 + vdotq_s32 ×2 + vaddvq_s32 = 4 instructions.
 extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
-    const int8_t* weights, const uint8_t* act_u8,
-    const float* max_abs, float scale, float* output, int B) {
+    const int8_t* __restrict__ weights, const uint8_t* __restrict__ act_u8,
+    const float* __restrict__ max_abs, float scale, float* __restrict__ output, int B) {
 
     int rows_packed = rows / 4;
     int8x16_t xor_mask = vdupq_n_s8(-128);
@@ -542,8 +587,8 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
 // XOR-0x80 trick: converts uint8 [+128 offset] activations to centered int8,
 // so vdotq_s32 gives corrected dot product directly — no 128*row_sums needed.
 extern "C" void atlas_matmul_i4_f32(int rows, int cols,
-    const uint8_t* packed_weights, const uint8_t* act_u8,
-    const int32_t* row_sums, float* output, int n_tokens) {
+    const uint8_t* __restrict__ packed_weights, const uint8_t* __restrict__ act_u8,
+    const int32_t* __restrict__ row_sums, float* __restrict__ output, int n_tokens) {
     (void)row_sums;
     int packed_cols = (cols + 1) / 2;
     uint8x16_t xor_80 = vdupq_n_u8(0x80);
@@ -595,9 +640,9 @@ extern "C" void atlas_matmul_i4_f32(int rows, int cols,
 // ARM64 equivalent of the x86 inline loop in the f32_bypass else branch.
 // Same 4-row grouped reorder output layout as x86.
 extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
-    const int8_t* gw, const int8_t* uw,
-    const float* act_f32, int act_stride,
-    float* buf_gate, float* buf_up,
+    const int8_t* __restrict__ gw, const int8_t* __restrict__ uw,
+    const float* __restrict__ act_f32, int act_stride,
+    float* __restrict__ buf_gate, float* __restrict__ buf_up,
     int B, float g_scale, float u_scale) {
 
     int rows_packed = rows / 4;
@@ -687,10 +732,10 @@ extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
 // ARM64 equivalent of the x86 default inline loop (vpmaddubsw + row_sums
 // correction). XOR-0x80 trick eliminates the 128*row_sums subtraction.
 extern "C" void atlas_fused_gate_up_default_neon(int rows, int dim_w,
-    const int8_t* gw, const int8_t* uw,
-    const uint8_t* act_u8,
-    const float* max_abs, int B,
-    float* buf_gate, float* buf_up,
+    const int8_t* __restrict__ gw, const int8_t* __restrict__ uw,
+    const uint8_t* __restrict__ act_u8,
+    const float* __restrict__ max_abs, int B,
+    float* __restrict__ buf_gate, float* __restrict__ buf_up,
     float g_scale, float u_scale) {
 
     int rows_packed = rows / 4;

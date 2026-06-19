@@ -755,7 +755,7 @@ struct AtlasModel {
 // ─── TQ1 byte → int8 decode LUT (v1.3.1 chunked decode) ──────────────
 // Decode LUT: 5 int8 trits pro Byte (1280 bytes, L1-resident)
 static std::once_flag tq1_decode_init_flag;
-alignas(32) static int8_t tq1_decode[256][5];
+alignas(128) static int8_t tq1_decode[256][5];
 
 static void init_tq1_decode_lut() {
     std::call_once(tq1_decode_init_flag, [&]() {
