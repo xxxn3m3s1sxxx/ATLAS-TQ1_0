@@ -18,18 +18,155 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <ctime>
+#include <chrono>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <csignal>
 
 #ifdef _WIN32
-#include <shellapi.h> // CommandLineToArgvW
+#include <shellapi.h>
 #endif
 
-// ─── Function pointer typedefs ──────────────────────────────────────────
-// Mirrors atlas_ffi.h signatures. Loaded via GetProcAddress at runtime.
+// ─── ANSI colors ─────────────────────────────────────────────────────────
+#define ANSI_RESET  "\033[0m"
+#define ANSI_RED    "\033[31m"
+#define ANSI_GREEN  "\033[32m"
+#define ANSI_YELLOW "\033[33m"
+#define ANSI_CYAN   "\033[36m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_BOLD   "\033[1m"
+#define ANSI_DIM    "\033[2m"
 
+// ─── Signal handling ────────────────────────────────────────────────────
+static volatile bool g_interrupted = false;
+
+static void handle_sigint(int) {
+    g_interrupted = true;
+    printf(ANSI_RESET "\n");
+}
+
+// ─── FNV-1a hash for cache validation ────────────────────────────────────
+static uint64_t fnv1a(const std::string& s) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (char c : s) {
+        h ^= (uint8_t)c;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// ─── Timing helper ────────────────────────────────────────────────────
+struct Timer {
+    std::chrono::high_resolution_clock::time_point start;
+    Timer() : start(std::chrono::high_resolution_clock::now()) {}
+    double elapsed() const {
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double>(end - start).count();
+    }
+};
+
+// ─── RAII: DLL lifecycle ──────────────────────────────────────────────
+struct AtlasDLL {
+    HMODULE handle;
+
+    AtlasDLL() : handle(NULL) {}
+
+    bool load(const char* path) {
+#ifdef _WIN32
+        handle = LoadLibraryA(path);
+        if (!handle) {
+            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+                " Failed to load %s (error %lu)\n", path, GetLastError());
+            return false;
+        }
+#else
+        handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!handle) {
+            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+                " Failed to load %s: %s\n", path, dlerror());
+            return false;
+        }
+#endif
+        return true;
+    }
+
+    ~AtlasDLL() { unload(); }
+
+    AtlasDLL(const AtlasDLL&) = delete;
+    AtlasDLL& operator=(const AtlasDLL&) = delete;
+
+    AtlasDLL(AtlasDLL&& other) noexcept : handle(other.handle) {
+        other.handle = NULL;
+    }
+    AtlasDLL& operator=(AtlasDLL&& other) noexcept {
+        if (this != &other) { unload(); handle = other.handle; other.handle = NULL; }
+        return *this;
+    }
+
+    void unload() {
+        if (handle) {
+#ifdef _WIN32
+            FreeLibrary(handle);
+#else
+            dlclose(handle);
+#endif
+            handle = NULL;
+        }
+    }
+
+    void* sym(const char* name) const {
+#ifdef _WIN32
+        return (void*)GetProcAddress(handle, name);
+#else
+        return dlsym(handle, name);
+#endif
+    }
+};
+
+// ─── RAII: Model lifecycle ────────────────────────────────────────────
+struct AtlasSession {
+    void* model;
+    const char* path;
+
+    AtlasSession(const char* p) : model(NULL), path(p) {}
+
+    bool load() {
+        model = atlas_load(path);
+        if (!model) {
+            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+                " Failed to load model: %s\n", path);
+            return false;
+        }
+        return true;
+    }
+
+    ~AtlasSession() { if (model) atlas_free(model); }
+
+    AtlasSession(const AtlasSession&) = delete;
+    AtlasSession& operator=(const AtlasSession&) = delete;
+
+    AtlasSession(AtlasSession&& other) noexcept : model(other.model), path(other.path) {
+        other.model = NULL;
+    }
+    AtlasSession& operator=(AtlasSession&& other) noexcept {
+        if (this != &other) {
+            if (model) atlas_free(model);
+            model = other.model;
+            path = other.path;
+            other.model = NULL;
+        }
+        return *this;
+    }
+
+    void reset() { if (model) { atlas_free(model); model = NULL; } }
+
+    explicit operator bool() const { return model != NULL; }
+};
+
+// ─── Function pointer typedefs ──────────────────────────────────────────
 typedef void* (*PFN_atlas_load)(const char* path);
 typedef void  (*PFN_atlas_free)(void* model);
 typedef void  (*PFN_atlas_get_info)(void* model, int* n_layers, int* hidden_dim,
@@ -67,7 +204,6 @@ typedef void  (*PFN_atlas_quantize_ffn_to_i4)(void* model);
 typedef int   (*PFN_atlas_has_binary_tokenizer)(void* model);
 
 // ─── Dynamic DLL bindings ──────────────────────────────────────────────
-static HMODULE g_dll = NULL;
 static PFN_atlas_load              atlas_load;
 static PFN_atlas_free              atlas_free;
 static PFN_atlas_get_info          atlas_get_info;
@@ -93,71 +229,44 @@ static PFN_atlas_tokenizer_decode  atlas_tokenizer_decode;
 static PFN_atlas_generate          atlas_generate;
 static PFN_atlas_has_binary_tokenizer atlas_has_binary_tokenizer;
 
-static bool load_dll(const char* dll_path) {
-#ifdef _WIN32
-    g_dll = LoadLibraryA(dll_path);
-    if (!g_dll) {
-        fprintf(stderr, "[Error] Failed to load %s (error %lu)\n", dll_path, GetLastError());
-        return false;
-    }
-#define LOAD(name) do { \
-    name = (PFN_##name)GetProcAddress(g_dll, #name); \
-    if (!name) { fprintf(stderr, "[Error] Missing symbol: %s\n", #name); return false; } \
+#define LOAD_OR_FAIL(name) do { \
+    name = (PFN_##name)dll.sym(#name); \
+    if (!name) { \
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " Missing symbol: %s\n", #name); \
+        return false; \
+    } \
 } while(0)
-#else
-    g_dll = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
-    if (!g_dll) {
-        fprintf(stderr, "[Error] Failed to load %s: %s\n", dll_path, dlerror());
-        return false;
-    }
-#define LOAD(name) do { \
-    name = (PFN_##name)dlsym(g_dll, #name); \
-    if (!name) { fprintf(stderr, "[Error] Missing symbol: %s\n", #name); return false; } \
-} while(0)
-#endif
-    LOAD(atlas_load);
-    LOAD(atlas_free);
-    LOAD(atlas_get_info);
-    LOAD(atlas_set_seed);
-    LOAD(atlas_set_num_threads);
-    LOAD(atlas_decompress_all);
-    LOAD(atlas_decompress_ttype5);
-    LOAD(atlas_load_cache);
-    LOAD(atlas_save_cache);
-    LOAD(atlas_prefetch_int8);
-    LOAD(atlas_set_use_f32_matmul);
-    LOAD(atlas_set_use_hybrid_matmul);
-    LOAD(atlas_set_rope_scale);
-    LOAD(atlas_set_base_seq_len);
-    LOAD(atlas_reset_cache);
-    LOAD(atlas_ensure_layer_idx);
-    LOAD(atlas_get_tensor_index);
-    LOAD(atlas_quantize_lmhead);
+
+static bool bind_dll(AtlasDLL& dll) {
+    LOAD_OR_FAIL(atlas_load);
+    LOAD_OR_FAIL(atlas_free);
+    LOAD_OR_FAIL(atlas_get_info);
+    LOAD_OR_FAIL(atlas_set_seed);
+    LOAD_OR_FAIL(atlas_set_num_threads);
+    LOAD_OR_FAIL(atlas_decompress_all);
+    LOAD_OR_FAIL(atlas_decompress_ttype5);
+    LOAD_OR_FAIL(atlas_load_cache);
+    LOAD_OR_FAIL(atlas_save_cache);
+    LOAD_OR_FAIL(atlas_prefetch_int8);
+    LOAD_OR_FAIL(atlas_set_use_f32_matmul);
+    LOAD_OR_FAIL(atlas_set_use_hybrid_matmul);
+    LOAD_OR_FAIL(atlas_set_rope_scale);
+    LOAD_OR_FAIL(atlas_set_base_seq_len);
+    LOAD_OR_FAIL(atlas_reset_cache);
+    LOAD_OR_FAIL(atlas_ensure_layer_idx);
+    LOAD_OR_FAIL(atlas_get_tensor_index);
+    LOAD_OR_FAIL(atlas_quantize_lmhead);
     // Optional: FFN int4 quantization
-#ifdef _WIN32
-    atlas_quantize_ffn_to_i4 = (PFN_atlas_quantize_ffn_to_i4)GetProcAddress(g_dll, "atlas_quantize_ffn_to_i4");
-#else
-    atlas_quantize_ffn_to_i4 = (PFN_atlas_quantize_ffn_to_i4)dlsym(g_dll, "atlas_quantize_ffn_to_i4");
-#endif
-    LOAD(atlas_tokenizer_preencode);
-    LOAD(atlas_tokenizer_merge);
-    LOAD(atlas_tokenizer_decode);
-    LOAD(atlas_generate);
-    LOAD(atlas_has_binary_tokenizer);
-#undef LOAD
+    atlas_quantize_ffn_to_i4 = (PFN_atlas_quantize_ffn_to_i4)dll.sym("atlas_quantize_ffn_to_i4");
+    LOAD_OR_FAIL(atlas_tokenizer_preencode);
+    LOAD_OR_FAIL(atlas_tokenizer_merge);
+    LOAD_OR_FAIL(atlas_tokenizer_decode);
+    LOAD_OR_FAIL(atlas_generate);
+    LOAD_OR_FAIL(atlas_has_binary_tokenizer);
     return true;
 }
 
-static void unload_dll() {
-    if (g_dll) {
-#ifdef _WIN32
-        FreeLibrary(g_dll);
-#else
-        dlclose(g_dll);
-#endif
-        g_dll = NULL;
-    }
-}
+#undef LOAD_OR_FAIL
 
 // ─── Windows UTF-8 helper ────────────────────────────────────────────
 #ifdef _WIN32
@@ -187,6 +296,7 @@ struct Config {
     bool interactive = false;
     bool raw = false;
     bool help = false;
+    std::string log_path;
 };
 
 static Config parse_args(int argc, char** argv) {
@@ -215,10 +325,12 @@ static Config parse_args(int argc, char** argv) {
             cfg.num_threads = atoi(argv[++i]);
         } else if (arg == "-i") {
             cfg.interactive = true;
+        } else if (arg == "--log" && i + 1 < argc) {
+            cfg.log_path = argv[++i];
         } else if (arg == "--raw") {
             cfg.raw = true;
         } else if (arg[0] == '-') {
-            fprintf(stderr, "[Warning] Unknown option: %s\n", arg.c_str());
+            fprintf(stderr, ANSI_YELLOW "[Warning]" ANSI_RESET " Unknown option: %s\n", arg.c_str());
         } else if (cfg.model_path.empty()) {
             cfg.model_path = arg;
         } else if (cfg.prompt.empty()) {
@@ -231,33 +343,31 @@ static Config parse_args(int argc, char** argv) {
 }
 
 static void print_usage() {
-    printf("ATLAS — TQ1.0 Ternary Inference Engine (CPU)\n");
+    printf(ANSI_BOLD "ATLAS" ANSI_RESET " — TQ1.0 Ternary Inference Engine (CPU)\n");
     printf("Run large language models on a laptop. No GPU needed.\n\n");
-    printf("Usage:\n");
-    printf("  atlas.exe <model.atlas> [prompt] [options]\n\n");
-    printf("Examples:\n");
+    printf(ANSI_BOLD "Usage:" ANSI_RESET "\n");
+    printf("  atlas.exe " ANSI_CYAN "<model.atlas>" ANSI_RESET " " ANSI_GREEN "[prompt]" ANSI_RESET " [options]\n\n");
+    printf(ANSI_BOLD "Examples:" ANSI_RESET "\n");
     printf("  atlas.exe falcon3-3b-tq1.atlas \"Hello, how are you?\"\n");
     printf("  atlas.exe model.atlas --temp 0.0 \"Capital of France?\"\n");
     printf("  atlas.exe model.atlas -i                          # interactive chat\n\n");
-    printf("Options:\n");
-    printf("  --temp <f>      Temperature (default: 0.7, 0=deterministic)\n");
-    printf("  --top-k <n>     Top-k sampling (default: 40, 0=disabled)\n");
-    printf("  --top-p <f>     Top-p sampling (default: 0.9, 0=disabled)\n");
-    printf("  --max-new <n>   Max tokens to generate (default: 200)\n");
-    printf("  --max-seq <n>   KV cache window size (default: 4096)\n");
-    printf("  --rep-penalty <f>   Repetition penalty (default: 1.0)\n");
-    printf("  --min-new <n>   Min tokens before EOS allowed (default: 20)\n");
-    printf("  --seed <n>      RNG seed (default: random)\n");
-    printf("  --threads <n>   OpenMP threads (default: auto)\n");
-    printf("  --raw           Send prompt as-is (no chat template)\n");
-    printf("  -i              Interactive chat mode\n");
-    printf("  -h, --help      Show this help\n");
+    printf(ANSI_BOLD "Options:" ANSI_RESET "\n");
+    printf("  " ANSI_CYAN "--temp <f>" ANSI_RESET "      Temperature (default: 0.7, 0=deterministic)\n");
+    printf("  " ANSI_CYAN "--top-k <n>" ANSI_RESET "     Top-k sampling (default: 40, 0=disabled)\n");
+    printf("  " ANSI_CYAN "--top-p <f>" ANSI_RESET "     Top-p sampling (default: 0.9, 0=disabled)\n");
+    printf("  " ANSI_CYAN "--max-new <n>" ANSI_RESET "   Max tokens to generate (default: 200)\n");
+    printf("  " ANSI_CYAN "--max-seq <n>" ANSI_RESET "   KV cache window size (default: 4096)\n");
+    printf("  " ANSI_CYAN "--rep-penalty <f>" ANSI_RESET "   Repetition penalty (default: 1.0)\n");
+    printf("  " ANSI_CYAN "--min-new <n>" ANSI_RESET "   Min tokens before EOS allowed (default: 20)\n");
+    printf("  " ANSI_CYAN "--seed <n>" ANSI_RESET "      RNG seed (default: random)\n");
+    printf("  " ANSI_CYAN "--threads <n>" ANSI_RESET "   OpenMP threads (default: auto)\n");
+    printf("  " ANSI_CYAN "--raw" ANSI_RESET "           Send prompt as-is (no chat template)\n");
+    printf("  " ANSI_CYAN "-i" ANSI_RESET "              Interactive chat mode\n");
+    printf("  " ANSI_CYAN "--log <file>" ANSI_RESET "    Log conversation to file\n");
+    printf("  " ANSI_CYAN "-h, --help" ANSI_RESET "      Show this help\n");
 }
 
 // ─── Chat template ─────────────────────────────────────────────────────
-// Detects model family and wraps user message in the correct format.
-// Mirrors atlas_infer.py _apply_chat_template logic.
-
 struct ModelInfo {
     int n_layers, hidden, inter, n_heads, n_kv_heads, head_dim, vocab_size;
     float rope_theta;
@@ -271,8 +381,6 @@ static ModelInfo get_model_info(void* model) {
     ModelInfo info;
     atlas_get_info(model, &info.n_layers, &info.hidden, &info.inter,
                    &info.n_heads, &info.n_kv_heads, &info.head_dim, &info.vocab_size);
-    // Read rope_theta from file header
-    // We'll approximate by checking tensor names
     info.is_bitnet = (atlas_get_tensor_index(model, "model.layers.0.self_attn.attn_sub_norm.weight") >= 0);
     info.is_cann = (info.vocab_size == 73448);
     info.is_qwen3 = (!info.is_bitnet && !info.is_cann && (info.head_dim <= 128 || info.vocab_size > 131072));
@@ -287,27 +395,21 @@ static std::string apply_chat_template(const ModelInfo& info, const std::string&
     if (info.is_bitnet) {
         return "User: " + user_text + "<|eot_id|>\nAssistant: ";
     }
-    // Falcon3 / default
     return "<|user|>\n" + user_text + "\n<|assistant|>\n";
 }
 
 // ─── Tokenizer ─────────────────────────────────────────────────────────-
-// Uses C++ preencode + BPE merge from atlas.dll (v6 binary tokenizer).
-
 static std::vector<int> encode_text(void* model, const std::string& text) {
-    // Pre-encode: text → byte token IDs
     int max_ids = (int)text.size() * 2 + 256;
     std::vector<int> ids(max_ids);
     int n = atlas_tokenizer_preencode(model, text.c_str(), (int)text.size(), ids.data(), max_ids);
     if (n < 0) {
-        fprintf(stderr, "[Error] Tokenizer preencode failed\n");
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " Tokenizer preencode failed\n");
         return {};
     }
     ids.resize(n);
-
-    // BPE merge loop
     if (atlas_tokenizer_merge(model, ids.data(), &n) != 0) {
-        fprintf(stderr, "[Error] Tokenizer merge failed\n");
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " Tokenizer merge failed\n");
         return {};
     }
     ids.resize(n);
@@ -320,7 +422,7 @@ static std::string decode_tokens(void* model, const std::vector<int>& ids) {
     std::string out(max_out, '\0');
     int n = atlas_tokenizer_decode(model, ids.data(), (int)ids.size(), &out[0], max_out);
     if (n < 0) {
-        fprintf(stderr, "[Error] Tokenizer decode failed\n");
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " Tokenizer decode failed\n");
         return "[decode error]";
     }
     out.resize(n);
@@ -329,76 +431,72 @@ static std::string decode_tokens(void* model, const std::vector<int>& ids) {
 
 // ─── Model setup ────────────────────────────────────────────────────────
 static bool setup_model(void* model, const Config& cfg, const ModelInfo& info) {
-    printf("[Atlas] %dL %dH %dI %d/%d heads | vocab=%d\n",
+    printf(ANSI_CYAN "[Atlas]" ANSI_RESET " %dL %dH %dI %d/%d heads | vocab=%d\n",
            info.n_layers, info.hidden, info.inter,
            info.n_heads, info.n_kv_heads, info.vocab_size);
 
-    // Try loading int8 cache; if not found, decompress + save
+    Timer t;
+
     int cache_loaded = atlas_load_cache(model, cfg.model_path.c_str());
     if (cache_loaded) {
-        printf("[Atlas] Loaded int8 weights from cache (mmap)\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " int8 cache loaded (" ANSI_GREEN "mmap" ANSI_RESET ")\n");
     } else {
-        printf("[Atlas] Decompressing TQ1 weights to int8...\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Decompressing TQ1 weights to int8...\n");
         atlas_decompress_all(model);
         atlas_decompress_ttype5(model);
         atlas_save_cache(model, cfg.model_path.c_str());
-        printf("[Atlas] Cache saved\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Cache saved (%.1fs)\n", t.elapsed());
     }
 
-    // Decompress again even on cache load (FFN tensors not in cache)
+    t = Timer();
     atlas_decompress_all(model);
     atlas_decompress_ttype5(model);
 
     // f32_bypass: for small, block-scaled, or BitNet models
     if (info.is_bitnet || info.hidden <= 2048) {
         atlas_set_use_f32_matmul(model, 1);
-        printf("[Atlas] f32 bypass enabled\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " f32 bypass\n");
     }
 
-    // Qwen3/Bonsai: YaRN RoPE scaling
     if (info.is_qwen3) {
         atlas_set_rope_scale(model, 4.0f);
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " YaRN RoPE scale=4.0\n");
     }
 
-    // Optional: quantize FFN int8→int4 (v2.8.0, 18-26% faster)
     if (atlas_quantize_ffn_to_i4) {
         atlas_quantize_ffn_to_i4(model);
-        printf("[Atlas] FFN quantized to int4\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " FFN int4 quantized\n");
     }
 
-    // Prefetch int8 data into physical RAM
+    printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Prefetching weights into RAM...\n");
     atlas_prefetch_int8(model);
 
-    // Set base seq len for NTK context extension
     atlas_set_base_seq_len(model, cfg.max_seq_len);
-
-    // Ensure layer indices are built
     atlas_ensure_layer_idx(model);
 
-    // Quantize lm_head to int8 (saves ~1 GB per 131k vocab)
     int idx = atlas_get_tensor_index(model, "lm_head.weight");
     if (idx >= 0) {
-        printf("[Atlas] Quantizing lm_head...\n");
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Quantizing lm_head...\n");
         atlas_quantize_lmhead(model, idx, 0);
     } else {
         idx = atlas_get_tensor_index(model, "model.embed_tokens.weight");
         if (idx >= 0) {
-            printf("[Atlas] Quantizing lm_head (tied embeddings)...\n");
+            printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Quantizing lm_head (tied embeddings)...\n");
             atlas_quantize_lmhead(model, idx, 1);
         }
     }
 
-    // Set thread count
     if (cfg.num_threads > 0) {
         atlas_set_num_threads(model, cfg.num_threads);
-        printf("[Atlas] Threads: %d\n", cfg.num_threads);
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Threads: %d\n", cfg.num_threads);
     }
 
-    // Seed RNG
     if (cfg.seed != 0) {
         atlas_set_seed(cfg.seed);
+        printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Seed: %llu\n", (unsigned long long)cfg.seed);
     }
 
+    printf(ANSI_CYAN "[Atlas]" ANSI_RESET " Model ready (%.1fs total)\n", t.elapsed());
     return true;
 }
 
@@ -419,7 +517,7 @@ static std::string generate(void* model, const std::vector<int>& input_ids,
         output_ids.data());
 
     if (n_gen < 0) {
-        fprintf(stderr, "[Error] Generation failed\n");
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " Generation failed\n");
         return "";
     }
 
@@ -427,81 +525,130 @@ static std::string generate(void* model, const std::vector<int>& input_ids,
     return decode_tokens(model, output_ids);
 }
 
+// ─── Session logging ─────────────────────────────────────────────────────
+static FILE* g_log = NULL;
+
+static bool open_log(const std::string& path) {
+    if (path.empty()) return true;
+    g_log = fopen(path.c_str(), "a");
+    if (!g_log) {
+        fprintf(stderr, ANSI_YELLOW "[Warning]" ANSI_RESET " Could not open log: %s\n", path.c_str());
+        return false;
+    }
+    // UTF-8 BOM for Windows Notepad compatibility
+    fwrite("\xEF\xBB\xBF", 1, 3, g_log);
+    time_t now = time(NULL);
+    struct tm* tm = localtime(&now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm);
+    fprintf(g_log, "=== ATLAS Session %s ===\n\n", buf);
+    fflush(g_log);
+    return true;
+}
+
+static void close_log() {
+    if (g_log) {
+        fprintf(g_log, "\n");
+        fclose(g_log);
+        g_log = NULL;
+    }
+}
+
+static void log_turn(const char* prefix, const std::string& text) {
+    if (!g_log) return;
+    fprintf(g_log, "[%s] %s\n", prefix, text.c_str());
+    fflush(g_log);
+}
+
 // ─── Interactive loop ───────────────────────────────────────────────────
-static void interactive_loop(void* model, const ModelInfo& info, const Config& cfg) {
-    printf("\nInteractive mode. Type your message, or /exit to quit.\n");
-    printf("Model: %s\n\n", cfg.model_path.c_str());
-
-    std::vector<int> history_ids;  // All tokens ever generated (for chat template)
-    std::string history_text;      // Full chat template text
+struct ChatState {
+    std::vector<int> all_token_ids;
+    std::string history_text;
+    uint64_t history_hash = 0;
     int total_input = 0;
+};
 
+static void interactive_loop(void* model, const ModelInfo& info, const Config& cfg) {
+    signal(SIGINT, handle_sigint);
+
+    printf("\n" ANSI_BOLD "Interactive mode." ANSI_RESET
+           " Type " ANSI_YELLOW "/exit" ANSI_RESET " to quit, "
+           ANSI_YELLOW "/reset" ANSI_RESET " to clear context.\n\n");
+
+    ChatState chat;
     std::string line;
-    while (true) {
-        printf(">>> ");
+
+    while (!g_interrupted) {
+        printf(ANSI_BOLD "[YOU]" ANSI_RESET " ");
         fflush(stdout);
 
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
-        if (line == "/exit" || line == "/quit") break;
+        if (line == "/exit" || line == "/quit") {
+            log_turn("YOU", line);
+            break;
+        }
         if (line == "/reset") {
             atlas_reset_cache(model);
-            history_ids.clear();
-            history_text.clear();
-            total_input = 0;
-            printf("[Cache reset]\n");
+            chat = ChatState();
+            printf(ANSI_YELLOW "[Context cleared]" ANSI_RESET "\n");
             continue;
         }
 
-        // Build full chat template
         std::string full_prompt;
         if (cfg.raw) {
             full_prompt = line;
         } else {
-            // If we have history, reconstruct from text
-            if (history_text.empty()) {
-                full_prompt = apply_chat_template(info, line);
-            } else {
-                // Strip the final "<|assistant|>\n" from previous, add user + assistant
-                // Simple: rebuild from history text + new user message
-                full_prompt = apply_chat_template(info, line);
+            full_prompt = apply_chat_template(info, line);
+        }
+
+        // Cache validity check: hash of history should match
+        if (!chat.history_text.empty() && chat.history_hash != 0) {
+            uint64_t current_hash = fnv1a(chat.history_text);
+            if (current_hash != chat.history_hash) {
+                printf(ANSI_YELLOW "[Warning]" ANSI_RESET
+                       " History text changed since last generation"
+                       " (cache may be stale). Type " ANSI_YELLOW "/reset" ANSI_RESET " if output is garbled.\n");
             }
         }
 
-        // Encode full prompt
         std::vector<int> input_ids = encode_text(model, full_prompt);
         if (input_ids.empty()) continue;
 
-        // Determine cache offset: if history matches, skip prefill for first part
         int cache_offset = 0;
-        if (history_text.empty()) {
-            // First turn: no cache
-            history_text = full_prompt;
-            total_input = (int)input_ids.size();
+        if (chat.history_text.empty()) {
+            chat.history_text = full_prompt;
         } else {
-            // Subsequent turns: use cache_offset to skip re-prefilling
-            // The cache already has previous turns' KV data
-            // We send the full input but offset by the number of previously processed tokens
-            // For simplicity, just use total_input as offset
-            cache_offset = total_input;
-            total_input = (int)input_ids.size();
+            cache_offset = chat.total_input;
         }
+        chat.total_input = (int)input_ids.size();
 
-        // Generate
+        log_turn("YOU", line);
+
+        Timer t;
+        printf(ANSI_GREEN "[ATLAS]" ANSI_RESET " ");
+        fflush(stdout);
         std::string response = generate(model, input_ids, cfg, cache_offset);
-        printf("%s\n\n", response.c_str());
 
-        // Update history
         if (!response.empty()) {
-            history_text += response;
+            printf("%s", response.c_str());
+            log_turn("ATLAS", response);
+            chat.history_text += response;
+            chat.history_hash = fnv1a(chat.history_text);
         }
+
+        printf(ANSI_DIM "\n     ─── %.1fs ───" ANSI_RESET "\n\n", t.elapsed());
     }
+
+    signal(SIGINT, SIG_DFL);
+    printf(ANSI_RESET "\n");
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
+    signal(SIGINT, handle_sigint);
+
 #ifdef _WIN32
-    // Override ANSI-codepage argv with UTF-8 (handles Umlaute, accents, CJK)
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     int argc_w = 0;
@@ -531,80 +678,75 @@ int main(int argc, char** argv) {
 
     // ─── Input validation ────────────────────────────────────────────────
     if (cfg.temperature < 0.0f || !std::isfinite(cfg.temperature)) {
-        fprintf(stderr, "[Error] --temp must be a finite value >= 0 (got %g)\n", cfg.temperature);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --temp must be a finite value >= 0 (got %g)\n", cfg.temperature);
         return 1;
     }
     if (cfg.max_new_tokens <= 0 || cfg.max_new_tokens > 100000) {
-        fprintf(stderr, "[Error] --max-new must be 1..100000 (got %d)\n", cfg.max_new_tokens);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --max-new must be 1..100000 (got %d)\n", cfg.max_new_tokens);
         return 1;
     }
     if (cfg.max_seq_len < 64 || cfg.max_seq_len > 262144) {
-        fprintf(stderr, "[Error] --max-seq must be 64..262144 (got %d)\n", cfg.max_seq_len);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --max-seq must be 64..262144 (got %d)\n", cfg.max_seq_len);
         return 1;
     }
     if (cfg.top_p < 0.0f || cfg.top_p > 1.0f) {
-        fprintf(stderr, "[Error] --top-p must be 0..1 (got %g)\n", cfg.top_p);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --top-p must be 0..1 (got %g)\n", cfg.top_p);
         return 1;
     }
     if (cfg.rep_penalty < 0.0f || !std::isfinite(cfg.rep_penalty)) {
-        fprintf(stderr, "[Error] --rep-penalty must be a finite value >= 0 (got %g)\n", cfg.rep_penalty);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --rep-penalty must be a finite value >= 0 (got %g)\n", cfg.rep_penalty);
         return 1;
     }
     if (cfg.num_threads < 0) {
-        fprintf(stderr, "[Error] --threads must be >= 0 (got %d)\n", cfg.num_threads);
+        fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+            " --threads must be >= 0 (got %d)\n", cfg.num_threads);
         return 1;
     }
 
-    // Determine DLL path (next to EXE, or ATLAS_DLL env var)
     const char* env_dll = getenv("ATLAS_DLL");
     std::string dll_path = env_dll ? env_dll : "atlas.dll";
 
-    if (!load_dll(dll_path.c_str())) {
-        fprintf(stderr, "[Error] Could not load atlas.dll.\n");
+    // RAII: DLL and model both cleaned up on scope exit — no manual free needed
+    AtlasDLL dll;
+    if (!dll.load(dll_path.c_str())) {
         fprintf(stderr, "  Make sure atlas.dll is in the same directory as atlas.exe\n");
-        fprintf(stderr, "  or set ATLAS_DLL environment variable.\n");
+        fprintf(stderr, "  or set " ANSI_YELLOW "ATLAS_DLL" ANSI_RESET " environment variable.\n");
         return 1;
     }
 
-    // Load model
-    void* model = atlas_load(cfg.model_path.c_str());
-    if (!model) {
-        fprintf(stderr, "[Error] Failed to load model: %s\n", cfg.model_path.c_str());
-        unload_dll();
-        return 1;
-    }
+    if (!bind_dll(dll)) return 1;
 
-    // Get model info + setup
-    ModelInfo info = get_model_info(model);
-    if (!setup_model(model, cfg, info)) {
-        atlas_free(model);
-        unload_dll();
-        return 1;
-    }
+    AtlasSession session(cfg.model_path.c_str());
+    if (!session.load()) return 1;
+    open_log(cfg.log_path);
+
+    ModelInfo info = get_model_info(session.model);
+    if (!setup_model(session.model, cfg, info)) return 1;
+
+    if (g_interrupted) goto cleanup;
 
     if (cfg.interactive) {
-        interactive_loop(model, info, cfg);
+        interactive_loop(session.model, info, cfg);
     } else if (!cfg.prompt.empty()) {
-        // One-shot generation
-        std::string full_text;
-        if (cfg.raw) {
-            full_text = cfg.prompt;
-        } else {
-            full_text = apply_chat_template(info, cfg.prompt);
-        }
+        std::string full_text = cfg.raw ? cfg.prompt : apply_chat_template(info, cfg.prompt);
+        std::vector<int> input_ids = encode_text(session.model, full_text);
+        if (input_ids.empty()) goto cleanup;
 
-        std::vector<int> input_ids = encode_text(model, full_text);
-        if (input_ids.empty()) {
-            atlas_free(model);
-            unload_dll();
-            return 1;
-        }
+        log_turn("YOU", cfg.prompt);
 
-        printf("[Atlas] Generating...\n");
-        std::string response = generate(model, input_ids, cfg, 0);
-        printf("%s\n", response.c_str());
+        Timer t;
+        printf(ANSI_GREEN "[ATLAS]" ANSI_RESET " ");
+        fflush(stdout);
+        std::string response = generate(session.model, input_ids, cfg, 0);
+        printf("%s", response.c_str());
+        log_turn("ATLAS", response);
+        printf(ANSI_DIM "\n     ─── %.1fs ───" ANSI_RESET "\n", t.elapsed());
     } else {
-        // Read prompt from stdin
         std::string stdin_text;
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -612,26 +754,27 @@ int main(int argc, char** argv) {
             stdin_text += line;
         }
         if (stdin_text.empty()) {
-            fprintf(stderr, "[Error] No prompt provided. Use -h for help.\n");
-            atlas_free(model);
-            unload_dll();
-            return 1;
+            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET " No prompt provided. Use -h for help.\n");
+            goto cleanup;
         }
 
         std::string full_text = cfg.raw ? stdin_text : apply_chat_template(info, stdin_text);
-        std::vector<int> input_ids = encode_text(model, full_text);
-        if (input_ids.empty()) {
-            atlas_free(model);
-            unload_dll();
-            return 1;
-        }
+        std::vector<int> input_ids = encode_text(session.model, full_text);
+        if (input_ids.empty()) goto cleanup;
 
-        printf("[Atlas] Generating...\n");
-        std::string response = generate(model, input_ids, cfg, 0);
-        printf("%s\n", response.c_str());
+        log_turn("YOU", stdin_text);
+
+        Timer t;
+        printf(ANSI_GREEN "[ATLAS]" ANSI_RESET " ");
+        fflush(stdout);
+        std::string response = generate(session.model, input_ids, cfg, 0);
+        printf("%s", response.c_str());
+        log_turn("ATLAS", response);
+        printf(ANSI_DIM "\n     ─── %.1fs ───" ANSI_RESET "\n", t.elapsed());
     }
 
-    atlas_free(model);
-    unload_dll();
-    return 0;
+cleanup:
+    close_log();
+    printf(ANSI_RESET);
+    return g_interrupted ? 130 : 0;
 }
