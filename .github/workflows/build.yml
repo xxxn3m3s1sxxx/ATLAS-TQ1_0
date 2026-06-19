@@ -252,7 +252,9 @@ jobs:
           python -c "import atlas_server; print('[CI] atlas_server.py OK')"
       - name: Profiling benchmark
         if: inputs.enable_profiling == true
+        shell: bash
         run: |
+          set +e
           python -c "
           from atlas_infer import AtlasModel
           m = AtlasModel('tests/falcon3-v6.atlas')
