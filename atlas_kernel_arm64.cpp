@@ -59,7 +59,7 @@
 #else
   #define ARM64_P_START()
   #define ARM64_P_ACCUM(f)
-  inline void profile_print_arm64() {}
+  void profile_print_arm64() {}
 #endif
 
 // ─── Helper: fp16 → fp32 (NEON single-instruction FCVT) ────────────────

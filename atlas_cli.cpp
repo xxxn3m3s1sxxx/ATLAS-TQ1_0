@@ -126,46 +126,6 @@ struct AtlasDLL {
     }
 };
 
-// ─── RAII: Model lifecycle ────────────────────────────────────────────
-struct AtlasSession {
-    void* model;
-    const char* path;
-
-    AtlasSession(const char* p) : model(NULL), path(p) {}
-
-    bool load() {
-        model = atlas_load(path);
-        if (!model) {
-            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
-                " Failed to load model: %s\n", path);
-            return false;
-        }
-        return true;
-    }
-
-    ~AtlasSession() { if (model) atlas_free(model); }
-
-    AtlasSession(const AtlasSession&) = delete;
-    AtlasSession& operator=(const AtlasSession&) = delete;
-
-    AtlasSession(AtlasSession&& other) noexcept : model(other.model), path(other.path) {
-        other.model = NULL;
-    }
-    AtlasSession& operator=(AtlasSession&& other) noexcept {
-        if (this != &other) {
-            if (model) atlas_free(model);
-            model = other.model;
-            path = other.path;
-            other.model = NULL;
-        }
-        return *this;
-    }
-
-    void reset() { if (model) { atlas_free(model); model = NULL; } }
-
-    explicit operator bool() const { return model != NULL; }
-};
-
 // ─── Function pointer typedefs ──────────────────────────────────────────
 typedef void* (*PFN_atlas_load)(const char* path);
 typedef void  (*PFN_atlas_free)(void* model);
@@ -236,6 +196,46 @@ static PFN_atlas_has_binary_tokenizer atlas_has_binary_tokenizer;
         return false; \
     } \
 } while(0)
+
+// ─── RAII: Model lifecycle ────────────────────────────────────────────
+struct AtlasSession {
+    void* model;
+    const char* path;
+
+    AtlasSession(const char* p) : model(NULL), path(p) {}
+
+    bool load() {
+        model = atlas_load(path);
+        if (!model) {
+            fprintf(stderr, ANSI_RED "[Error]" ANSI_RESET
+                " Failed to load model: %s\n", path);
+            return false;
+        }
+        return true;
+    }
+
+    ~AtlasSession() { if (model) atlas_free(model); }
+
+    AtlasSession(const AtlasSession&) = delete;
+    AtlasSession& operator=(const AtlasSession&) = delete;
+
+    AtlasSession(AtlasSession&& other) noexcept : model(other.model), path(other.path) {
+        other.model = NULL;
+    }
+    AtlasSession& operator=(AtlasSession&& other) noexcept {
+        if (this != &other) {
+            if (model) atlas_free(model);
+            model = other.model;
+            path = other.path;
+            other.model = NULL;
+        }
+        return *this;
+    }
+
+    void reset() { if (model) { atlas_free(model); model = NULL; } }
+
+    explicit operator bool() const { return model != NULL; }
+};
 
 static bool bind_dll(AtlasDLL& dll) {
     LOAD_OR_FAIL(atlas_load);
