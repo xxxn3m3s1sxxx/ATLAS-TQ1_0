@@ -219,7 +219,7 @@ jobs:
       - name: Build (ARM64 NEON)
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
-          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
+          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -D__aarch64__ -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
           echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
       - name: Generate test fixtures
         run: python tests/generate_test_fixtures.py tests/

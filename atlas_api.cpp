@@ -860,12 +860,14 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
 
 // ─── Load model ─────────────────────────────────────────────────────────
 ATLAS_API AtlasModel* atlas_load(const char* path) {
+#ifndef __aarch64__
     if (!check_avx2()) {
         fprintf(stderr, "[ATLAS] Error: AVX2 instruction set required.\n");
         fprintf(stderr, "  ATLAS needs AVX2 (Haswell, ~2013+) for fast int8 matmul.\n");
         fprintf(stderr, "  Your CPU does not report AVX2 support.\n");
         return nullptr;
     }
+#endif
     init_tq1_decode_lut();
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ATLAS] Cannot open %s\n", path); return nullptr; }

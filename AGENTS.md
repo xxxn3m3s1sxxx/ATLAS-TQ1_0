@@ -76,6 +76,15 @@ clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas
 clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
 ```
 
+**macOS ARM64 (Apple Silicon):** Requires Homebrew LLVM (not Apple Clang). `atlas_kernel_arm64.cpp` provides NEON equivalents.
+```bash
+brew install llvm libomp
+LLVM_PREFIX=$(brew --prefix llvm)
+$LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -D__aarch64__ -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
+```
+
+**Compiler macro compatibility**: `atlas_api.cpp` uses `#ifdef __aarch64__` / `#ifndef __aarch64__` guards throughout. Homebrew LLVM Clang 22.1.7 on macOS ARM64 defines `__arm64__` instead of `__aarch64__`; the portability block at line 13 also maps `_M_ARM64` and `__ARM_ARCH_ISA_A64`. As a belt-and-suspenders measure, the ARM64 build command passes `-D__aarch64__` explicitly.
+
 **Env**: `KMP_DUPLICATE_LIB_OK=TRUE` on Windows for MKL compat.
 
 ## Performance
