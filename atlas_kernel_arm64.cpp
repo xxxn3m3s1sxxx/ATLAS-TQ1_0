@@ -25,6 +25,43 @@
 #include <cstring>
 #include <arm_neon.h>
 
+// ─── FFN Micro-profiling (cycle-level, ARM64 cntvct_el0) ──────────────
+// Guards: PROFILE_MODE or ATLAS_DEBUG_MODE
+// For per-operation breakdown in the three FFN kernel hot loops.
+// Call profile_print_arm64() from atlas_api.cpp after profile_print().
+#if defined(PROFILE_MODE) || defined(ATLAS_DEBUG_MODE)
+  #include "atlas_timer.h"
+  static thread_local struct {
+      uint64_t ffn_i4_unpack;     // nibble unpack + sign extend in matmul_i4
+      uint64_t ffn_i4_fma;        // vdotq_s32 in matmul_i4
+      uint64_t ffn_f32_conv;      // int8→f32 conversion (vmovl + vcvt) in fused f32
+      uint64_t ffn_f32_fma;       // vfmaq_f32 in fused f32
+      uint64_t ffn_default_conv;  // XOR-0x80 conversion + load in fused default
+      uint64_t ffn_default_fma;   // vdotq_s32 in fused default
+  } g_prof_arm64;
+  #define ARM64_P_START()  uint64_t _arm64_tsc = atlas_cycles()
+  #define ARM64_P_ACCUM(f) g_prof_arm64.ffn_##f += (atlas_cycles() - _arm64_tsc)
+  void profile_print_arm64() {
+      uint64_t tot = g_prof_arm64.ffn_i4_unpack + g_prof_arm64.ffn_i4_fma
+                   + g_prof_arm64.ffn_f32_conv + g_prof_arm64.ffn_f32_fma
+                   + g_prof_arm64.ffn_default_conv + g_prof_arm64.ffn_default_fma;
+      if (tot == 0) return;
+      auto pc = [tot](uint64_t v) { return 100.0 * (double)v / (double)tot; };
+      fprintf(stderr, "\n── ARM64 FFN micro (%lluM cycles) ──\n", (unsigned long long)(tot / 1000000));
+      fprintf(stderr, "  i4 unpack     %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_i4_unpack, pc(g_prof_arm64.ffn_i4_unpack));
+      fprintf(stderr, "  i4 FMA        %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_i4_fma, pc(g_prof_arm64.ffn_i4_fma));
+      fprintf(stderr, "  f32 conv      %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_f32_conv, pc(g_prof_arm64.ffn_f32_conv));
+      fprintf(stderr, "  f32 FMA       %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_f32_fma, pc(g_prof_arm64.ffn_f32_fma));
+      fprintf(stderr, "  default conv  %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_default_conv, pc(g_prof_arm64.ffn_default_conv));
+      fprintf(stderr, "  default FMA   %9llu (%5.1f%%)\n", (unsigned long long)g_prof_arm64.ffn_default_fma, pc(g_prof_arm64.ffn_default_fma));
+      fprintf(stderr, "────────────────────────────────\n");
+  }
+#else
+  #define ARM64_P_START()
+  #define ARM64_P_ACCUM(f)
+  inline void profile_print_arm64() {}
+#endif
+
 // ─── Helper: fp16 → fp32 (NEON single-instruction FCVT) ────────────────
 static inline float fp16_to_fp32(uint16_t h) {
     uint16x4_t uv = vld1_u16(&h);
@@ -604,6 +641,7 @@ extern "C" void atlas_matmul_i4_f32(int rows, int cols,
             int c = 0;
 
             for (; c + 32 <= cols; c += 32) {
+                ARM64_P_START();
                 int pc = c / 2;
                 uint8x16_t packed = vld1q_u8(pw + pc);
                 uint8x16_t lo = vandq_u8(packed, vdupq_n_u8(0x0F));
@@ -613,12 +651,16 @@ extern "C" void atlas_matmul_i4_f32(int rows, int cols,
                     vreinterpretq_s8_u8(hi));
                 int8x16_t w0 = vsubq_s8(veorq_s8(zipped.val[0], vdupq_n_s8(8)), vdupq_n_s8(8));
                 int8x16_t w1 = vsubq_s8(veorq_s8(zipped.val[1], vdupq_n_s8(8)), vdupq_n_s8(8));
+                ARM64_P_ACCUM(i4_unpack);
+
+                ARM64_P_START();
                 uint8x16_t au0 = vld1q_u8(a + c);
                 uint8x16_t au1 = vld1q_u8(a + c + 16);
                 int8x16_t act0 = vreinterpretq_s8_u8(veorq_u8(au0, xor_80));
                 int8x16_t act1 = vreinterpretq_s8_u8(veorq_u8(au1, xor_80));
                 acc = vdotq_s32(acc, act0, w0);
                 acc = vdotq_s32(acc, act1, w1);
+                ARM64_P_ACCUM(i4_fma);
             }
 
             int32_t dot = vaddvq_s32(acc);
@@ -671,6 +713,7 @@ extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
                     float32x4_t a2 = vld1q_f32(a + c + 8);
                     float32x4_t a3 = vld1q_f32(a + c + 12);
 
+                    ARM64_P_START();
                     int8x16_t wgv = vld1q_s8(wg + c);
                     int8x16_t wuv = vld1q_s8(wu + c);
 
@@ -688,7 +731,9 @@ extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
                     float32x4_t u_wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu16)));
                     float32x4_t u_wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wu16h)));
                     float32x4_t u_wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wu16h)));
+                    ARM64_P_ACCUM(f32_conv);
 
+                    ARM64_P_START();
                     g_acc = vfmaq_f32(g_acc, a0, g_wf0);
                     g_acc = vfmaq_f32(g_acc, a1, g_wf1);
                     g_acc = vfmaq_f32(g_acc, a2, g_wf2);
@@ -698,6 +743,7 @@ extern "C" void atlas_fused_gate_up_f32_neon(int rows, int dim_w,
                     u_acc = vfmaq_f32(u_acc, a1, u_wf1);
                     u_acc = vfmaq_f32(u_acc, a2, u_wf2);
                     u_acc = vfmaq_f32(u_acc, a3, u_wf3);
+                    ARM64_P_ACCUM(f32_fma);
                 }
 
                 float gs = vaddvq_f32(g_acc);
@@ -762,12 +808,17 @@ extern "C" void atlas_fused_gate_up_default_neon(int rows, int dim_w,
 
                 int c = 0;
                 for (; c + 16 <= dim_w; c += 16) {
+                    ARM64_P_START();
                     uint8x16_t av = vld1q_u8(a + c);
                     int8x16_t gv = vld1q_s8(wg + c);
                     int8x16_t uv = vld1q_s8(wu + c);
                     int8x16_t av_s = veorq_s8(vreinterpretq_s8_u8(av), xor_mask);
+                    ARM64_P_ACCUM(default_conv);
+
+                    ARM64_P_START();
                     g_acc = vdotq_s32(g_acc, gv, av_s);
                     u_acc = vdotq_s32(u_acc, uv, av_s);
+                    ARM64_P_ACCUM(default_fma);
                 }
 
                 int g_dot = vaddvq_s32(g_acc);

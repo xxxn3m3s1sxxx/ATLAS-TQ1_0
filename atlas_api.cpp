@@ -62,6 +62,13 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
     const int8_t* weights, const uint8_t* act_u8,
     const float* max_abs, float scale, float* output, int B);
 
+#endif  // __aarch64__
+
+// C++ linkage — print ARM64 FFN micro-probes (no-op on non-arm64)
+#ifdef __aarch64__
+void profile_print_arm64();
+#else
+static void profile_print_arm64() {}
 #endif
 #include <omp.h>
 
@@ -7021,6 +7028,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     PROF_ADD_TOKENS(1);  // account for prefill token
 
     profile_print();
+    profile_print_arm64();
     return n_gen;
 }
 
@@ -7179,6 +7187,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     PROF_ADD_TOKENS(1);
 
     profile_print();
+    profile_print_arm64();
     return n_gen;
 }
 
