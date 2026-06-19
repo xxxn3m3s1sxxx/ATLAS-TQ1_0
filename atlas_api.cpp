@@ -3764,6 +3764,37 @@ static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
         }
     }
 }
+#else
+static void matmul_turboquant_fused(int rows, int input_dim, int packed_cols,
+    const uint8_t* tensor_data, int block_size, int n_blocks,
+    const float* activations, float* output, int B) {
+    (void)packed_cols;
+    const uint8_t* packed = tensor_data + 3 + rows * n_blocks * 2;
+    for (int r = 0; r < rows; r++) {
+        const uint8_t* row_scales = tensor_data + 3 + r * n_blocks * 2;
+        const uint8_t* row_packed = packed + r * packed_cols;
+        for (int b = 0; b < B; b++) {
+            const float* act = activations + b * input_dim;
+            float row_acc = 0.0f;
+            for (int blk = 0; blk < n_blocks; blk++) {
+                float vacc = 0.0f;
+                int blk_start = blk * block_size;
+                int blk_bytes = blk_start / 4;
+                for (int off = 0; off < block_size; off += 4) {
+                    const uint8_t* bp = row_packed + blk_bytes + off / 4;
+                    uint8_t byte = bp[0];
+                    for (int i = 0; i < 4; i++) {
+                        int val = (int)((byte >> (2 * i)) & 3) - 1;
+                        vacc += act[blk_start + off + i] * (float)val;
+                    }
+                }
+                uint16_t ws16; memcpy(&ws16, row_scales + blk * 2, 2);
+                row_acc += vacc * fp16_to_fp32(ws16);
+            }
+            output[b * rows + r] = row_acc;
+        }
+    }
+}
 #endif
 
 // ─── v1.3.0: Ternary-add matmul + reorder (vpsignb, no multiplication) ─
@@ -3915,6 +3946,33 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
             }
         }
         free(decode_buf);
+    }
+}
+#else
+static void matmul_tq1_packed_reorder(int rows, int input_dim,
+    const uint8_t* packed, int packed_cols,
+    const uint8_t* act_u8, const float* max_abs,
+    float scale, float* output, int B) {
+    (void)packed_cols;
+    init_tq1_decode_lut();
+    for (int b = 0; b < B; b++) {
+        const uint8_t* a = act_u8 + b * input_dim;
+        float deq = max_abs[b] / 127.0f;
+        for (int r = 0; r < rows; r++) {
+            const uint8_t* wp = packed + r * packed_cols;
+            int dot = 0;
+            int sum_w = 0;
+            for (int c = 0; c < input_dim; c += 5) {
+                uint8_t byte = wp[c / 5];
+                for (int i = 0; i < 5 && c + i < input_dim; i++) {
+                    int w = (int)tq1_decode[byte][i];
+                    dot += (int)a[c + i] * w;
+                    sum_w += w;
+                }
+            }
+            dot -= 128 * sum_w;
+            output[b * rows + r] = (float)dot * deq / (127.0f * scale);
+        }
     }
 }
 #endif
@@ -4995,9 +5053,92 @@ static void matmul_f32_per_row(int rows, int input_dim,
         }
     }
 }
+#else
+static void matmul_f32_reorder(int rows, int input_dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    float scale, float* __restrict__ output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * input_dim;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * input_dim;
+                float s = 0.0f;
+                for (int i = 0; i < input_dim; i++) s += a[i] * (float)w[i];
+                out4[sub] = s / scale;
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+}
+static void matmul_f32_reorder_per_row(int rows, int dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    const uint16_t* __restrict__ row_scales_fp16,
+    float* __restrict__ output, int B) {
+    int rows_packed = rows / 4;
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows_packed > 4)
+    #endif
+    for (int ur = 0; ur < rows_packed; ur++) {
+        float rsc[4];
+        for (int sub = 0; sub < 4; sub++)
+            rsc[sub] = fp16_to_fp32(row_scales_fp16[ur * 4 + sub]);
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * dim;
+            float out4[4];
+            for (int sub = 0; sub < 4; sub++) {
+                const int8_t* w = weights + (ur * 4 + sub) * dim;
+                float s = 0.0f;
+                for (int i = 0; i < dim; i++) s += a[i] * (float)w[i];
+                out4[sub] = s / rsc[sub];
+            }
+            float* dst = output + b * rows;
+            dst[0 * rows_packed + ur] = out4[0];
+            dst[1 * rows_packed + ur] = out4[1];
+            dst[2 * rows_packed + ur] = out4[2];
+            dst[3 * rows_packed + ur] = out4[3];
+        }
+    }
+    int rem_start = rows_packed * 4;
+    for (int r = 0; r < rows - rem_start; r++) {
+        int ri = rem_start + r;
+        float rs = fp16_to_fp32(row_scales_fp16[ri]);
+        for (int b = 0; b < B; b++) {
+            const int8_t* w = weights + ri * dim;
+            const float* a = act_f32 + b * dim;
+            float s = 0.0f;
+            for (int i = 0; i < dim; i++) s += a[i] * (float)w[i];
+            output[b * rows + ri] = s / rs;
+        }
+    }
+}
+static void matmul_f32_per_row(int rows, int input_dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act_f32,
+    int act_stride, const uint16_t* __restrict__ row_scales_fp16,
+    float* __restrict__ output, int B) {
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows > 4)
+    #endif
+    for (int r = 0; r < rows; r++) {
+        float rs = fp16_to_fp32(row_scales_fp16[r]);
+        for (int b = 0; b < B; b++) {
+            const float* a = act_f32 + b * act_stride;
+            const int8_t* w = weights + r * input_dim;
+            float s = 0.0f;
+            for (int i = 0; i < input_dim; i++) s += a[i] * (float)w[i];
+            output[b * rows + r] = s / rs;
+        }
+    }
+}
 #endif
-
-
 
 // ─── Helper: int8 matmul + reorder + dequant ──────────────────────────
 // act_u8: [B, input_dim] quantized activations
