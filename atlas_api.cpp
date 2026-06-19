@@ -9,6 +9,14 @@
 #include <vector>
 #include <string>
 #include <mutex>
+
+// Normalize ARM64 detection across compilers. GCC defines __aarch64__,
+// Apple Clang defines __arm64__, MSVC defines _M_ARM64. Unify to __aarch64__
+// so the dozens of #if[n]def __aarch64__ guards throughout the file work.
+#if (defined(__arm64__) || defined(_M_ARM64) || defined(__ARM_ARCH_ISA_A64)) && !defined(__aarch64__)
+#define __aarch64__ 1
+#endif
+
 #ifdef __aarch64__
 #include <arm_neon.h>
 #else
