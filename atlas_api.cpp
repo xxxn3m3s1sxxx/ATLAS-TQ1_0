@@ -58,6 +58,24 @@ extern "C" void atlas_fused_gate_up_default_neon(int rows, int dim_w,
     const float* max_abs, int B,
     float* buf_gate, float* buf_up,
     float g_scale, float u_scale);
+extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
+    const int8_t* weights, const uint8_t* act_u8,
+    const float* max_abs, float scale, float* output, int B);
+
+// x86-only matmul stubs — should never be reached on ARM64
+static void matmul_turboquant_fused(int, int, int,
+    const uint8_t*, int, int,
+    const float*, float*, int) {
+    fprintf(stderr, "[ATLAS] ARM64: TurboQuant (ttype=7) not supported\n");
+    abort();
+}
+static void matmul_tq1_packed_reorder(int, int,
+    const uint8_t*, int,
+    const uint8_t*, const float*,
+    float, float*, int) {
+    fprintf(stderr, "[ATLAS] ARM64: TQ1-packed (ttype=0) not supported\n");
+    abort();
+}
 #endif
 #include <omp.h>
 
