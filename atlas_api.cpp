@@ -67,10 +67,10 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
 // C++ linkage — print ARM64 FFN micro-probes (no-op on non-arm64)
 #ifdef __aarch64__
 void profile_print_arm64();
-void profile_print_tq1();    // defined in scalar fallback PROFILE_MODE block (or as stub)
+extern "C" void profile_print_tq1();    // defined in scalar fallback PROFILE_MODE block (or as stub)
 #else
 static void profile_print_arm64() {}
-void profile_print_tq1() {}
+extern "C" void profile_print_tq1() {}
 #endif
 
 
