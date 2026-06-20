@@ -261,21 +261,20 @@ jobs:
           echo "=== Starting profiling benchmark ==="
           set +e
           python -c "
-import sys, ctypes
-sys.stderr.write('[PROFILE] Python benchmark script started\n')
-import atlas_infer
-sys.stderr.write('[PROFILE] atlas_infer imported OK\n')
-m = atlas_infer.AtlasModel('tests/falcon3_v6.atlas')
-m.set_use_f32_matmul(False)
-# Bypass Python tokenizer — mock model has only 67 vocab (preencode fails)
-input_ids = (ctypes.c_int * 2)(1, 1)
-out_arr = (ctypes.c_int * 50)()
-n_gen = atlas_infer.dll.atlas_generate(
-    m.model_ptr, input_ids, 2,
-    256, 50,
-    0.7, 40, 0.9, 1.0, 0, 0, out_arr)
-print('n_gen:', n_gen)
-" 2>profiling_stderr.txt
+          import sys, ctypes
+          sys.stderr.write('[PROFILE] Python benchmark script started\n')
+          import atlas_infer
+          sys.stderr.write('[PROFILE] atlas_infer imported OK\n')
+          m = atlas_infer.AtlasModel('tests/falcon3_v6.atlas')
+          m.set_use_f32_matmul(False)
+          input_ids = (ctypes.c_int * 2)(1, 1)
+          out_arr = (ctypes.c_int * 50)()
+          n_gen = atlas_infer.dll.atlas_generate(
+          m.model_ptr, input_ids, 2,
+          256, 50,
+          0.7, 40, 0.9, 1.0, 0, 0, out_arr)
+          print('n_gen:', n_gen)
+          " 2>profiling_stderr.txt
           echo "=== PROFILING OUTPUT ==="
           cat profiling_stderr.txt
           [ -s profiling_stderr.txt ] || echo "[WARN] No profiling output in stderr"
