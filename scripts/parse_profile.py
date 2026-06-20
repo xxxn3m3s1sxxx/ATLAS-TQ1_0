@@ -66,10 +66,14 @@ RAII_RE = re.compile(r"\[Profile\] (.+?): (\d+) ticks?")
 def parse_ffn_blocks(text: str):
     blocks = []
     for m in PROFILE_RE.finditer(text):
-        total_cycles = int(m.group(1)) * 1_000_000
+        total_cycles_hdr = int(m.group(1)) * 1_000_000
         cats = {}
         for lm in LINE_RE.finditer(m.group(2)):
             cats[lm.group(1)] = {"cycles": int(lm.group(2)), "pct": float(lm.group(3))}
+        if total_cycles_hdr == 0:
+            total_cycles = sum(c["cycles"] for c in cats.values())
+        else:
+            total_cycles = total_cycles_hdr
         blocks.append({"total_cycles": total_cycles, "categories": cats})
     return blocks
 

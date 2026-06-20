@@ -2548,7 +2548,9 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                                     const int32_t* __restrict__ row_sums,
                                     float* __restrict__ output,
                                     int n_tokens) {
+    (void)row_sums;
     const int TILE_B = 8;
+    const __m256i c80 = _mm256_set1_epi8((char)0x80);
     for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
         int t_end = t0 + TILE_B;
         if (t_end > n_tokens) t_end = n_tokens;
@@ -2557,7 +2559,6 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
         #endif
         for (int r = 0; r < rows; r++) {
             const int8_t* w = weights + r * input_dim;
-            int sum_w = row_sums[r];
 
             for (int t = t0; t < t_end; t++) {
                 const uint8_t* a = act_u8 + t * input_dim;
@@ -2568,11 +2569,15 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                 __m256i acc = _mm256_setzero_si256();
 
                 for (; c + 32 <= input_dim; c += 32) {
-                    __m256i au = _mm256_loadu_si256((const __m256i*)(a + c));
-                    __m256i wi = _mm256_loadu_si256((const __m256i*)(w + c));
-                    __m256i prod16 = _mm256_maddubs_epi16(au, wi);
-                    __m256i prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
-                    acc = _mm256_add_epi32(acc, prod32);
+                    __m256i a8 = _mm256_loadu_si256((const __m256i*)(a + c));
+                    __m256i w8 = _mm256_loadu_si256((const __m256i*)(w + c));
+                    __m256i ac = _mm256_xor_si256(a8, c80);
+                    __m256i a16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(ac));
+                    __m256i a16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(ac, 1));
+                    __m256i w16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w8));
+                    __m256i w16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w8, 1));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16, w16));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a16h, w16h));
                 }
 
                 __m128i lo = _mm256_castsi256_si128(acc);
@@ -2583,11 +2588,10 @@ ATLAS_API void atlas_matmul_i8_f32(int rows, int input_dim,
                 dot = _mm_cvtsi128_si32(sum128);
 
                 for (; c < input_dim; c++) {
-                    dot += (int)a[c] * (int)w[c];
+                    dot += ((int)a[c] - 128) * (int)w[c];
                 }
 
-                int result = dot - 128 * sum_w;
-                output[t * rows + r] = (float)result;
+                output[t * rows + r] = (float)dot;
             }
         }
     }
@@ -2608,6 +2612,7 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
                                     const int32_t* __restrict__ row_sums,
                                     float* __restrict__ output,
                                     int n_tokens) {
+    (void)row_sums;
     if (atlas_vnni_available()) {
         atlas_matmul_i4_vnni(rows, cols, packed_weights, act_u8, row_sums, output, n_tokens);
         return;
@@ -2615,7 +2620,7 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
 
     const __m256i c8 = _mm256_set1_epi8(8);
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
-    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i c80 = _mm256_set1_epi8((char)0x80);
 
     const int TILE_B = 8;
     for (int t0 = 0; t0 < n_tokens; t0 += TILE_B) {
@@ -2626,7 +2631,6 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
         #endif
         for (int r = 0; r < rows; r++) {
             const uint8_t* pw = packed_weights + r * cols / 2;
-            int sum_w = row_sums[r];
 
             for (int t = t0; t < t_end; t++) {
                 const uint8_t* a = act_u8 + t * cols;
@@ -2653,15 +2657,24 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
                     __m256i w_lo = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x20);
                     __m256i w_hi = _mm256_permute2f128_si256(w_tmp_lo, w_tmp_hi, 0x31);
 
+                    // XOR act_u8 with 0x80 centered: (a[c] - 128) as int8 → sign-extend to int16
                     __m256i a0 = _mm256_loadu_si256((const __m256i*)(a + c));
-                    __m256i p16_0 = _mm256_maddubs_epi16(a0, w_lo);
-                    __m256i p32_0 = _mm256_madd_epi16(p16_0, ones16);
-                    acc = _mm256_add_epi32(acc, p32_0);
+                    __m256i w_lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w_lo));
+                    __m256i w_lo16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w_lo, 1));
+                    __m256i a0c = _mm256_xor_si256(a0, c80);
+                    __m256i a0c16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a0c));
+                    __m256i a0c16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a0c, 1));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a0c16, w_lo16));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a0c16h, w_lo16h));
 
                     __m256i a1 = _mm256_loadu_si256((const __m256i*)(a + c + 32));
-                    __m256i p16_1 = _mm256_maddubs_epi16(a1, w_hi);
-                    __m256i p32_1 = _mm256_madd_epi16(p16_1, ones16);
-                    acc = _mm256_add_epi32(acc, p32_1);
+                    __m256i w_hi16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w_hi));
+                    __m256i w_hi16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w_hi, 1));
+                    __m256i a1c = _mm256_xor_si256(a1, c80);
+                    __m256i a1c16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a1c));
+                    __m256i a1c16h = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a1c, 1));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a1c16, w_hi16));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a1c16h, w_hi16h));
                 }
 
                 __m128i lo = _mm256_castsi256_si128(acc);
@@ -2677,11 +2690,10 @@ ATLAS_API void atlas_matmul_i4_f32(int rows, int cols,
                         ? (packed_weights[packed_idx] >> 4)
                         : (packed_weights[packed_idx] & 0x0F);
                     int8_t w_val = (int8_t)((nibble ^ 8) - 8);
-                    dot += (int)a[c] * (int)w_val;
+                    dot += ((int)a[c] - 128) * (int)w_val;
                 }
 
-                int result = dot - 128 * sum_w;
-                output[t * rows + r] = (float)result;
+                output[t * rows + r] = (float)dot;
             }
         }
     }
