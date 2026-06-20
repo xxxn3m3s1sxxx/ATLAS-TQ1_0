@@ -31,18 +31,22 @@
 // Call profile_print_arm64() from atlas_api.cpp after profile_print().
 #if defined(PROFILE_MODE) || defined(ATLAS_DEBUG_MODE)
   #include <cstdio>
+  #include <omp.h>
   #include "atlas_timer.h"
-  static thread_local struct {
-      uint64_t _tsc;                   // scratch: written by START, read by ACCUM
-      uint64_t ffn_i4_unpack;     // nibble unpack + sign extend in matmul_i4
-      uint64_t ffn_i4_fma;        // vdotq_s32 in matmul_i4
-      uint64_t ffn_f32_conv;      // int8→f32 conversion (vmovl + vcvt) in fused f32
-      uint64_t ffn_f32_fma;       // vfmaq_f32 in fused f32
-      uint64_t ffn_default_conv;  // XOR-0x80 conversion + load in fused default
-      uint64_t ffn_default_fma;   // vdotq_s32 in fused default
+  static struct {
+      uint64_t ffn_i4_unpack;
+      uint64_t ffn_i4_fma;
+      uint64_t ffn_f32_conv;
+      uint64_t ffn_f32_fma;
+      uint64_t ffn_default_conv;
+      uint64_t ffn_default_fma;
   } g_prof_arm64;
-  #define ARM64_P_START()  g_prof_arm64._tsc = atlas_cycles()
-  #define ARM64_P_ACCUM(f) g_prof_arm64.ffn_##f += (atlas_cycles() - g_prof_arm64._tsc)
+  #define ARM64_P_START()  do { g_prof_tsc[omp_get_thread_num()] = atlas_cycles(); } while(0)
+  #define ARM64_P_ACCUM(f) do { \
+      int _t = omp_get_thread_num(); \
+      __sync_fetch_and_add(&g_prof_arm64.ffn_##f, atlas_cycles() - g_prof_tsc[_t]); \
+  } while(0)
+  static __thread uint64_t g_prof_tsc[64];
   void profile_print_arm64() {
       uint64_t tot = g_prof_arm64.ffn_i4_unpack + g_prof_arm64.ffn_i4_fma
                    + g_prof_arm64.ffn_f32_conv + g_prof_arm64.ffn_f32_fma
