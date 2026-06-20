@@ -326,7 +326,7 @@ See `atlas_ffi.h` for full API.
 
 | Version | Key Changes |
 |---------|-------------|
-| **v2.16.1** | **vpmaddubsw overflow fix in atlas_matmul_i8_f32**: XOR-0x80 centering + `_mm256_madd_epi16` replaces saturating `_mm256_maddubs_epi16`. Eliminates `row_sums` correction — `sum((act-128)×w) = sum(act×w) - 128×sum(w)`. Three secondary bugs fixed (`_mm256_set1_epi8(0x80)` zero-extension, tail loop uint8 wrap, same in `atlas_matmul_i4_f32`). 94 tests (27 parity + 67 mock) on 7 architectures. Bonsai-4B-Pro baseline: 19.2 tok/s (+10%). Confirm: hybrid+int4 path "achuachuachu" — f32_bypass is mandatory for Bonsai-4B (rope_theta=5M >= 3M). int4 FFN + fp32 activations deferred (nibble-unpack overhead uncertain). CI: macOS ARM64 `--break-system-packages` fix for PEP 668. |
+| **v2.16.1** | **vpmaddubsw overflow fix in atlas_matmul_i8_f32**: XOR-0x80 centering + `_mm256_madd_epi16` replaces saturating `_mm256_maddubs_epi16`. Eliminates `row_sums` correction — `sum((act-128)×w) = sum(act×w) - 128×sum(w)`. Three secondary bugs fixed (`_mm256_set1_epi8(0x80)` zero-extension, tail loop uint8 wrap, same in `atlas_matmul_i4_f32`). 94 tests (27 parity + 67 mock) on 7 architectures. Bonsai-4B-Pro baseline: 19.2 tok/s (+10%). Confirm: hybrid+int4 path "achuachuachu" — f32_bypass is mandatory for Bonsai-4B (rope_theta=5M >= 3M). int4 FFN + fp32 activations deferred (nibble-unpack overhead uncertain). CI: macOS ARM64 `--break-system-packages` fix for PEP 668. **ARM64 NEON kernel audit**: alle 8 Kernels mathematisch äquivalent zu x86. Tail-loop Bug gefixt (`(int)(a[c]-128)` → `((int)a[c]-128)` in `atlas_matmul_i8_f32`, Dead Code aber defensive Korrektheit). |
 | **v2.16.0** | **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d). B=1024: weighted sum 57.7s (−35.7% from baseline). Total 656.1s (−27.8% from baseline). 64/67 mock tests. |
 | **v2.15.0** | **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens. Per-query thread-local scores buffer initialized to -1e9f — SKIP/PARTIAL stay masked. B=1024: scores 292s (−43.1%), total 664s (−26.9%). Bonsai-4B-Pro decode: 12.65 tok/s (+16%). 64/67 mock tests. |
 | **v2.14.0** | **OMP schedule(dynamic) + i8 Prefetch Removal**. `schedule(dynamic, 64)` on `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, `atlas_matmul_i4_vnni` — prevents cache-miss stragglers from blocking OMP barriers. `schedule(dynamic, 32)` on 4-row grouped hybrid int8 gate+up. Removed stale `_MM_HINT_T1` from i8 and VNNI kernels (consistent with v2.13.0). 64/67 mock tests. Bonsai-4B-Pro: 10.57→10.91 tok/s (+3% within noise). Key insight: dynamic scheduling overhead negligible (~4 µs for 38 chunks), but DRAM bandwidth remains the real bottleneck — no schedule change can fix that. |
@@ -410,3 +410,22 @@ See `atlas_ffi.h` for full API.
 - **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
 - **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).
 - **Cache**: `.i8` cache auto-generated on first full int8 decompress, mmap'd on reload.
+
+## ARM64 NEON Parity (v2.16.1)
+
+`atlas_kernel_arm64.cpp` (856 Zeilen) stellt NEON-Äquivalente für alle heißen x86-Pfade bereit:
+
+| Kernel | NEON-Status | Anmerkungen |
+|--------|-------------|-------------|
+| `matmul_i8_f32` | ✅ XOR-0x80 + `vdotq_s32` | `vdotq_s32` akkumuliert direkt in int32 — keine `vpmaddubsw`-Sättigung |
+| `matmul_i4_f32` | ✅ `vzipq_s8` Nibble + XOR-0x80 | Tail loop via `(a[c] ^ 0x80)`, korrekt |
+| `matmul_ternary_f32` | ✅ `vdotq_s32` + XOR-0x80 | Tail loop via `(int)a[c] - 128`, korrekt |
+| TQ1 fused (s8) | ✅ Fused decode + `vdotq_s32` | Kein x86-Äquivalent (x86 trennt decode + matmul) |
+| TQ1 fused (f32) | ✅ Fused decode + `vfmaq_f32` | Kein x86-Äquivalent |
+| TQ2 s8/f32 | ✅ Delegiert an fused_* | Wrapper |
+| Fused gate+up (f32) | ✅ `vfmaq_f32` | Tail loop via float, korrekt |
+| Fused gate+up (default) | ✅ XOR-0x80 + `vdotq_s32` | Tail loop via `(int8_t)(a[c] ^ 0x80)`, korrekt |
+
+**Audit-Ergebnis**: Alle 8 Kernels mathematisch äquivalent zu x86. Einziger Fix (v2.16.1): Tail-Loop-Bug in `atlas_matmul_i8_f32` (Zeile 178), `(int)(a[c] - 128)` → `((int)a[c] - 128)`. Dead Code für alle Produktionsmodelle (`cols % 16 == 0`), aber defensive Korrektheit.
+
+**Key insight**: ARM64 NEON hatte nie das `vpmaddubsw`-Sättigungsproblem, weil `vdotq_s32` direkt in int32 akkumuliert. Die x86-seitige Zentrierungs-Formel (XOR-0x80 + `_mm256_madd_epi16`) war auf ARM64 seit jeher korrekt implementiert.

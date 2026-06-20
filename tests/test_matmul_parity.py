@@ -23,12 +23,17 @@ if DLL is None:
     raise RuntimeError("No atlas DLL/SO found in current directory")
 
 
-def _bind(name, argtypes, restype):
+def _bind(name, argtypes, restype, optional=False):
+    if optional and not hasattr(DLL, name):
+        return None
     fn = getattr(DLL, name)
     fn.argtypes = argtypes
     fn.restype = restype
     return fn
 
+
+_HAS_I8 = hasattr(DLL, "atlas_matmul_i8_f32")
+_HAS_I4 = hasattr(DLL, "atlas_matmul_i4_f32")
 
 matmul_i8_f32 = _bind("atlas_matmul_i8_f32", [
     ctypes.c_int, ctypes.c_int,
@@ -37,7 +42,7 @@ matmul_i8_f32 = _bind("atlas_matmul_i8_f32", [
     ctypes.POINTER(ctypes.c_int32),
     ctypes.POINTER(ctypes.c_float),
     ctypes.c_int,
-], None)
+], None, optional=True)
 
 matmul_i4_f32 = _bind("atlas_matmul_i4_f32", [
     ctypes.c_int, ctypes.c_int,
@@ -46,7 +51,7 @@ matmul_i4_f32 = _bind("atlas_matmul_i4_f32", [
     ctypes.POINTER(ctypes.c_int32),
     ctypes.POINTER(ctypes.c_float),
     ctypes.c_int,
-], None)
+], None, optional=True)
 
 
 # ─── Quantization helpers (replicate engine logic) ────────────────────────
@@ -158,6 +163,8 @@ B_VALUES = [1, 4]
 @pytest.mark.parametrize("B", B_VALUES)
 def test_matmul_i8_parity(rows: int, cols: int, B: int):
     """atlas_matmul_i8_f32 matches naive u8xi8 reference."""
+    if not _HAS_I8:
+        pytest.skip("atlas_matmul_i8_f32 not exported (ARM64 NEON build)")
     rng = np.random.default_rng(42)
     w_f32 = rng.standard_normal((rows, cols), dtype=np.float32) * 0.5
     act_f32 = rng.standard_normal((B, cols), dtype=np.float32)
@@ -188,6 +195,8 @@ def test_matmul_i8_parity(rows: int, cols: int, B: int):
 @pytest.mark.parametrize("B", B_VALUES)
 def test_matmul_i4_parity(rows: int, cols: int, B: int):
     """atlas_matmul_i4_f32 matches naive u8xi4 reference using packed int4 weights."""
+    if not _HAS_I4:
+        pytest.skip("atlas_matmul_i4_f32 not exported (ARM64 NEON build)")
     if cols < 2:
         pytest.skip("int4 needs at least 2 columns for packing")
     rng = np.random.default_rng(42)
@@ -222,6 +231,8 @@ def test_matmul_i8_vs_i4_consistency():
     i8 weights quantize f32 × 127/|w|_max, int4 weights quantize f32 × 7/|w|_max.
     Raw accumulators differ by ×127/7 ≈ 18×. Compare in f32 space.
     """
+    if not _HAS_I8 or not _HAS_I4:
+        pytest.skip("i8/i4 exports not available (ARM64 NEON build)")
     rng = np.random.default_rng(99)
     rows, cols, B = 128, 256, 4
     w_f32 = rng.standard_normal((rows, cols), dtype=np.float32) * 0.5

@@ -212,6 +212,7 @@ jobs:
           python tests/ci_smoke.py
           python -m pytest tests/test_dll.py -v
           python -m pytest tests/test_fixtures.py -v
+          python -m pytest tests/test_mock_model.py tests/test_matmul_parity.py -v
           python -c "import atlas_server; print('[CI] atlas_server.py OK')"
       - name: Upload artifact (release only)
         if: github.event_name == 'release'

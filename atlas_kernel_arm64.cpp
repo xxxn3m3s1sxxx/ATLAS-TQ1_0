@@ -175,7 +175,7 @@ extern "C" void atlas_matmul_i8_f32(int rows, int cols,
                         + vaddvq_s32(acc2) + vaddvq_s32(acc3);
 
             for (; c < cols; c++) {
-                sum += (int)(a[c] - 128) * (int)w[c];
+                sum += ((int)a[c] - 128) * (int)w[c];
             }
 
             output[t * rows + r] = (float)sum;
