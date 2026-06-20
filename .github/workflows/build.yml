@@ -258,6 +258,7 @@ jobs:
           python -c "
           from atlas_infer import AtlasModel
           m = AtlasModel('tests/falcon3_v6.atlas')
+          m.set_use_f32_matmul(False)
           out = m.generate_c('What is the capital of France?', max_new_tokens=50, temperature=0.7, top_k=40, max_seq_len=256)
           print('Output:', out)
           " 2>profiling_stderr.txt

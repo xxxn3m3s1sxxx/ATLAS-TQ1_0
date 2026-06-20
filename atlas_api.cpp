@@ -67,9 +67,13 @@ extern "C" void atlas_matmul_ternary_f32_arm64(int rows, int input_dim,
 // C++ linkage — print ARM64 FFN micro-probes (no-op on non-arm64)
 #ifdef __aarch64__
 void profile_print_arm64();
+void profile_print_tq1();    // defined in scalar fallback PROFILE_MODE block (or as stub)
 #else
 static void profile_print_arm64() {}
+void profile_print_tq1() {}
 #endif
+
+
 #include <omp.h>
 
 // Debug logging: compile with -DATLAS_DEBUG_MODE for runtime probes
@@ -3937,6 +3941,33 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
     }
 }
 #else
+#ifdef PROFILE_MODE
+#include "atlas_timer.h"
+static struct {
+    uint64_t tq1_decode;
+    uint64_t tq1_dot;
+} g_prof_tq1;
+#define ARM64_TQ1_START() do { _tq1_tsc[0] = atlas_cycles(); } while(0)
+#define ARM64_TQ1_ACCUM_DECODE() __sync_fetch_and_add(&g_prof_tq1.tq1_decode, atlas_cycles() - _tq1_tsc[0])
+#define ARM64_TQ1_ACCUM_DOT()    __sync_fetch_and_add(&g_prof_tq1.tq1_dot,    atlas_cycles() - _tq1_tsc[0])
+static uint64_t _tq1_tsc[1];
+
+void profile_print_tq1() {
+    uint64_t tot = g_prof_tq1.tq1_decode + g_prof_tq1.tq1_dot;
+    if (tot == 0) return;
+    auto pc = [tot](uint64_t v) { return 100.0 * (double)v / (double)tot; };
+    fprintf(stderr, "\n── ARM64 TQ1 micro (%lluK cycles) ──\n", (unsigned long long)(tot / 1000));
+    fprintf(stderr, "  tq1 decode    %9llu (%5.1f%%)\n", (unsigned long long)g_prof_tq1.tq1_decode, pc(g_prof_tq1.tq1_decode));
+    fprintf(stderr, "  tq1 dot+sumw  %9llu (%5.1f%%)\n", (unsigned long long)g_prof_tq1.tq1_dot, pc(g_prof_tq1.tq1_dot));
+    fprintf(stderr, "────────────────────────────────\n");
+}
+#else
+#define ARM64_TQ1_START()
+#define ARM64_TQ1_ACCUM_DECODE()
+#define ARM64_TQ1_ACCUM_DOT()
+void profile_print_tq1() {}
+#endif
+
 static void matmul_tq1_packed_reorder(int rows, int input_dim,
     const uint8_t* packed, int packed_cols,
     const uint8_t* act_u8, const float* max_abs,
@@ -3951,12 +3982,19 @@ static void matmul_tq1_packed_reorder(int rows, int input_dim,
             int dot = 0;
             int sum_w = 0;
             for (int c = 0; c < input_dim; c += 5) {
+                ARM64_TQ1_START();
                 uint8_t byte = wp[c / 5];
+                int w_vals[5];
                 for (int i = 0; i < 5 && c + i < input_dim; i++) {
-                    int w = (int)tq1_decode[byte][i];
-                    dot += (int)a[c + i] * w;
-                    sum_w += w;
+                    w_vals[i] = (int)tq1_decode[byte][i];
                 }
+                ARM64_TQ1_ACCUM_DECODE();
+                ARM64_TQ1_START();
+                for (int i = 0; i < 5 && c + i < input_dim; i++) {
+                    dot += (int)a[c + i] * w_vals[i];
+                    sum_w += w_vals[i];
+                }
+                ARM64_TQ1_ACCUM_DOT();
             }
             dot -= 128 * sum_w;
             output[b * rows + r] = (float)dot * deq / (127.0f * scale);
@@ -7024,6 +7062,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     profile_print();
     profile_print_arm64();
+    profile_print_tq1();
     return n_gen;
 }
 
@@ -7183,6 +7222,7 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
 
     profile_print();
     profile_print_arm64();
+    profile_print_tq1();
     return n_gen;
 }
 
