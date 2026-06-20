@@ -185,7 +185,6 @@ jobs:
           if-no-files-found: ignore
 
   build-macos:
-    if: github.event_name == 'release'
     needs: sanitizer-build
     runs-on: macos-13
     steps:
