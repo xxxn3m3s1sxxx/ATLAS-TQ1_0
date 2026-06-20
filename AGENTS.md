@@ -9,7 +9,8 @@ CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/
 - **5 matmul modes**: int8 (default, `vpmaddubs` SIMD), int4 (v2.8.0, nibble-unpack + `vpmaddubsw`, halves FFN memory bandwidth), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
 - **ttype=8 (int4 packed)**: 2 int4 weights per byte, sign-extension via `(nibble ^ 8) - 8`. Converted at load time from existing int8 FFN tensors — no packer changes required. `[fp16_scale:2][packed_weights:rows*packed_cols][row_sums:rows*4]`. Guarded by `use_f32_matmul` to avoid activation quantization for hybrid architectures.
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
-- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN architectures where weights are ~0.01× and u8+128 activation quant destroys signal.
+- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-4B/8B, CANN 3B/8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN/Qwen3 architectures where small activations are destroyed by u8+128 centering. Bonsai-4B (rope_theta=5M) triggers this; hybrid/int4 path produces garbage — f32_bypass is mandatory for all rope_theta >= 3M models.
+- **int4 FFN + fp32 activations (deferred)**: The current ttype=8 dispatch (`atlas_matmul_i4_f32`, `matmul_i4_reorder_deq`) requires uint8 activation quantization (`act_u8 = act_f32 + 128`), which destroys signal for f32_bypass models. A new kernel taking fp32 activations × int4 weights would halve DRAM reads but adds nibble-unpack overhead. Estimated net gain uncertain at B=1 decode; deferred pending ARM64 parity completion.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
 - **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
 - **`rope_interleaved_set` flag** (v2.10.3): Tracks whether config.json set `rope_interleaved`. If yes, Heuristik in `ensure_layer_idx` überschreibt nicht. Default: `true` (interleaved). Config override möglich (Llama/BitNet: half-split, `false`).
@@ -103,7 +104,7 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 
 **10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
 
-**int4 FFN quantization** (v2.8.0): Load-time int8→int4 conversion halves FFN memory bandwidth. 7B achieves **3.15 tok/s** (+26% vs int8), 10B achieves **2.25 tok/s** (+18% vs int8). Automatic skip for f32_bypass models (Bonsai, BitNet, 1B).
+**int4 FFN quantization** (v2.8.0): Load-time int8→int4 conversion halves FFN memory bandwidth. 7B achieves **3.15 tok/s** (+26% vs int8), 10B achieves **2.25 tok/s** (+18% vs int8). Automatic skip for f32_bypass models (Bonsai, BitNet, 1B). A new `matmul_f32_i4_f32` kernel is needed for int4 FFN with fp32 activations (no activation quant); deferred (nibble-unpack overhead uncertain).
 
 **T=0 argmax behavior** (deterministic mode):  
 - **10B/7B**: Clean output ("The capital of France is Paris."), EOS after answer.  
@@ -119,10 +120,10 @@ Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm 
 | Model | Default Mode | tok/s | Context Window | Quality (T=0) |
 |-------|-------------|:-----:|:--------------:|---------------|
 | **Bonsai-1.7B** | f32 bypass | **13.0** | 4K (f32) / 8K (NTK) | "The capital of France is Paris." |
-| **Bonsai-4B** | hybrid+int8 | **17.4** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
+| **Bonsai-4B-Pro** | f32 bypass (int8) | **19.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
 | **Bonsai-8B** | f32 bypass | **2.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent |
 
-Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-8B rope_theta=1M (<3M threshold, f32 not auto-triggered), use `AtlasModel(..., use_f32_matmul=True)`. Hybrid path degenerates to garbage — needs f32_bypass despite hidden=4096. Quantized hybrid mode yields 19.2 tok/s (1.7B only).
+Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-4B rope_theta=5M >= 3M threshold → f32_bypass auto-triggered; hybrid+int4 path produces "achuachuachu" garbage. f32_bypass is mandatory for all rope_theta >= 3M models (Bonsai-4B/8B, CANN 3B/8B) — not just Bonsai-8B. Bonsai-4B reaches 19.2 tok/s (DDR4 bandwidth limit for 36L/2560H/9728I). Bonsai-8B rope_theta=1M (<3M threshold, f32 not auto-triggered), use `AtlasModel(..., use_f32_matmul=True)`.
 CANN 3B/8B: `vocab_size==73448` auto-triggers f32_bypass (v2.11.2+).
 
 ### Architecture Notes
@@ -130,8 +131,8 @@ CANN 3B/8B: `vocab_size==73448` auto-triggers f32_bypass (v2.11.2+).
 - **1B**: f32 bypass (`hidden ≤ 2048`) eliminates activation quantization. 10 tok/s pure gen.
 - **3B vs 7B/10B**: Same hidden (3072) but intermediate scales from 9216 (3B) to 23040 (7B/10B). FFN matmul is 2.5× wider on 7B/10B, dominating the per-token cost.
 - **10B**: 40 layers mean 1.8× more memory traffic per token than 7B (28 layers), despite same per-layer weight size.
-- **Bonsai-4B vs -1.7B**: Same 36 layers (4B) vs 28 layers (1.7B). 4B has wider hidden (2560→2048) and intermediate (9728→6144). Bonsai-4B achieves higher tok/s due to better int8/AVX2 utilization per layer.
-- **Bonsai-8B**: 36L/4096H/12288I, rope_theta=1M with YaRN 4.0. Requires `use_f32_matmul=True`. The i8 cache (6.9 GB) reduces load time from decompression (TTFP from 40s to 1s). Generation is memory-bandwidth bound at 2.2 tok/s on DDR4.
+- **Bonsai-4B vs -1.7B**: Same 36 layers (4B) vs 28 layers (1.7B). 4B has wider hidden (2560→2048) and intermediate (9728→6144). Bonsai-4B achieves higher tok/s due to better int8/AVX2 utilization per layer, despite running f32_bypass (hybrid+int4 produces "achuachuachu" garbage — rope_theta=5M triggers f32 bypass auto-detect).
+- **Bonsai-8B**: 36L/4096H/12288I, rope_theta=1M with YaRN 4.0. Requires `use_f32_matmul=True` (rope_theta < 3M threshold, so f32_bypass not auto-triggered). The i8 cache (6.9 GB) reduces load time from decompression (TTFP from 40s to 1s). Generation is memory-bandwidth bound at 2.2 tok/s on DDR4.
 
 ## Sampling
 
@@ -319,11 +320,13 @@ See `atlas_ffi.h` for full API.
 
 ### Deferred
 - **F16C-Rester**: Diminishing returns (heiße Pfade bereits erledigt)
+- **int4 FFN + fp32 activations**: New kernel required (`matmul_f32_i4_f32`). Halves FFN weight DRAM reads but adds nibble-unpack overhead. Estimated net gain uncertain at B=1 decode; deferred pending ARM64 parity completion.
 
 ## Version History
 
 | Version | Key Changes |
 |---------|-------------|
+| **v2.16.1** | **vpmaddubsw overflow fix in atlas_matmul_i8_f32**: XOR-0x80 centering + `_mm256_madd_epi16` replaces saturating `_mm256_maddubs_epi16`. Eliminates `row_sums` correction — `sum((act-128)×w) = sum(act×w) - 128×sum(w)`. Three secondary bugs fixed (`_mm256_set1_epi8(0x80)` zero-extension, tail loop uint8 wrap, same in `atlas_matmul_i4_f32`). 94 tests (27 parity + 67 mock) on 7 architectures. Bonsai-4B-Pro baseline: 19.2 tok/s (+10%). Confirm: hybrid+int4 path "achuachuachu" — f32_bypass is mandatory for Bonsai-4B (rope_theta=5M >= 3M). int4 FFN + fp32 activations deferred (nibble-unpack overhead uncertain). CI: macOS ARM64 `--break-system-packages` fix for PEP 668. |
 | **v2.16.0** | **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d). B=1024: weighted sum 57.7s (−35.7% from baseline). Total 656.1s (−27.8% from baseline). 64/67 mock tests. |
 | **v2.15.0** | **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens. Per-query thread-local scores buffer initialized to -1e9f — SKIP/PARTIAL stay masked. B=1024: scores 292s (−43.1%), total 664s (−26.9%). Bonsai-4B-Pro decode: 12.65 tok/s (+16%). 64/67 mock tests. |
 | **v2.14.0** | **OMP schedule(dynamic) + i8 Prefetch Removal**. `schedule(dynamic, 64)` on `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, `atlas_matmul_i4_vnni` — prevents cache-miss stragglers from blocking OMP barriers. `schedule(dynamic, 32)` on 4-row grouped hybrid int8 gate+up. Removed stale `_MM_HINT_T1` from i8 and VNNI kernels (consistent with v2.13.0). 64/67 mock tests. Bonsai-4B-Pro: 10.57→10.91 tok/s (+3% within noise). Key insight: dynamic scheduling overhead negligible (~4 µs for 38 chunks), but DRAM bandwidth remains the real bottleneck — no schedule change can fix that. |
