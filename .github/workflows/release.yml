@@ -120,7 +120,7 @@ jobs:
 
       - name: Smoke test — generate mock model
         run: |
-          python3 -m pip install numpy pytest -q
+          python3 -m pip install --break-system-packages numpy pytest -q
           python3 tests/create_mock_model.py tests/mock.atlas
 
       - name: Smoke test — load + generate

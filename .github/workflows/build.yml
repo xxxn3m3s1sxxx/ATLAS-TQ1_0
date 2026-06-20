@@ -198,7 +198,7 @@ jobs:
       - name: Install LLVM/Clang
         run: brew install llvm libomp
       - name: Install test deps
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+        run: pip install --break-system-packages --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
       - name: Build
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
@@ -234,7 +234,7 @@ jobs:
       - name: Install LLVM/Clang
         run: brew install llvm libomp
       - name: Install test deps
-        run: pip install --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
+        run: pip install --break-system-packages --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
       - name: Build (ARM64 NEON)
         run: |
           LLVM_PREFIX=$(brew --prefix llvm)
