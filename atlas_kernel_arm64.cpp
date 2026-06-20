@@ -51,6 +51,7 @@
       uint64_t tot = g_prof_arm64.ffn_i4_unpack + g_prof_arm64.ffn_i4_fma
                    + g_prof_arm64.ffn_f32_conv + g_prof_arm64.ffn_f32_fma
                    + g_prof_arm64.ffn_default_conv + g_prof_arm64.ffn_default_fma;
+      fprintf(stderr, "[PROFILE] profile_print_arm64 called, tot=%llu\n", (unsigned long long)tot);
       if (tot == 0) return;
       auto pc = [tot](uint64_t v) { return 100.0 * (double)v / (double)tot; };
       fprintf(stderr, "\n── ARM64 FFN micro (%lluM cycles) ──\n", (unsigned long long)(tot / 1000000));

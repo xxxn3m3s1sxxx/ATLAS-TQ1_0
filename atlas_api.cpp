@@ -3954,6 +3954,7 @@ static uint64_t _tq1_tsc[1];
 
 void profile_print_tq1() {
     uint64_t tot = g_prof_tq1.tq1_decode + g_prof_tq1.tq1_dot;
+    fprintf(stderr, "[PROFILE] profile_print_tq1 called, tot=%llu\n", (unsigned long long)tot);
     if (tot == 0) return;
     auto pc = [tot](uint64_t v) { return 100.0 * (double)v / (double)tot; };
     fprintf(stderr, "\n── ARM64 TQ1 micro (%lluK cycles) ──\n", (unsigned long long)(tot / 1000));
