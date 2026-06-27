@@ -1,6 +1,6 @@
 # ATLAS — Falcon3 TQ1.0 Inference Engine
 
-CPU inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
+CPU LLM inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3, TriLM, BitNet, Llama3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
 ## Architecture
 
@@ -321,6 +321,15 @@ See `atlas_ffi.h` for full API.
 ### Deferred
 - **F16C-Rester**: Diminishing returns (heiße Pfade bereits erledigt)
 - **int4 FFN + fp32 activations**: New kernel required (`matmul_f32_i4_f32`). Halves FFN weight DRAM reads but adds nibble-unpack overhead. Estimated net gain uncertain at B=1 decode; deferred pending ARM64 parity completion.
+
+### ❌ FLUX.2/Bonsai-Image Diffusion Post-Mortem (ABGEBROCHEN)
+- **Modell**: `prism-ml/bonsai-image-ternary-4B-unpacked` — FLUX.2 Klein 4B MMDiT (12 double blocks + 19 single blocks + 3 VAE).
+- **CPU-Port**: Komplette `atlas_diffusion.cpp` MMDiT-Implementierung in C++ mit TQ1 g128 Quantisierung, 28-step Heun 2nd-order Solver, CFG-guidance (scale=3-50), Ring-Buffer KV-Cache.
+- **Symptom**: "cat" und "robot" Prompts erzeugen nahezu identische Outputs (Korrelation 0.998). img_gate=0.1 limitiert text→img attention auf ~10%.
+- **Root Cause**: Die BF16 Ternary-Gewichte in den safetensors haben **36-47 eindeutige Nicht-Null-Werte pro Row** mit 11.8% durchschnittlicher relativer Standardabweichung. Der TQ1-Packer zerdrückt jede Row auf exakt `{-scale, 0, +scale}` — ein Verlust von >90% der Gewichts-Expressivität. Das Signal-Relief des Text-Embeddings kann durch die drei verbleibenden Zustände nicht abgebildet werden.
+- **Vergleich**: Offizielles PrismML-Demo verwendet GPU mit **HQQ int2 gemlite** auf vollen BF16-Gewichten — fundamental anderer Stack. Der GPU-Pfad behält die Multi-Scale-Struktur pro Row.
+- **Heun-Korrelationstest (28 steps)**: cat mean=0.773 std=5.247; robot mean=0.822 std=5.238; corr=0.9980; diff std=0.328. Heun half nicht — korrelation identisch zu Euler. std=5.2 vs erwartet ~1 zeigt Latent-Norm-Divergenz durch akkumulierte TQ1-Fehler über 28 Forward-Passes.
+- **Fazit**: TQ1-CPU-Path kann dieses Modell nicht prompt-differenzieren. Alle Source-Files und Test-Artefakte entfernt. Fokus zurück auf LLM-Inferenz (Plan B).
 
 ## Version History
 

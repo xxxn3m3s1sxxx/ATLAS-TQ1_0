@@ -184,41 +184,7 @@ jobs:
           path: coverage.*
           if-no-files-found: ignore
 
-  build-macos:
-    needs: sanitizer-build
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: .github/workflows/build.yml
-      - name: Install LLVM/Clang
-        run: brew install llvm libomp
-      - name: Install test deps
-        run: pip install --break-system-packages --quiet pytest numpy safetensors "fastapi>=0.115.0" uvicorn
-      - name: Build
-        run: |
-          LLVM_PREFIX=$(brew --prefix llvm)
-          $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -L$LLVM_PREFIX/lib -lomp
-          echo "DYLD_LIBRARY_PATH=$LLVM_PREFIX/lib:${DYLD_LIBRARY_PATH:-}" >> $GITHUB_ENV
-          $LLVM_PREFIX/bin/clang++ -std=c++17 -O2 -c atlas_cli.cpp -o atlas_cli.o
-      - name: Generate test fixtures
-        run: python tests/generate_test_fixtures.py tests/
-      - name: Test
-        run: |
-          python tests/ci_smoke.py
-          python -m pytest tests/test_dll.py -v
-          python -m pytest tests/test_fixtures.py -v
-          python -m pytest tests/test_mock_model.py tests/test_matmul_parity.py -v
-          python -c "import atlas_server; print('[CI] atlas_server.py OK')"
-      - name: Upload artifact (release only)
-        if: github.event_name == 'release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: atlas-macOS
-          path: libatlas.so
+  # macOS x86 (macos-13) removed: permanently red, no Apple hardware for maintenance
 
   build-macos-arm64:
     if: github.event_name != 'release'
