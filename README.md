@@ -1,32 +1,32 @@
 # ATLAS — TQ1.0 Ternary Inference Engine
 
-**v2.16.1 — Juni 2026 — ARCHIVED**
+**v2.16.1 — June 2026 — ARCHIVED**
 
-CPU inference engine für 1.58-Bit ternär quantisierte LLMs.
-Entstanden aus der Frage: *"Wie weit kommt man mit CPU-only + ternary?"*
-Antwort: **~3 tok/s für 7B auf DDR4. Nicht genug für interaktive Nutzung.**
+CPU inference engine for 1.58-bit ternary-quantized LLMs.
+Born from the question: *"How far can CPU-only + ternary go?"*
+Answer: **~3 tok/s for 7B on DDR4. Not enough for interactive use.**
 
-TQ1.0 ist trotzdem das einzige produktionsreife Format für ternäre 1.58-Bit-Quantisierung —
-5 Trits pro Byte, Base-3 codiert. Das Format und der Packer (der 29 Architekturen
-automatisch erkennt) sind das eigentliche Artefakt, nicht die Engine selbst.
+TQ1.0 remains the only production-grade format for ternary 1.58-bit quantization —
+5 trits per byte, Base-3 encoded. The format and the packer (which auto-detects
+29 architectures) are the real artifact, not the engine itself.
 
-## Funktionsumfang
+## Features
 
-- **TQ1.0-Packer** (`pack_to_atlas.py`): HuggingFace Safetensors → TQ1.0 (auto-detect)
-- **5 Matmul-Modi**: int8 (AVX2), int4 (nibble-unpack, ~26% schneller auf 7B), f32 bypass,
+- **TQ1.0 Packer** (`pack_to_atlas.py`): HuggingFace safetensors → TQ1.0 (auto-detect)
+- **5 matmul modes**: int8 (AVX2), int4 (nibble-unpack, ~26% faster on 7B), f32 bypass,
   ternary (vpsignb), TQ1-packed (chunked decode + SIMD)
 - **C API**: `atlas_load`, `atlas_generate`, `atlas_free`
 - **C++ CLI**: `atlas_cli.cpp`
 - **Streaming SSE Server**: `atlas_server.py`
-- **ARM64 NEON**: Alle 8 Hot-Path-Kernels portiert (v2.16.1)
-- **Binary Tokenizer**: v6-Format, kein transformers-Dependency zur Laufzeit
+- **ARM64 NEON**: All 8 hot-path kernels ported (v2.16.1)
+- **Binary Tokenizer**: v6 format, no transformers dependency at runtime
 
 ## Performance
 
-Gemessen auf Intel Core i7-7700T (Kaby Lake, DDR4-2400, ~20 GB/s).
+Measured on Intel Core i7-7700T (Kaby Lake, DDR4-2400, ~20 GB/s).
 
-| Modell | Größe | tok/s (total) | Pfad |
-|--------|-------|:-------------:|------|
+| Model | Size | tok/s (total) | Path |
+|-------|------|:-------------:|------|
 | Falcon3-1B | 1.22 GB | 10.1 | f32 bypass |
 | Falcon3-3B | 1.96 GB | 7.1 | hybrid |
 | Falcon3-7B | 2.75 GB | 3.15 | int4 FFN |
@@ -36,23 +36,23 @@ Gemessen auf Intel Core i7-7700T (Kaby Lake, DDR4-2400, ~20 GB/s).
 | Llama3-8B-1.58 | 3.27 GB | ~4 | hybrid |
 | TriLM-1.5B | 0.65 GB | ~15 | f32 bypass |
 
-**Detail**: Die 29 HF-validierten Modelle sind im [ATLAS Hub](https://huggingface.co/xxxn3m3s1sxxx)
-verfügbar (Falcon3, Bonsai, BitNet, TriLM, CANN, Llama3-1.58).
+**Detail**: All 29 HF-validated models are available on the [ATLAS Hub](https://huggingface.co/xxxn3m3s1sxxx)
+(Falcon3, Bonsai, BitNet, TriLM, CANN, Llama3-1.58).
 
-## Warum archiviert?
+## Why archived?
 
-Drei Gründe:
+Three reasons:
 
-1. **Physik**: DDR4-Bandbreite (~20 GB/s) limitiert jede CPU-Inference.
-   TQ1.0 halbiert die Gewichtsgröße gegenüber GGUF Q4, aber die verbleibenden
-   20 GB/s erlauben nur ~3 tok/s für ein 7B — unabhängig vom Kernel.
+1. **Physics**: DDR4 bandwidth (~20 GB/s) caps all CPU inference.
+   TQ1.0 halves weight size vs GGUF Q4, but the remaining
+   20 GB/s only allows ~3 tok/s for a 7B — kernel-independent.
 
-2. **Proprietäres Format**: GGUF ist der De-facto-Standard. TQ1.0 ist kompakter,
-   aber inkompatibel. Der Packer ist das Werkzeug, das fehlt — nicht die Engine.
+2. **Proprietary format**: GGUF is the de-facto standard. TQ1.0 is more compact
+   but incompatible. The packer is the missing tool — not the engine.
 
-3. **Kein Ökosystem**: Ein Autor, null User. Ein Projekt, das keiner ausser dir
-   bedienen kann, ist ein Tagebuch — kein Produkt.
+3. **No ecosystem**: One author, zero users. A project nobody can operate
+   but its author is a diary entry, not a product.
 
-## Lizenz
+## License
 
-MIT. Siehe `LICENSE`.
+Apache 2.0. See `LICENSE`.
