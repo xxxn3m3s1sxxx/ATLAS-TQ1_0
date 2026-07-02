@@ -2290,7 +2290,7 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
 // ─── v2.8.0: Convert FFN int8 tensors to int4 (ttype=8) in-place ───
 // Halves memory bandwidth for FFN matmuls. Clip int8→int4, pack 2/byte.
 ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
-    if (m->use_f32_matmul) return; // f32_bypass: full precision FFN, no int4
+    if (m->use_f32_matmul) return; // int4 FFN is a net loss for f32_bypass (nibble-unpack overhead > bandwidth savings at B=1)
     int total = 0;
     for (size_t i = 0; i < m->tensors.size(); i++) {
         auto& t = m->tensors[i];
@@ -5997,6 +5997,79 @@ static void forward_layer_internal(
             matmul_f32_per_row(tg.row_dim, dim11, gw, m->buf_act, ffn_dim, g_rs_fp16, m->buf_gate, B);
             matmul_f32_per_row(tu.row_dim, dim11, uw, m->buf_act, ffn_dim, u_rs_fp16, m->buf_up, B);
 #endif
+        } else if (tg.ttype == 8 && tu.ttype == 8) {
+#ifndef __aarch64__
+            uint16_t g_s16; memcpy(&g_s16, tg.data, 2); float g_sc = fp16_to_fp32(g_s16);
+            uint16_t u_s16; memcpy(&u_s16, tu.data, 2); float u_sc = fp16_to_fp32(u_s16);
+            int rows = tg.row_dim, dim_w = tg.packed_cols * 2;
+            int rows_packed = rows / 4;
+            int packed_cols = tg.packed_cols;
+            const uint8_t* gw = tg.data + 2;
+            const uint8_t* uw = tu.data + 2;
+            const __m128i mask_low = _mm_set1_epi8(0x0F);
+            const __m128i xor8 = _mm_set1_epi8(8);
+            const __m128i sub8 = _mm_set1_epi8(8);
+            #ifdef _OPENMP
+            #pragma omp parallel for if(rows_packed > 4)
+            #endif
+            for (int ur = 0; ur < rows_packed; ur++) {
+                const uint8_t* gw4 = gw + ur * 4 * packed_cols;
+                const uint8_t* uw4 = uw + ur * 4 * packed_cols;
+                for (int b = 0; b < B; b++) {
+                    const float* a = m->buf_act + b * ffn_dim;
+                    float g_val[4], u_val[4];
+                    for (int sub = 0; sub < 4; sub++) {
+                        const uint8_t* wg = gw4 + sub * packed_cols;
+                        const uint8_t* wu = uw4 + sub * packed_cols;
+                        __m256 gs = _mm256_setzero_ps();
+                        __m256 us = _mm256_setzero_ps();
+                        int c = 0;
+                        for (; c + 8 <= dim_w; c += 8) {
+                            __m256 af = _mm256_loadu_ps(a + c);
+                            uint32_t g_p4, u_p4;
+                            memcpy(&g_p4, wg + c / 2, 4);
+                            memcpy(&u_p4, wu + c / 2, 4);
+                            __m128i gnib = _mm_cvtsi32_si128((int)g_p4);
+                            __m128i unib = _mm_cvtsi32_si128((int)u_p4);
+                            __m128i glo = _mm_and_si128(gnib, mask_low);
+                            __m128i ghi = _mm_and_si128(_mm_srli_epi16(gnib, 4), mask_low);
+                            __m128i ulo = _mm_and_si128(unib, mask_low);
+                            __m128i uhi = _mm_and_si128(_mm_srli_epi16(unib, 4), mask_low);
+                            __m128i gw8 = _mm_unpacklo_epi8(glo, ghi);
+                            __m128i uw8 = _mm_unpacklo_epi8(ulo, uhi);
+                            __m128i gws = _mm_sub_epi8(_mm_xor_si128(gw8, xor8), sub8);
+                            __m128i uws = _mm_sub_epi8(_mm_xor_si128(uw8, xor8), sub8);
+                            __m256 gwf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(gws));
+                            __m256 uwf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(uws));
+                            gs = _mm256_fmadd_ps(af, gwf, gs);
+                            us = _mm256_fmadd_ps(af, uwf, us);
+                        }
+                        float gs_f = hsum_ps(gs);
+                        float us_f = hsum_ps(us);
+                        for (; c < dim_w; c++) {
+                            int8_t g_wv = (c & 1) ? (int8_t)((((wg[c / 2] >> 4) & 0x0F) ^ 8) - 8)
+                                                  : (int8_t)(((wg[c / 2] & 0x0F) ^ 8) - 8);
+                            int8_t u_wv = (c & 1) ? (int8_t)((((wu[c / 2] >> 4) & 0x0F) ^ 8) - 8)
+                                                  : (int8_t)(((wu[c / 2] & 0x0F) ^ 8) - 8);
+                            gs_f += a[c] * (float)g_wv;
+                            us_f += a[c] * (float)u_wv;
+                        }
+                        g_val[sub] = gs_f / g_sc;
+                        u_val[sub] = us_f / u_sc;
+                    }
+                    float* g_out = m->buf_gate + b * rows;
+                    float* u_out = m->buf_up + b * rows;
+                    g_out[0 * rows_packed + ur] = g_val[0];
+                    g_out[1 * rows_packed + ur] = g_val[1];
+                    g_out[2 * rows_packed + ur] = g_val[2];
+                    g_out[3 * rows_packed + ur] = g_val[3];
+                    u_out[0 * rows_packed + ur] = u_val[0];
+                    u_out[1 * rows_packed + ur] = u_val[1];
+                    u_out[2 * rows_packed + ur] = u_val[2];
+                    u_out[3 * rows_packed + ur] = u_val[3];
+                }
+            }
+#endif
         } else {
             int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
             int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
@@ -6341,6 +6414,81 @@ static void forward_layer_internal(
             }
             quantize_f32_to_u8(m->buf_act, B, down_dim, max_abs, m->buf_i8);
             matmul_i4_reorder_deq(td.row_dim, d_cols, d_pw, d_rs, m->buf_i8, max_abs, d_scale, m->buf_act, m->buf_gate, B);
+        } else if (td.ttype == 8 && m->use_f32_matmul) {
+#ifndef __aarch64__
+            uint16_t d_s16; memcpy(&d_s16, td.data, 2); float d_sc = fp16_to_fp32(d_s16);
+            int d_cols = td.packed_cols * 2;
+            const uint8_t* d_pw = td.data + 2;
+            for (int b = 0; b < B; b++) {
+                const float* g = m->buf_gate + b * inter;
+                const float* u = m->buf_up + b * inter;
+                float* tmp = m->buf_act + b * d_cols;
+                for (int i = 0; i < inter; i++)
+                    tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
+                for (int i = inter; i < d_cols; i++) tmp[i] = 0.0f;
+            }
+            if (idx_ffn_sub_norm >= 0) {
+                auto& sn = m->tensors[idx_ffn_sub_norm];
+                const uint8_t* snw = sn.data;
+                for (int b = 0; b < B; b++) {
+                    float* ob = m->buf_act + b * d_cols;
+                    float ss = 0.0f;
+                    for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
+                    float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
+                    for (int i = 0; i < inter; i++) {
+                        uint16_t w16; memcpy(&w16, snw + i * 2, 2);
+                        ob[i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+            int d_rows = td.row_dim;
+            int d_cols_i = d_cols;
+            int d_rows_packed = d_rows / 4;
+            int d_packed_cols = td.packed_cols;
+            const uint8_t* dw = td.data + 2;
+            const __m128i mask_low_d = _mm_set1_epi8(0x0F);
+            const __m128i xor8_d = _mm_set1_epi8(8);
+            const __m128i sub8_d = _mm_set1_epi8(8);
+            #ifdef _OPENMP
+            #pragma omp parallel for if(d_rows_packed > 4)
+            #endif
+            for (int ur = 0; ur < d_rows_packed; ur++) {
+                const uint8_t* dw4 = dw + ur * 4 * d_packed_cols;
+                for (int b = 0; b < B; b++) {
+                    const float* a = m->buf_act + b * d_cols_i;
+                    float out4[4];
+                    for (int sub = 0; sub < 4; sub++) {
+                        const uint8_t* w = dw4 + sub * d_packed_cols;
+                        __m256 acc = _mm256_setzero_ps();
+                        int c = 0;
+                        for (; c + 8 <= d_cols_i; c += 8) {
+                            __m256 af = _mm256_loadu_ps(a + c);
+                            uint32_t p4;
+                            memcpy(&p4, w + c / 2, 4);
+                            __m128i nib = _mm_cvtsi32_si128((int)p4);
+                            __m128i lo = _mm_and_si128(nib, mask_low_d);
+                            __m128i hi = _mm_and_si128(_mm_srli_epi16(nib, 4), mask_low_d);
+                            __m128i w8 = _mm_unpacklo_epi8(lo, hi);
+                            __m128i ws = _mm_sub_epi8(_mm_xor_si128(w8, xor8_d), sub8_d);
+                            __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
+                            acc = _mm256_fmadd_ps(af, wf, acc);
+                        }
+                        float s = hsum_ps(acc);
+                        for (; c < d_cols_i; c++) {
+                            int8_t wv = (c & 1) ? (int8_t)((((w[c / 2] >> 4) & 0x0F) ^ 8) - 8)
+                                                : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
+                            s += a[c] * (float)wv;
+                        }
+                        out4[sub] = s / d_sc;
+                    }
+                    float* dst = m->buf_gate + b * d_rows;
+                    dst[0 * d_rows_packed + ur] = out4[0];
+                    dst[1 * d_rows_packed + ur] = out4[1];
+                    dst[2 * d_rows_packed + ur] = out4[2];
+                    dst[3 * d_rows_packed + ur] = out4[3];
+                }
+            }
+#endif
         } else if (td.ttype == 11) {
 #ifndef __aarch64__
             // Per-row int8 down_proj (ttype=11)
