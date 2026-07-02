@@ -1,333 +1,58 @@
-<p align="center">
-  <img src="atlas_banner.svg" alt="ATLAS Banner" width="100%">
-</p>
+# ATLAS — TQ1.0 Ternary Inference Engine
 
-# ATLAS — Run 10B LLMs on a 8GB RAM Laptop
+**v2.16.1 — Juni 2026 — ARCHIVED**
 
-**No GPU needed.** ATLAS runs Falcon3, Bonsai/Qwen3, and BitNet b1.58 models on CPU using ternary-quantized **TQ1.0** format (~1.58 bits/weight). Run a 3B model on a 4 GB laptop, or a 10B model on 8 GB RAM — all at 2-17 tokens/second on CPU.
+CPU inference engine für 1.58-Bit ternär quantisierte LLMs.
+Entstanden aus der Frage: *"Wie weit kommt man mit CPU-only + ternary?"*
+Antwort: **~3 tok/s für 7B auf DDR4. Nicht genug für interaktive Nutzung.**
 
-> 🚀 **v2.11.0 — Falcon-E Edge + TriLM Full Series + CI Hardening**: Falcon-E 1B/3B Base+Instruct (BitNet 1.58 arch) in TQ1.0 format. TriLM 99M–560M added (9-model full series). CANN dual EOS, thread_local block scales, relaxed QK-Norm guard. CI: sanitizer-build, coverage gates, all platforms. 58/58 mock tests across 9 architectures.
+TQ1.0 ist trotzdem das einzige produktionsreife Format für ternäre 1.58-Bit-Quantisierung —
+5 Trits pro Byte, Base-3 codiert. Das Format und der Packer (der 29 Architekturen
+automatisch erkennt) sind das eigentliche Artefakt, nicht die Engine selbst.
 
-## Quickstart
+## Funktionsumfang
 
-**Download** the latest release zip and unzip into one folder:
+- **TQ1.0-Packer** (`pack_to_atlas.py`): HuggingFace Safetensors → TQ1.0 (auto-detect)
+- **5 Matmul-Modi**: int8 (AVX2), int4 (nibble-unpack, ~26% schneller auf 7B), f32 bypass,
+  ternary (vpsignb), TQ1-packed (chunked decode + SIMD)
+- **C API**: `atlas_load`, `atlas_generate`, `atlas_free`
+- **C++ CLI**: `atlas_cli.cpp`
+- **Streaming SSE Server**: `atlas_server.py`
+- **ARM64 NEON**: Alle 8 Hot-Path-Kernels portiert (v2.16.1)
+- **Binary Tokenizer**: v6-Format, kein transformers-Dependency zur Laufzeit
 
-```
-atlas.exe   ← CLI binary
-atlas.dll   ← engine DLL
-libomp.dll  ← OpenMP runtime
-```
+## Performance
 
-**Run a model:**
+Gemessen auf Intel Core i7-7700T (Kaby Lake, DDR4-2400, ~20 GB/s).
 
-```bash
-# Download a pre-packed model from Hugging Face (see "Model Sources" below):
-# e.g. https://huggingface.co/xxxn3m3s1sxxx/Falcon3-3B-Instruct-ATLAS
-#      https://huggingface.co/xxxn3m3s1sxxx/Ternary-Bonsai-4B-ATLAS
+| Modell | Größe | tok/s (total) | Pfad |
+|--------|-------|:-------------:|------|
+| Falcon3-1B | 1.22 GB | 10.1 | f32 bypass |
+| Falcon3-3B | 1.96 GB | 7.1 | hybrid |
+| Falcon3-7B | 2.75 GB | 3.15 | int4 FFN |
+| Falcon3-10B | 3.28 GB | 2.25 | int4 FFN |
+| Bonsai-1.7B | 0.86 GB | 13.0 | f32 bypass |
+| Bonsai-4B | 1.45 GB | 12.0 | f32 bypass |
+| Llama3-8B-1.58 | 3.27 GB | ~4 | hybrid |
+| TriLM-1.5B | 0.65 GB | ~15 | f32 bypass |
 
-# Chat with it:
-atlas.exe falcon3-3B-Instruct-tq1.atlas "What is the capital of France?"
-# → "The capital of France is Paris."
+**Detail**: Die 29 HF-validierten Modelle sind im [ATLAS Hub](https://huggingface.co/xxxn3m3s1sxxx)
+verfügbar (Falcon3, Bonsai, BitNet, TriLM, CANN, Llama3-1.58).
 
-# Interactive chat:
-atlas.exe falcon3-3B-Instruct-tq1.atlas -i
+## Warum archiviert?
 
-# Adjust sampling:
-atlas.exe model.atlas "Tell me a story" --temp 0.9 --max-new 500
-```
+Drei Gründe:
 
-**Requirements:** Windows x86-64, AVX2 CPU (Intel Haswell 2013+ / AMD Excavator 2015+), 4-8 GB RAM. Works without Python.
+1. **Physik**: DDR4-Bandbreite (~20 GB/s) limitiert jede CPU-Inference.
+   TQ1.0 halbiert die Gewichtsgröße gegenüber GGUF Q4, aber die verbleibenden
+   20 GB/s erlauben nur ~3 tok/s für ein 7B — unabhängig vom Kernel.
 
-## Supported Models
+2. **Proprietäres Format**: GGUF ist der De-facto-Standard. TQ1.0 ist kompakter,
+   aber inkompatibel. Der Packer ist das Werkzeug, das fehlt — nicht die Engine.
 
-| Model | Download Size | RAM Needed | Layers | Heads | Best tok/s |
-|-------|:------------:|:----------:|:------:|:-----:|:----------:|
-| **Falcon3** |||||
-| Falcon3-3B-Instruct | **2.0 GB** | **4 GB** | 22 | 12 | **7.1** |
-| Falcon3-1B-Instruct | 1.2 GB | 3 GB | 18 | 8 | **10.1** |
-| Falcon3-7B-Instruct | 2.8 GB | 6 GB | 28 | 12 | **3.15** |
-| Falcon3-10B-Instruct | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
-| Falcon3-3B-Base | 2.1 GB | 4 GB | 22 | 12 | **7.1** |
-| Falcon3-7B-Base | 3.0 GB | 6 GB | 28 | 12 | **3.15** |
-| Falcon3-10B-Base | 3.3 GB | 8 GB | 40 | 12 | **2.25** |
-| **Falcon-E Edge** (v2.10.5) |||||
-| Falcon-E-1B-Instruct | 0.56 GB | 2 GB | 24 | 16 | **13** |
-| Falcon-E-1B-Base | 0.56 GB | 2 GB | 24 | 16 | **13** |
-| Falcon-E-3B-Instruct | 0.82 GB | 3 GB | 32 | 16 | **7** |
-| Falcon-E-3B-Base | 0.82 GB | 3 GB | 32 | 16 | **7** |
-| **Bonsai (Qwen3)** |||||
-| Bonsai-1.7B | 0.9 GB | 3 GB | 28 | 16 | **13.0** |
-| Bonsai-4B | 1.5 GB | 5 GB | 36 | 32 | **17.4** |
-| Bonsai-8B | 2.5 GB | 8 GB | 36 | 32 | **1.8** |
-| **BitCPM-CANN** (v2.10.4) |||||
-| CANN-0.5B | 0.22 GB | 1 GB | 24 | 16 | **30** |
-| CANN-1B | 0.83 GB | 3 GB | 28 | 16 | **9.7** |
-| CANN-3B | 1.35 GB | 5 GB | 32 | 32 | **7.1** |
-| CANN-8B | 2.65 GB | 8 GB | 32 | 32 | **1.5** |
-| **TriLM** |||||
-| TriLM-99M | 0.05 GB | 1 GB | 12 | 24 | — |
-| TriLM-190M | 0.1 GB | 1 GB | 18 | 24 | — |
-| TriLM-390M | 0.2 GB | 1 GB | 24 | 24 | — |
-| TriLM-560M | 0.3 GB | 1 GB | 24 | 28 | — |
-| TriLM-830M | 0.4 GB | 2 GB | 24 | 28 | — |
-| TriLM-1.1B | 0.5 GB | 3 GB | 24 | 28 | — |
-| TriLM-1.5B | 0.7 GB | 3 GB | 24 | 32 | — |
-| TriLM-2.4B | 0.9 GB | 4 GB | 30 | 36 | — |
-| TriLM-3.9B ⚠️ | 1.2 GB | 5 GB | 32 | 64 | — |
-| **Other** |||||
-| BitNet-2B4T-b1.58 | 1.0 GB | 4 GB | 30 | 20 | **2.8** |
-| Llama3-8B-1.58 | 4.1 GB | 10 GB | 32 | 32 | **0.8** |
+3. **Kein Ökosystem**: Ein Autor, null User. Ein Projekt, das keiner ausser dir
+   bedienen kann, ist ein Tagebuch — kein Produkt.
 
-"Best tok/s" on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Your speed depends on CPU.
-- **3B+ models** work well on 4-8 GB RAM laptops
-- **7B/10B models** need 6-8 GB RAM (faster with int4 FFN mode)
-- **1B models** are fast but less capable
-- **Falcon-E Edge**: BitNet 1.58-bit architecture (SubLN, ReLU²), 32K native context. 0.56–0.82 GB on disk.
-- **CANN models**: MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Chat template: `<|role|>\n{content}\n`.
-- **TriLM 3.9B ⚠️**: Uses **standard Llama** architecture (head_dim=128, no SubLN) — different from smaller TriLMs (SubLN, head_dim=64). Auto-detected.
-- **Llama3-8B-1.58** ([`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens)): Llama3 architecture (GQA, QK-Norm), 256 added tokens (IDs 128000–128255). Base model (no chat template, Llama3 license).
+## Lizenz
 
-### Model Sources
-
-| Family | HuggingFace Repo | License | Status |
-|--------|-----------------|:-------:|:------:|
-| **Falcon3 (1.58bit)** (1B/3B/7B/10B) | [`tiiuae/Falcon3-*-1.58bit`](https://huggingface.co/tiiuae) | TII Falcon License | ✅ |
-| **Falcon3 ATLAS** (1B/3B/7B/10B Base+Instruct) | [`xxxn3m3s1sxxx/Falcon3-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon3) | TII Falcon License | ✅ |
-| **Falcon-E Edge** (1B/3B Base+Instruct) | [`tiiuae/Falcon-E-*`](https://huggingface.co/tiiuae) | TII Falcon License | ✅ |
-| **Falcon-E Edge ATLAS** (1B/3B) | [`xxxn3m3s1sxxx/Falcon-E-*-1.58bit-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Falcon-E) | TII Falcon License | ✅ |
-| **Ternary Bonsai** (1.7B/4B/8B) | [`prism-ml/Ternary-Bonsai-*-unpacked`](https://huggingface.co/prism-ml) | Apache 2.0 | ✅ |
-| **Ternary Bonsai ATLAS** (1.7B/4B/8B) | [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) | Apache 2.0 | ✅ |
-| **BitNet b1.58** (2B) | [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) | MIT | ✅ |
-| **BitNet b1.58 ATLAS** (2B) | [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) | MIT | ✅ |
-| **Llama3-8B-1.58** (8B) | [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) | Llama3 | ✅ |
-| **Llama3-8B-1.58 ATLAS** (8B) | [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS) | Llama3 | ✅ |
-| **BitCPM-CANN** (0.5B/1B/3B/8B) | [`openbmb/BitCPM-CANN-*-unpacked`](https://huggingface.co/openbmb) | Apache 2.0 | ✅ |
-| **BitCPM-CANN ATLAS** (0.5B/1B/3B/8B) | [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN) | Apache 2.0 | ✅ |
-| **TriLM** (99M→3.9B, 10 sizes) | [`SpectraSuite/TriLM_*_Unpacked`](https://huggingface.co/SpectraSuite) | Apache 2.0 | ✅ |
-| **TriLM ATLAS** (99M→3.9B) | [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM) | Apache 2.0 | ✅ |
-
-✅ — Supported and tested.
-
-**TriLM ⚠️**: TriLM 3.9B uses **standard Llama** (head_dim=128, no SubLN). Smaller TriLMs (≤2.4B) use SubLN (head_dim=64). Auto-detected by `derive_arch`.
-
-### Converting Models to .atlas Format
-
-```bash
-# Requires Python + transformers:
-pip install safetensors transformers numpy
-
-# All architectures auto-detected (Falcon3, Falcon-E, Bonsai, Qwen3, BitNet, BitCPM-CANN, TriLM, Llama3):
-python pack_to_atlas.py path/to/model-directory
-```
-
-The packer autodetects the model and generates a `.atlas` file ready for the CLI.
-
-## CLI Usage
-
-```bash
-atlas.exe <model.atlas> [prompt] [options]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--temp <f>` | 0.7 | Temperature (0 = deterministic) |
-| `--top-k <n>` | 40 | Top-k sampling (0 = off) |
-| `--top-p <f>` | 0.9 | Top-p nucleus sampling |
-| `--max-new <n>` | 200 | Max tokens to generate |
-| `--max-seq <n>` | 4096 | Context window size |
-| `--rep-penalty <f>` | 1.0 | Repetition penalty (1.0=off) |
-| `--seed <n>` | random | RNG seed for reproducible output |
-| `--threads <n>` | auto | CPU threads to use |
-| `--raw` | off | Send prompt as-is (no chat template) |
-| `-i` | off | Interactive chat mode |
-
-**Interactive mode** (`-i`) supports:
-- Type messages and get responses (KV cache persists across turns)
-- `/reset` — clear conversation context
-- `/exit` or `/quit` — exit
-
-## Performance Tips
-
-| Setting | When to Use |
-|---------|-------------|
-| `--temp 0.0` | Factual QA, deterministic answers |
-| `--temp 0.7` + `--top-k 40` | Creative writing, conversation |
-| `--threads 4` | On battery, or shared CPU |
-| `--threads <P-cores>` | **Hybrid CPUs** (Alder Lake+): set to physical P-core count. E-cores slow synchronized matmul barriers. |
-| `--max-seq 2048` | Lower RAM usage (shorter context) |
-
-- **7B+ models**: Use `--max-new 100` for faster responses
-- **1B/3B models**: Good at `--max-new 200-500`
-- **T=0 (deterministic)**: Best for 7B+ models. Smaller models may repeat or collapse at T=0 — use T=0.7 instead.
-
-## Build from Source
-
-**Windows (clang):**
-```bash
-compile.bat
-```
-
-**Linux:**
-```bash
-chmod +x compile-linux.sh && ./compile-linux.sh
-```
-
-Requires Clang with OpenMP, AVX2+FMA, C++17.
-
-The CLI (`atlas.exe`) is optional — it's built by `compile.bat` but only the DLL is required for Python/API usage.
-
-## Performance (Technical)
-
-Measured on Intel Core i7-7700T (4C/8T @ 2.9 GHz). Warm cache, `generate_c()` at T=0.7 / top_k=40.
-
-| Model | Mode | tok/s | Notes |
-|-------|------|:-----:|-------|
-| Bonsai-1.7B | f32 bypass | **13.0** | Fastest model, good quality |
-| Bonsai-1.7B | hybrid+int8 | 19.2 | Higher throughput, minor quant noise |
-| Bonsai-4B | hybrid+int8 | **17.4** | Best perf/size tradeoff |
-| Falcon3-3B | hybrid+int8 | **7.1** | Good general-purpose model |
-| Falcon3-1B | f32 bypass | **10.1** | Fast but shallow |
-| Falcon3-7B (int4) | hybrid+int8 | **3.15** | 26% faster than int8 |
-| Falcon3-10B (int4) | hybrid+int8 | **2.25** | 18% faster than int8 |
-| Bonsai-8B | f32 bypass | **1.8** | Most capable, slowest |
-| BitNet-2B4T | f32 bypass | **2.8** | Experimental |
-| **Falcon-E Edge** (v2.10.5) ||||
-| Falcon-E-1B | hybrid+int8 | **13** | BitNet 1.58 arch, SubLN, ReLU² |
-| Falcon-E-3B | hybrid+int8 | **7** | Balanced Falcon Edge |
-| **BitCPM-CANN** (v2.10.4) ||||
-| CANN-0.5B | f32 bypass | **30** | Tiny, MiniCPM v5 tok, DeepNorm |
-| CANN-1B | hybrid+int8 | **9.7** | Llama arch, LongRoPE 32K ctx |
-| CANN-3B | hybrid+int8 | **7.1** | Balanced quality/speed |
-| CANN-8B | f32 bypass | **1.5** | Max quality, 16384 intermediate |
-| **TriLM** ||||
-| TriLM-99M | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-190M | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-390M | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-560M | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-830M | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-1.1B | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-1.5B | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-2.4B | f32 bypass | — | SubLN, head_dim=64 |
-| TriLM-3.9B ⚠️ | hybrid+int8 | — | Standard Llama, no SubLN |
-
-### How It Works
-
-1. **TQ1.0 format**: Repacks HuggingFace safetensors into 5 ternary trits per byte (Base-3 encoding). ~1.58 bits/weight.
-2. **Hybrid mode** (default for 3B+ non-SubLN models): FFN projections run as decompressed int8 (dominate compute), QKV/O stay TQ1-packed (5× less memory reads). **f32 bypass** takes priority for SubLN architectures (BitNet, TriLM ≤2.4B), hidden≤2048 (1B, Bonsai-1.7B), or rope_theta≥3M (Bonsai-8B) — no activation quantization needed.
-3. **Int8 KV-cache**: Per-position int8 quantization with dynamic scaling halves KV cache RAM. 10B@4K: 320 MB → 173 MB.
-4. **Int4 FFN**: Load-time conversion halves FFN memory bandwidth (7B: +26%). Auto-enabled.
-5. **C++ binary tokenizer**: No Python dependencies at runtime. Encode via preencode + BPE merge, decode via pool lookup.
-
-### Matmul Modes
-
-The engine dispatches per-tensor based on `ttype` (packing format) and model flags. Key modes:
-
-| Mode | Kernel | Trigger | Used By |
-|------|--------|---------|---------|
-| **f32 bypass** | `vfmadd231ps` | `use_f32_matmul` | SubLN archs (BitNet, TriLM ≤2.4B), hidden≤2048 (1B, Bonsai-1.7B), rope_theta≥3M (Bonsai-8B). No activation quant — prevents signal collapse. |
-| **int8** (default) | `vpmaddubs` + 128×row_sum | `ttype==3` (decompressed int8) | FFN in hybrid mode (3B/7B/10B), any model after decompress |
-| **int4** (v2.8.0) | nibble-unpack + `vpmaddubsw` | `ttype==8 && !f32_matmul` | 7B/10B FFN (18-26% faster). Halves FFN memory bandwidth. |
-| **TQ1-packed** | chunked decode + SIMD | `ttype==0` | QKV/O in hybrid mode (5× less memory reads) |
-| **TQ2** | chunked decode + `ttype==10` matmul | `ttype==10` | BitNet v2 two-bit packed format |
-| **g128 fused** | block-decode + fused s8/f32/LUT | `ttype==5` | Block-scaled g128 models (Bonsai/Qwen3). Auto-selects f32/LUT/s8 sub-path per batch size. |
-| **ternary** | `vpsignb` | `use_ternary_matmul` | Pure sign path (no multiply). Rarely used; superseded by hybrid. |
-
-**Dispatch flow** (simplified):
-
-```
-Tensor ttype?
-├── 10 → TQ2 matmul
-├── 5  → g128 fused (f32 if use_f32_matmul, else LUT if B≥8, else s8)
-├── 7  → TurboQuant fused
-├── 0  → TQ1-packed (activation quant + chunked decode)
-├── 8  → int4 packed (if !use_f32_matmul) — FFN only
-└── 3  → decompressed int8:
-          ├── ternary → vpsignb
-          ├── f32     → vfmadd231ps (no activation quant)
-          └── default → vpmaddubs + activation quant + 128×row_sum
-```
-
-## Python API
-
-```python
-from atlas_infer import AtlasModel
-
-model = AtlasModel("falcon3-3B-Instruct-tq1.atlas")
-response = model.generate_c("What is the capital of France?")
-print(response)
-```
-
-| Method | Description |
-|--------|-------------|
-| `AtlasModel(path)` | Load model |
-| `generate_c(text)` | Generate text (returns string) |
-| `generate_stream(text)` | Streaming generator (yields token IDs) |
-| `set_system_prompt(text)` | Set system prompt |
-| `set_seed(seed)` | Set RNG seed |
-| `set_num_threads(n)` | Set CPU thread count |
-| `reset_cache()` | Clear conversation context |
-
-## Architecture
-
-```
-safetensors → atlas_packer*.py → .atlas file → atlas.exe / atlas_infer.py
-                                                      |
-                                                 atlas.dll / libatlas.so
-                                                      |
-                                            atlas_forward (fused layers)
-                                                      |
-                                            +----+----+----+----+
-                                          Norm  Attn  FFN  LM Head
-```
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `atlas_cli.cpp` | Standalone CLI (`atlas.exe` — no Python needed) |
-| `atlas_api.cpp` | C++ inference engine — AVX2 kernels, attention, norms, tokenizer |
-| `atlas_vnni.cpp` | AVX-512 VNNI matmul kernel (separate TU, `target("avx10.2")`) |
-| `atlas_ffi.h` | C API contract |
-| `atlas_infer.py` | Python bindings (`AtlasModel` class) |
-| `atlas_server.py` | SSE web server (FastAPI, `/v1/chat/completions`) |
-| `atlas_packer*.py` | Model converters (safetensors → .atlas) |
-| `compile.bat` | Windows build script |
-| `scripts/check_api_parity.py` | API parity scanner (C → Python) |
-| `scripts/check_coverage_thresholds.py` | Coverage gates in CI |
-| `tests/test_fuzz.py` | Fuzz tests (head_dim edge-cases) |
-| `tests/test_e2e_pipeline.py` | End-to-end pipeline tests |
-| `tests/test_omp_stress.py` | OMP stress tests |
-| `tests/test_bonsai8b_tq2.py` | Bonsai-8B TQ2 format tests |
-| `tests/generate_test_fixtures.py` | Test fixture generator |
-| `BUGS.md` | Known issues & limitations |
-| `.github/workflows/` | CI + auto-release pipelines |
-
-## Version History
-
-| Version | What's New |
-|---------|------------|
-| **v2.11.0** | **Falcon-E Edge + TriLM Full Series + CI Hardening**. Falcon-E 1B/3B Base+Instruct (BitNet 1.58 arch) in TQ1.0 format. TriLM 99M–560M added (9-model full series). CANN dual EOS, thread_local block scales, relaxed QK-Norm arch guard. README: full model table with TriLM, Falcon-E, Llama3-8B-1.58. CI: sanitizer-build (ASan+UBSan), coverage gates, pip cache, fail-fast, macOS fix, release_to_hf.py Falcon-E support. 58/58 mock tests across 9 architectures. |
-| **v2.10.6** | **OOM Error Propagation (Signal Chain)**. Complete memory failure cascade: `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked, Python `RuntimeError` on OOM. 55/55 mock tests, 12/12 sonde. |
-| **v2.10.5** | **Falcon-E Edge Integration + Unified C++ Generation Path**. Falcon-E 1B/3B (Base+Instruct) in TQ1.0 format. CANN dual EOS (`eos_id2` for `</s>` ID 2), thread_local block scales, relaxed QK-Norm arch guard. 58/58 mock tests across 9 architectures. |
-| **v2.10.4** | **BitCPM-CANN Series (0.5B/1B/3B/8B) + Bug Hunt**. MiniCPM v5 tokenizer, LongRoPE 32K context, DeepNorm (scale_emb=12, scale_depth=1.4). Debug print crash fix (unconditional OOB logits read). 43/43 mock tests, 4 CANN models deployed to HF. |
-| **v2.10.3** | **Bug Hunt Round 2+3 (12 bugs) + Llama3**. Falcon3 BPE cutoff, unaligned memcpy, RoPE heuristic override, xoshiro thread safety, VNNI init race, EOS sentinel, Llama3 stops/specials, v6 added_tokens. 39/39 tests. |
-| **v2.10.2** | **Consistent naming + HF repos**. Falcon3 HF models renamed, Bonsai-8B perf table. |
-| **v2.10.1** | BitNet EOS fix + HF push (BitNet + all 3 Bonsai). |
-| **v2.10.0** | **Unified Packer + BF16 weight_scale Fix + Falcon3 TQ1.0 Series**. Single `pack_to_atlas.py` replaces all individual packers — architecture auto-detection from `config.json`. BF16 weight_scale fix (`get_bf16_manual` fallback). All 4 Falcon3 models (1B/3B/7B/10B) packaged as TQ1.0, verified T=0 correct, deployed to Hugging Face. 22/22 mock tests, CI green. |
-| **v2.9.3** | AKI-Bug-Fix + HF alignment (16/18 PASS) + TriLM blindspot. TQ2 P2: OMP scale-decode, batch stores, 2× unrolled matmul (+91%: 0.58→1.11 tok/s). AVX-512 VNNI kernel via `atlas_vnni.cpp` with CPUID dispatch + clang 19+ guard.
-| **v2.9.2** | Synthetic mock CI suite (9 tests, 3 archs, 1.14s). Bugfix: ttype=1 data_size, EOS fallback, Q-buffer overflow, BitNet stride. New APIs: set_rope_interleaved, set_rope_theta. TriLM-1.5B/TriLM-2.4B support. |
-| **v2.8.0** | int4 FFN quantization (7B +26%, 10B +18%). CLI binary. |
-| **v2.7.9** | BitNet fix: duplicate sub-norm collapse resolved. |
-| **v2.7.5** | ttype=5 decompress. Bonsai-8B: 0.2→1.8 tok/s. |
-| **v2.6.0** | SSE web server, prompt caching, CI pipeline. |
-| **v2.5.0** | Ring buffer KV cache, NTK context extension (8K-16K). |
-| **v2.4.0** | Bonsai/Qwen3 support, QK-Norm, YaRN RoPE, dynamic vocab. |
-| **v2.3.0** | Int8 KV-cache (10B@4K: 320→173 MB). |
-| **v2.2.0** | F16C SIMD, TQ1-LUT decompress (~30% faster). |
-| **v2.1.0** | Streaming generation, repetition penalty. |
-| **v2.0.0** | C++ binary tokenizer (no transformers dependency). |
-| **v1.0.0** | Initial TQ1.0 inference engine. |
-
-## License
-
-Code: Apache 2.0. Falcon3: TII Falcon License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon3-*-ATLAS`](https://huggingface.co/models?search=Falcon3+ATLAS) carry the same TII Falcon License). Falcon-E Edge: TII Falcon License (derivative ATLAS models at [`xxxn3m3s1sxxx/Falcon-E-*-ATLAS`](https://huggingface.co/models?search=Falcon-E+ATLAS)). Bonsai/Qwen3: PrismML (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai). BitNet b1.58: Microsoft (MIT). Llama3-8B-1.58: [`HF1BitLLM/Llama3-8B-1.58-100B-tokens`](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (Llama3 License, derived from `meta-llama/Meta-Llama-3-8B-Instruct`); derivative ATLAS at [`xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/Llama3-8B-1.58-ATLAS). BitCPM-CANN: OpenBMB (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/BitCPM-CANN-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/BitCPM-CANN). TriLM: SpectraSuite (Apache 2.0) — derivative ATLAS models at [`xxxn3m3s1sxxx/TriLM-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/TriLM).
+MIT. Siehe `LICENSE`.

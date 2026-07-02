@@ -1,4 +1,9 @@
-# ATLAS — Falcon3 TQ1.0 Inference Engine
+# ATLAS — Falcon3 TQ1.0 Inference Engine (ARCHIVED)
+
+**Status**: Eingestellt. Letzte Version: v2.16.1 (Juni 2026).
+**Warum**: CPU-LLM-Inference ist auf Consumer-Hardware (DDR4, ~20 GB/s) physikalisch bandbreitenbegrenzt. TQ1.0-Quantisierung ist 2-4× kompakter als GGUF Q4, aber der Performance-Vorsprung wird durch den Kernel-Overhead aufgefressen. Das Format und die Packer-Logik sind das eigentliche Artefakt — nicht die Engine selbst.
+
+**Repo archiviert. Keine weiteren Commits.**
 
 CPU LLM inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3, TriLM, BitNet, Llama3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
 
@@ -10,7 +15,7 @@ CPU LLM inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bon
 - **ttype=8 (int4 packed)**: 2 int4 weights per byte, sign-extension via `(nibble ^ 8) - 8`. Converted at load time from existing int8 FFN tensors — no packer changes required. `[fp16_scale:2][packed_weights:rows*packed_cols][row_sums:rows*4]`. Guarded by `use_f32_matmul` to avoid activation quantization for hybrid architectures.
 - **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
 - **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-4B/8B, CANN 3B/8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN/Qwen3 architectures where small activations are destroyed by u8+128 centering. Bonsai-4B (rope_theta=5M) triggers this; hybrid/int4 path produces garbage — f32_bypass is mandatory for all rope_theta >= 3M models.
-- **int4 FFN + fp32 activations (deferred)**: The current ttype=8 dispatch (`atlas_matmul_i4_f32`, `matmul_i4_reorder_deq`) requires uint8 activation quantization (`act_u8 = act_f32 + 128`), which destroys signal for f32_bypass models. A new kernel taking fp32 activations × int4 weights would halve DRAM reads but adds nibble-unpack overhead. Estimated net gain uncertain at B=1 decode; deferred pending ARM64 parity completion.
+- **int4 FFN + fp32 activations (tested, REVERTED)**: A `matmul_f32_i4_f32` kernel was implemented (v2.17.0) taking raw fp32 activations × int4 weights, eliminating activation quantization for f32_bypass models. Tested on Bonsai-4B: output correctness verified (aligned with int8) but **performance was -87% (2.5 vs 19 tok/s)** because B=1 decode is compute-bound on Kaby Lake DDR4 — the nibble-unpack overhead (~7× more operations) dominates the 2× memory bandwidth savings. Quantizer guard (`m->use_f32_matmul → skip int4 conversion`) was restored. The f32_bypass int4 dispatch branches remain in `forward_layer_internal` for manual/pre-quantized models but are never triggered in normal operation. Conclusion: int4 FFN only helps memory-bandwidth-bound models (7B: +26%, 10B: +18%). For compute-bound models (Bonsai-4B at 4-12 tok/s), int8 FFN is optimal.
 - **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
 - **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
 - **`rope_interleaved_set` flag** (v2.10.3): Tracks whether config.json set `rope_interleaved`. If yes, Heuristik in `ensure_layer_idx` überschreibt nicht. Default: `true` (interleaved). Config override möglich (Llama/BitNet: half-split, `false`).
@@ -317,10 +322,6 @@ See `atlas_ffi.h` for full API.
 - **`atlas_reset_cache()` C-API**: Neue C-Funktion + Python `AtlasModel.reset_cache()`. Zeros KV-Cache-Daten, Allokation bleibt erhalten.
 - **CI Pipeline**: `.github/workflows/build.yml` — GitHub Actions Build-Test auf Ubuntu/Windows/macOS mit Clang/LLVM. Automatischer Build bei Push auf main.
 - **Target**: 10B Chat-Client mit sub-second Prefill für kurze Folgefragen.
-
-### Deferred
-- **F16C-Rester**: Diminishing returns (heiße Pfade bereits erledigt)
-- **int4 FFN + fp32 activations**: New kernel required (`matmul_f32_i4_f32`). Halves FFN weight DRAM reads but adds nibble-unpack overhead. Estimated net gain uncertain at B=1 decode; deferred pending ARM64 parity completion.
 
 ### ❌ FLUX.2/Bonsai-Image Diffusion Post-Mortem (ABGEBROCHEN)
 - **Modell**: `prism-ml/bonsai-image-ternary-4B-unpacked` — FLUX.2 Klein 4B MMDiT (12 double blocks + 19 single blocks + 3 VAE).
