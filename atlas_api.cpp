@@ -2766,7 +2766,11 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
             if (n_vals <= 0) continue;
             int8_t* data = (int8_t*)(d8 + 2);
             for (int64_t i = 0; i < n_vals; i += step) {
+                #ifdef __x86_64__
                 _mm_prefetch((const char*)&data[i], _MM_HINT_NTA);
+                #else
+                __builtin_prefetch(&data[i], 0, 0);
+                #endif
             }
             total += n_vals;
         } else if (t.ttype == 11) {
@@ -2776,7 +2780,11 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
             if (n_vals <= 0) continue;
             int8_t* data = (int8_t*)(d8 + t.row_dim * 2);
             for (int64_t i = 0; i < n_vals; i += step) {
+                #ifdef __x86_64__
                 _mm_prefetch((const char*)&data[i], _MM_HINT_NTA);
+                #else
+                __builtin_prefetch(&data[i], 0, 0);
+                #endif
             }
             total += n_vals;
         } else if (t.ttype == 10) {
@@ -2785,7 +2793,11 @@ ATLAS_API void atlas_prefetch_int8(AtlasModel* m) {
             if (!d) continue;
             int64_t sz = t.data_size;
             for (int64_t i = 0; i < sz; i += step) {
+                #ifdef __x86_64__
                 _mm_prefetch((const char*)&d[i], _MM_HINT_NTA);
+                #else
+                __builtin_prefetch(&d[i], 0, 0);
+                #endif
             }
             total += sz;
         }
@@ -5559,6 +5571,7 @@ static void matmul_i4_reorder_deq(int rows, int cols,
 // ─── Row-major matmul: output[rows] = weights[rows,dim] @ input[dim] ───
 // Unlike matmul_f32_reorder (blocked output), this writes standard row-major.
 // Used for KV_b decompression: c_kv [lora_rank] → k_nope + v [out_dim]
+#ifndef __aarch64__
 static void matmul_f32_row_major(int rows, int dim,
     const int8_t* __restrict__ weights, const float* __restrict__ act,
     float scale, float* __restrict__ output) {
@@ -5606,6 +5619,35 @@ static void matmul_f32_row_major_per_row(int rows, int dim,
         output[r] = s / rs;
     }
 }
+#else
+static void matmul_f32_row_major(int rows, int dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act,
+    float scale, float* __restrict__ output) {
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows > 16)
+    #endif
+    for (int r = 0; r < rows; r++) {
+        const int8_t* w = weights + (int64_t)r * dim;
+        float s = 0.0f;
+        for (int c = 0; c < dim; c++) s += act[c] * (float)w[c];
+        output[r] = s / scale;
+    }
+}
+static void matmul_f32_row_major_per_row(int rows, int dim,
+    const int8_t* __restrict__ weights, const float* __restrict__ act,
+    const uint16_t* __restrict__ row_scales_fp16, float* __restrict__ output) {
+    #ifdef _OPENMP
+    #pragma omp parallel for if(rows > 16)
+    #endif
+    for (int r = 0; r < rows; r++) {
+        float rs = fp16_to_fp32(row_scales_fp16[r]);
+        const int8_t* w = weights + (int64_t)r * dim;
+        float s = 0.0f;
+        for (int c = 0; c < dim; c++) s += act[c] * (float)w[c];
+        output[r] = s / rs;
+    }
+}
+#endif
 
 // Batched row-major matmul wrappers: write directly to output in row-major layout.
 // Used for MLA projections (Q, kv_a, O) to avoid blocked layout + un-reorder.
