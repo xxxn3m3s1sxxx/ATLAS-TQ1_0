@@ -157,9 +157,55 @@ LLAMA = {
     "flags_fn": lambda cfg: 0,
 }
 
+# ─── DeepSeek-V2 / V2-Lite (MoE + MLA) ─────────────────────────────────
+# DeepSeek-V2 uses Multi-head Latent Attention (MLA) with joint KV compression
+# and Mixture-of-Experts FFN. Layer 0 is dense; layers 1+ are MoE.
+# MLA tensors: kv_a_proj_with_mqa, kv_b_proj, q_proj (V2-Lite: no q_a_proj)
+# MoE tensors: mlp.gate (router), mlp.experts.{E}.gate/up/down, shared_experts
+DEEPSEEK_V2 = {
+    "model_types": {"deepseek_v2", "deepseek_v3"},
+    # Dense layer tensors (all layers have these)
+    "layer_tensors": [
+        "model.layers.{}.input_layernorm.weight",
+        # MLA attention (V2-Lite: q_proj; V2: q_a_proj + q_b_proj)
+        "model.layers.{}.self_attn.q_proj.weight",
+        "model.layers.{}.self_attn.kv_a_proj_with_mqa.weight",
+        "model.layers.{}.self_attn.kv_a_layernorm.weight",
+        "model.layers.{}.self_attn.kv_b_proj.weight",
+        "model.layers.{}.self_attn.o_proj.weight",
+        "model.layers.{}.post_attention_layernorm.weight",
+    ],
+    "stride": 7,  # base stride (dense attention tensors per layer)
+    "global_tensors": ["model.embed_tokens.weight", "model.norm.weight"],
+    "conditional_layer": ["lm_head.weight"],
+    "input_format": "bf16",
+    "requires_pre_shuffle": True,
+    "quant_weight": "tq1_block_scaled",
+    "has_weight_scale": False,
+    # MoE-specific fields
+    "is_moe": True,
+    "moe_expert_patterns": [
+        "model.layers.{}.mlp.experts.{}.gate_proj.weight",
+        "model.layers.{}.mlp.experts.{}.up_proj.weight",
+        "model.layers.{}.mlp.experts.{}.down_proj.weight",
+    ],
+    "moe_shared_patterns": [
+        "model.layers.{}.mlp.shared_experts.gate_proj.weight",
+        "model.layers.{}.mlp.shared_experts.up_proj.weight",
+        "model.layers.{}.mlp.shared_experts.down_proj.weight",
+    ],
+    "moe_router_pattern": "model.layers.{}.mlp.gate.weight",
+    "moe_dense_ffn_patterns": [
+        "model.layers.{}.mlp.gate_proj.weight",
+        "model.layers.{}.mlp.up_proj.weight",
+        "model.layers.{}.mlp.down_proj.weight",
+    ],
+    "flags_fn": lambda cfg: 0,
+}
+
 # ─── Registry: model_type → arch entry ──────────────────────────────────
 ARCH_REGISTRY = {}
-for _entry in [FALCON3, QWEN3, BITNET, TRILM, TRILM_NOSUBLN, MINICPM, LLAMA]:
+for _entry in [FALCON3, QWEN3, BITNET, TRILM, TRILM_NOSUBLN, MINICPM, LLAMA, DEEPSEEK_V2]:
     for _mt in _entry["model_types"]:
         ARCH_REGISTRY[_mt] = _entry
 

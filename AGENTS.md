@@ -1,441 +1,81 @@
-# ATLAS — Falcon3 TQ1.0 Inference Engine (ARCHIVED)
+# ATLAS — TQ1.0 Ternary Inference Engine (ARCHIVED)
 
-**Status**: Eingestellt. Letzte Version: v2.16.1 (Juni 2026).
-**Warum**: CPU-LLM-Inference ist auf Consumer-Hardware (DDR4, ~20 GB/s) physikalisch bandbreitenbegrenzt. TQ1.0-Quantisierung ist 2-4× kompakter als GGUF Q4, aber der Performance-Vorsprung wird durch den Kernel-Overhead aufgefressen. Das Format und die Packer-Logik sind das eigentliche Artefakt — nicht die Engine selbst.
+**Status**: v2.16.1, Juni 2026. Eingestellt. Keine weiteren Commits.
+**Repo**: `xxxn3m3s1sxxx/ATLAS-TQ1_0` auf GitHub.
 
-**Repo archiviert. Keine weiteren Commits.**
+Keine Weiterentwicklung. Das TQ1.0-Format und der Packer sind das eigentliche Artefakt — die Engine ist durch DDR4-Bandbreite physikalisch begrenzt (~20 GB/s → ~3 tok/s für 7B).
 
-CPU LLM inference engine for BitNet b1.58 ternary-quantized models (Falcon3, Bonsai/Qwen3, TriLM, BitNet, Llama3). Repacks HuggingFace safetensors into **TQ1.0** format (5 ternary trits/byte, Base-3) and runs fast inference via C++ DLL/SO + Python. **Windows + Linux x86-64**, no GPU, 8-16 GB RAM.
+## Schnellstart
 
-## Architecture
-
-- **TQ1.0 format**: 5 ternary trits per byte (Base-3 encoding), ~1.58 bits/weight
-- **TQ1.0 g128** (ttype=5): Per-row per-block fp16 scales (block_size=128), 16/128 = 0.125 b/w overhead. Used by Bonsai/Qwen3 models. Packed via `matmul_tq1_block_reorder`.
-- **5 matmul modes**: int8 (default, `vpmaddubs` SIMD), int4 (v2.8.0, nibble-unpack + `vpmaddubsw`, halves FFN memory bandwidth), f32 bypass (reference, no activation quant), ternary (`vpsignb` pure sign), TQ1-packed (chunked decode + SIMD)
-- **ttype=8 (int4 packed)**: 2 int4 weights per byte, sign-extension via `(nibble ^ 8) - 8`. Converted at load time from existing int8 FFN tensors — no packer changes required. `[fp16_scale:2][packed_weights:rows*packed_cols][row_sums:rows*4]`. Guarded by `use_f32_matmul` to avoid activation quantization for hybrid architectures.
-- **Hybrid mode** (default since v1.3.2): FFN tensors decompressed to int8, QKV/O stay TQ1-packed. Per-tensor dispatch.
-- **f32 bypass**: Auto-enabled for `hidden <= 2048` (1B, Bonsai-1.7B), `rope_theta >= 3M` (Bonsai-4B/8B, CANN 3B/8B), or `ARCH_BITNET` (SubLN models). Eliminates activation quantization noise — required for SubLN/Qwen3 architectures where small activations are destroyed by u8+128 centering. Bonsai-4B (rope_theta=5M) triggers this; hybrid/int4 path produces garbage — f32_bypass is mandatory for all rope_theta >= 3M models.
-- **int4 FFN + fp32 activations (tested, REVERTED)**: A `matmul_f32_i4_f32` kernel was implemented (v2.17.0) taking raw fp32 activations × int4 weights, eliminating activation quantization for f32_bypass models. Tested on Bonsai-4B: output correctness verified (aligned with int8) but **performance was -87% (2.5 vs 19 tok/s)** because B=1 decode is compute-bound on Kaby Lake DDR4 — the nibble-unpack overhead (~7× more operations) dominates the 2× memory bandwidth savings. Quantizer guard (`m->use_f32_matmul → skip int4 conversion`) was restored. The f32_bypass int4 dispatch branches remain in `forward_layer_internal` for manual/pre-quantized models but are never triggered in normal operation. Conclusion: int4 FFN only helps memory-bandwidth-bound models (7B: +26%, 10B: +18%). For compute-bound models (Bonsai-4B at 4-12 tok/s), int8 FFN is optimal.
-- **C++ binary tokenizer** (v6 format, v2.0.0): No `transformers` dependency at runtime. `tokenizers` lib for encode, C++ pool-lookup for decode.
-- **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
-- **`rope_interleaved_set` flag** (v2.10.3): Tracks whether config.json set `rope_interleaved`. If yes, Heuristik in `ensure_layer_idx` überschreibt nicht. Default: `true` (interleaved). Config override möglich (Llama/BitNet: half-split, `false`).
-- **128*row_sum correction**: Required for all uint8×int8 matmuls (activation quantization adds +128 bias).
-
-## Supported Models
-
-| Model | Atlas Size | Layers | Hidden | Intermediate | Heads | KV Heads | Vocab | Arch |
-|-------|-----------|--------|--------|-------------|-------|----------|-------|------|
-| BitNet-2B4T-b1.58 | 1.03 GB | 30 | 2560 | 6912 | 20 | 5 | 128256 | SubLN, ReLU² |
-| Falcon3-1B-Instruct | 1.22 GB | 18 | 2048 | 8192 | 8 | 4 | 131072 | Falcon3 |
-| Falcon3-3B-Instruct | 1.96 GB | 22 | 3072 | 9216 | 12 | 4 | 131072 | Falcon3 |
-| Falcon3-7B-Instruct | 2.75 GB | 28 | 3072 | 23040 | 12 | 4 | 131080 | Falcon3 |
-| Falcon3-10B-Instruct | 3.28 GB | 40 | 3072 | 23040 | 12 | 4 | 131072 | Falcon3 |
-| Ternary Bonsai-1.7B | 0.86 GB | 28 | 2048 | 6144 | 16 | 8 | 151669 | Qwen3 (QK-Norm) |
-| Ternary Bonsai-4B | 1.45 GB | 36 | 2560 | 9728 | 32 | 8 | 151669 | Qwen3 (QK-Norm) |
-| Ternary Bonsai-8B | 3.72 GB | 36 | 4096 | 12288 | 32 | 8 | 151669 | Qwen3 (QK-Norm) |
-| TriLM-1.1B | 0.53 GB | 24 | 1792 | 5120 | 28 | 28 | 50432 | SubLN (head_dim=64) |
-| TriLM-1.5B | 0.65 GB | 24 | 2048 | 6144 | 32 | 32 | 50432 | SubLN (head_dim=64) |
-| TriLM-2.4B | 0.88 GB | 30 | 2304 | 7680 | 36 | 36 | 50304 | SubLN (head_dim=64) |
-| TriLM-3.9B | 0.84 GB | 32 | 3072 | 9216 | 24 | 24 | 50688 | Llama (head_dim=128, no SubLN) |
-| Llama3-8B-1.58-100B-tokens | 3.27 GB | 32 | 4096 | 14336 | 32 | 8 | 128256 | Llama3 (GQA, QK-Norm, Instruct chat template) |
-| BitCPM-CANN-0.5B | 0.22 GB | 24 | 1024 | 4096 | 16 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
-| BitCPM-CANN-1B | 0.83 GB | 28 | 2048 | 6144 | 16 | 2 | 73448 | Llama (LongRoPE) |
-| BitCPM-CANN-3B | 1.35 GB | 32 | 2560 | 10240 | 32 | 2 | 73448 | Llama (LongRoPE) |
-| BitCPM-CANN-8B | 2.65 GB | 32 | 4096 | 16384 | 32 | 2 | 73448 | Llama (LongRoPE, DeepNorm) |
-
-Falcon3: `head_dim=256`, `rope_theta=1000042`, GQA.  
-BitNet-2B4T: `head_dim=128`, `rope_theta=500000`, SubLN (attn_sub_norm, ffn_sub_norm), **ReLU²** activation, Tie Embeddings.  
-Bonsai/Qwen3: `head_dim=128`, `rope_theta=1M` (1.7B) or `5M` (4B) or `10M` (8B), YaRN factor=4.0, Tie Embeddings, QK-Norm, SwiGLU.  
-TriLM (≤2.4B): `head_dim=64`, `rope_theta=10K`, SubLN, MHA (no GQA), SwiGLU. f32 bypass auto-detected via head_dim=64 (v2.11.2+).  
-TriLM 3.9B: `head_dim=128`, `rope_theta=10K`, Llama arch, MHA (no GQA), SwiGLU. Auto-detected by packer via head_dim threshold.
-Llama3-8B-1.58 (Instruct, from HF1BitLLM): `head_dim=128`, `rope_theta=500000`, GQA (8 KV heads), QK-Norm, Tie Embeddings. V=128256. Llama3 chat template (`<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`). 256 added tokens (IDs 128000-128255) stored in v6 binary tokenizer. Finetuned 100B tokens from `Meta-Llama-3-8B-Instruct`.
-BitCPM-CANN-1B: `head_dim=128`, `rope_theta=10000`, LongRoPE (theta=100M for pos≥2048), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`. 9.7 tok/s on i7-7700T (28L/2048H).
-BitCPM-CANN-3B: `head_dim=128`, `rope_theta=10000`, LongRoPE (same factors), Llama arch, SwiGLU. Tie Embeddings, V=73448. MiniCPM tokenizer (v5 embedded). f32 bypass (auto-detected via vocab=73448). T=0: "Paris." coherent, T=0.7: coherent.
-BitCPM-CANN-0.5B: `head_dim=64`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. Tie Embeddings, V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. Tiny — 24L/1024H/4096I, 0.22 GB.
-BitCPM-CANN-8B: `head_dim=128`, `rope_theta=10000`, LongRoPE, Llama arch, SwiGLU. No tie embeddings (lm_head separate). V=73448, DeepNorm (scale_emb=12, scale_depth=1.4). MiniCPM v5 tokenizer. f32 bypass (auto-detected via vocab=73448). Largest CANN — 32L/4096H/16384I, 2.65 GB.
-
-### HF Alignment Check — 29 Models Verified
-
-`scripts/verify_hf_alignment.py` auto-checks all models against HF Hub:
-
-| Family | Count | Status |
-|--------|-------|--------|
-| Falcon3 (1B/3B/7B/10B, Base+Instruct) | 7 | ✅ All PASS |
-| Falcon-E (1B/3B, Base+Instruct) | 4 | ✅ All PASS |
-| Bonsai (1.7B/4B/8B) | 3 | ✅ All PASS |
-| BitNet-2B4T | 1 | ⏭️ SKIP (restricted repo) |
-| Llama3-8B-1.58 | 1 | ✅ PASS |
-| TriLM (99M→3.9B, all sizes) | 9 | ✅ All PASS |
-| BitCPM-CANN (0.5B/1B/3B/8B) | 4 | ✅ All PASS |
-
-TriLM 3.9B is auto-detected by the packer: ≤2.4B uses SubLN (head_dim=64), 3.9B uses Llama arch (head_dim=128, no SubLN).
-
-## Build
-
-**Windows (clang):**
 ```bash
-clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -shared -o atlas.dll atlas_api.cpp
-```
+compile.bat                # Release: atlas.dll + atlas.exe (Windows, clang++)
+compile.bat debug          # Debug: atlas_d.dll (-O0 -g)
+compile.bat test           # Release + fixture-Tests
+compile.bat coverage       # Coverage-Build + Tests + HTML-Report
 
-**Linux (GCC/Clang):**
-```bash
-clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp -lgomp
-```
+# Linux
+clang++ -fopenmp -O2 -mavx2 -mfma -mf16c -ffast-math -std=c++17 -fPIC -shared -o libatlas.so atlas_api.cpp atlas_vnni.cpp -lgomp
 
-**macOS ARM64 (Apple Silicon):** Requires Homebrew LLVM (not Apple Clang). `atlas_kernel_arm64.cpp` provides NEON equivalents.
-```bash
+# macOS ARM64 — Homebrew LLVM (nicht Apple Clang)
 brew install llvm libomp
-LLVM_PREFIX=$(brew --prefix llvm)
 $LLVM_PREFIX/bin/clang++ -fopenmp -O2 -march=armv8.2-a+dotprod -ffast-math -std=c++17 -fPIC -shared -D__aarch64__ -o libatlas.so atlas_api.cpp atlas_kernel_arm64.cpp -L$LLVM_PREFIX/lib -lomp
 ```
 
-**Compiler macro compatibility**: `atlas_api.cpp` uses `#ifdef __aarch64__` / `#ifndef __aarch64__` guards throughout. Homebrew LLVM Clang 22.1.7 on macOS ARM64 defines `__arm64__` instead of `__aarch64__`; the portability block at line 13 also maps `_M_ARM64` and `__ARM_ARCH_ISA_A64`. As a belt-and-suspenders measure, the ARM64 build command passes `-D__aarch64__` explicitly.
+## Tests
 
-**Env**: `KMP_DUPLICATE_LIB_OK=TRUE` on Windows for MKL compat.
-
-## Performance
-
-Measured on **Intel Core i7-7700T** (Kaby Lake, 4C/8T @ 2.9 GHz, 8 MB L3). Warm (model loaded and cached). `generate_c()` at T=0.7, top_k=40, 200 max tokens. Includes prefill of ~22 token prompt. Times shown as total tok/s (prefill + gen) and pure gen tok/s where sustained.
-
-| Model | Hybrid tok/s (total) | Hybrid tok/s (pure gen) | Sustained gen tokens |
-|-------|:--------------------:|:-----------------------:|:--------------------:|
-| **3B** | **7.1** | — | 200 (no EOS) |
-| **1B** | **7.4** | **10.1** | 24 (Gumbel-EOS) |
-| **2B (BitNet)** | **2.8** (f32 bypass) | — | T=0: Correct short answers ("The capital of France is Paris."), degenerates into repetition after 10-15 tokens. T=0.7: Coherent first sentence, then degrades. f32_bypass required (SubLN signal destroyed by u8+128 activation quant). U8-packed path (Microsoft pre-quantized) strongly preferred over BF16 ternarization. Two bugs fixed: I2_S bit order/layout (k*B+ur) + stored_scale formula (127/g→1/g). |
-| **7B (int8)** | **2.5** | — | 61 (sampling-dependent) |
-| **7B (int4)** | **3.15** | — | 200 (no EOS, +26%) |
-| **10B (int8)** | **1.9** | — | 29 (sampling-dependent) |
-| **10B (int4)** | **2.25** | — | 29 (sampling-dependent, +18%) |
-
-**10B/7B early EOS**: With T=0.7 sampling, Gumbel noise occasionally pushes EOS token ahead of natural continuation, limiting sustained gen length. This is Gumbel-max sampling behavior, not an engine limitation.
-
-**int4 FFN quantization** (v2.8.0): Load-time int8→int4 conversion halves FFN memory bandwidth. 7B achieves **3.15 tok/s** (+26% vs int8), 10B achieves **2.25 tok/s** (+18% vs int8). Automatic skip for f32_bypass models (Bonsai, BitNet, 1B). A new `matmul_f32_i4_f32` kernel is needed for int4 FFN with fp32 activations (no activation quant); deferred (nibble-unpack overhead uncertain).
-
-**T=0 argmax behavior** (deterministic mode):  
-- **10B/7B**: Clean output ("The capital of France is Paris."), EOS after answer.  
-- **3B**: Correct answer + newline collapse after completion (model-inherent, 22L insufficient calibration).  
-- **1B**: Pure newline collapse (18L/2048H too small for stable argmax path).  
-- **2B (BitNet)**: Real English words (U8 path) but degenerates into repetition after 3-5 tokens (30L/2560H ternary-quantized, model-inherent). T=0.7 yields diverse token salad.  
-- **8B (Bonsai)**: "The capital of France is Paris." at T=0, degenerates into repetition after 50+ tokens. T=0.7 yields coherent short answers.  
-
-🚀 **Default recommendation**: Always use `T=0.7, top_k=40` for any model below 7B. T=0 is only reliable for 7B+.
-
-### Bonsai Benchmarks (v2.5.0+)
-
-| Model | Default Mode | tok/s | Context Window | Quality (T=0) |
-|-------|-------------|:-----:|:--------------:|---------------|
-| **Bonsai-1.7B** | f32 bypass | **13.0** | 4K (f32) / 8K (NTK) | "The capital of France is Paris." |
-| **Bonsai-4B-Pro** | f32 bypass (int8) | **19.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris." |
-| **Bonsai-8B** | f32 bypass | **2.2** | 8K (YaRN) / 16K (NTK) | "The capital of France is Paris.", T=0.7 coherent |
-
-Bonsai-1.7B f32 bypass auto-enabled (hidden=2048). Bonsai-4B rope_theta=5M >= 3M threshold → f32_bypass auto-triggered; hybrid+int4 path produces "achuachuachu" garbage. f32_bypass is mandatory for all rope_theta >= 3M models (Bonsai-4B/8B, CANN 3B/8B) — not just Bonsai-8B. Bonsai-4B reaches 19.2 tok/s (DDR4 bandwidth limit for 36L/2560H/9728I). Bonsai-8B rope_theta=1M (<3M threshold, f32 not auto-triggered), use `AtlasModel(..., use_f32_matmul=True)`.
-CANN 3B/8B: `vocab_size==73448` auto-triggers f32_bypass (v2.11.2+).
-
-### Architecture Notes
-
-- **1B**: f32 bypass (`hidden ≤ 2048`) eliminates activation quantization. 10 tok/s pure gen.
-- **3B vs 7B/10B**: Same hidden (3072) but intermediate scales from 9216 (3B) to 23040 (7B/10B). FFN matmul is 2.5× wider on 7B/10B, dominating the per-token cost.
-- **10B**: 40 layers mean 1.8× more memory traffic per token than 7B (28 layers), despite same per-layer weight size.
-- **Bonsai-4B vs -1.7B**: Same 36 layers (4B) vs 28 layers (1.7B). 4B has wider hidden (2560→2048) and intermediate (9728→6144). Bonsai-4B achieves higher tok/s due to better int8/AVX2 utilization per layer, despite running f32_bypass (hybrid+int4 produces "achuachuachu" garbage — rope_theta=5M triggers f32 bypass auto-detect).
-- **Bonsai-8B**: 36L/4096H/12288I, rope_theta=1M with YaRN 4.0. Requires `use_f32_matmul=True` (rope_theta < 3M threshold, so f32_bypass not auto-triggered). The i8 cache (6.9 GB) reduces load time from decompression (TTFP from 40s to 1s). Generation is memory-bandwidth bound at 2.2 tok/s on DDR4.
-
-## Sampling
-
-- **Gumbel-max**: `argmax_i(logits[i] + Gumbel(0,1))` samples from `softmax(logits)` — no softmax needed for top-k-only path.
-- **Survivor-list optimization** (v1.5.0): After top_k pruning, softmax/heap/Gumbel operate only on survivors (~40 tokens) instead of full V=131072 vocab.
-- top_k+p overhead ≈ top_k overhead.
-
-## C API
-
-```c
-void* atlas_load(const char* path);
-void atlas_free(void* model);
-int atlas_generate(void* model, const int* input_ids, int n_input,
-    int max_seq_len, int max_new_tokens,
-    float temperature, int top_k, float top_p,
-    float repetition_penalty,
-    int* output_ids);
-void atlas_set_seed(uint64_t seed);
-void atlas_set_num_threads(int n);
-void atlas_set_use_hybrid_matmul(void* model, int enable);
-void atlas_set_use_packed_matmul(void* model, int enable);
-void atlas_set_use_f32_matmul(void* model, int enable);
-void atlas_set_base_seq_len(void* model, int seq_len);   // v2.5.0: NTK context base
-void atlas_reset_cache(void* model);                     // v2.6.0: Zero KV cache
-void atlas_set_rope_interleaved(void* model, int enable);// v2.9.2: Toggle interleaved/half-split RoPE
-void atlas_set_rope_theta(void* model, float theta);     // v2.9.2: Override RoPE theta frequency
-const char* atlas_get_tokenizer(void* model, int* size);
+```bash
+pytest tests/test_mock_model.py          # Schnelle CI-Smokes (kein Modell nötig)
+pytest tests/test_fixtures.py            # Golden-Regression mit echten Modellen
+pytest tests/test_fixtures.py -k "golden" # Nur Golden-Regenerierung
+pytest tests/test_e2e_pipeline.py -v     # Prompt-Caching + Streaming
+pytest tests/test_omp_stress.py -v       # OMP-Thread-Stress
 ```
 
-See `atlas_ffi.h` for full API.
-
-## Roadmap
-
-### v2.11.2 ✅ — Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix (ABGESCHLOSSEN)
-- **CANN 3B/8B f32_bypass**: `vocab_size==73448` triggert automatisch f32_bypass — behebt chinesischen Garbage-Output (Signal wurde durch activation quant u8+128 zerstört). `pack_to_atlas.py` Meta-Block ebenfalls auf `use_f32_bypass: True` gesetzt.
-- **TriLM-2.4B f32_bypass**: `head_dim==64` triggert automatisch f32_bypass — TriLM SubLN-Modelle ohne `attn_sub_norm` Tensor-Namen werden korrekt erkannt. Prompt-Wiederholung behoben.
-- **Llama3-8B Base Model**: Chat-Template wird nicht mehr angewandt (Base Model versteht `<|start_header_id|>` Tokens nicht). Prompt-Wiederholung bei T=0 und T=0.7 behoben.
-### v2.16.0 ✅ — Triangular Tiled Weighted Sum (WEIGHTED SUM TILING GELIEFERT)
-
-- **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d).
-- **B=1024 weighted sum improvement**: **57.7s → 89.7s baseline** (−35.7%). Scores unchanged (286.9s, within noise of v2.15.0).
-- **Total prefill improvement**: **656.1s → 908.4s baseline** (−27.8%). Combined scores + weighted sum tiling.
-- **Bonsai-4B-Pro decode**: 12.02 tok/s median (within noise of v2.15.0 12.65). Weighted sum is negligible at B=1.
-- **Softmax causal mask redundancy removed**: SKIP/PARTIAL positions carry `-1e9f` from scores buffer initialization — no `ring_start + s` computation or `attn_pos > pos` branch in max-reduction pass.
-- **64/67 Mock-Tests**: Same 3 pre-existing f32_bypass failures. No regression from v2.15.0.
-- **Key insight**: Weighted sum is V-cache bandwidth bound. Tiling eliminates ~49% of V-cache reads (future position tiles) and uses the remaining tiles' V-cache from L1d. Output-init once per tile avoids redundant zero-initialization.
-
-### v2.15.0 ✅ — Triangular Tiled Attention (ATTENTION TILING GELIEFERT)
-
-- **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens.
-- **Per-query thread-local scores buffer**: All `n_heads × ring_len` scores initialized to `-1e9f` -> SKIP/PARTIAL positions stay masked — no separate causal mask needed in scores loop.
-- **B=1024 prefill improvement**: Attention scores **292s → 513s baseline** (−43.1%, from profile RDTSC). Total prefill **664s → 908s baseline** (−26.9%).
-- **Bonsai-4B-Pro decode**: 12.65 tok/s median (vs v2.14.0 10.91, +16%). Noise range [10.96–13.98].
-- **All DENSE tile path optimization**: `qh` pointer hoisted out of inner position loop (computed once per tile instead of per position). `sh[s]` direct pointer arithmetic.
-- **64/67 Mock-Tests**: 3 pre-existing f32_bypass failures, no regression from v2.14.0.
-- **Key insight**: The O(B²) bottleneck is finally broken. 32×32 tiles give fine-grained cache control — 16 KB Q-tile + 2 KB K-tile per KV head fits in L1d. 48.4% of tiles at B=1024 are SKIP (pure OMP barrier, no K-cache touch). Implementation in `atlas_attention_f32` (lines 2807-2930).
-
-### v2.13.0 ✅ — Fused Gate+Up Attempt + Software Prefetch Removal (ABGESCHLOSSEN)
-
-- **Fused gate+up kernel attempted (−7.5%, reverted)**: `matmul_i4_fused_gate_up` with 4-row grouping and 8 YMM accumulators. Slower because activation is already in L1d (4KB → zero-cost reload) and fused kernel increases register pressure + coarsens OMP granularity (14336→3584 iterations). Reverted to v2.12.0.
-- **NTA prefetch attempted (−3.7%, reverted)**: `_MM_HINT_NTA` at row+4. Worse because NTA fill buffers (10 per core) overflow with 32 cache lines per row.
-- **Software prefetch removed (+5.1%, shipping)**: Deleted the `_MM_HINT_T1` prefetch of row+2 from `atlas_matmul_i4_f32`. The Kaby Lake L2 streamer detects the 2048-byte row stride after 2-3 rows and auto-prefetches row+1/row+2 — software prefetch was polluting L2 with streaming data that's never reused.
-- **Key insight**: For decode (B=1), activation (4KB) fits entirely in L1d — reload is free. The real bottleneck is DRAM bandwidth for the 56 MB of gate+up weights. The hardware prefetcher already handles sequential row access optimally; software hints only add cache pollution.
-- **55/55 Mock-Tests grün**: Keine Regression. v2.13.0 = v2.12.0 + prefetch removal only.
-
-### v2.12.0 ✅ — Int4 KV-Cache + Defense-in-Depth + Telemetry (ABGESCHLOSSEN)
-
-- **Int4 KV-Cache**: KV-Cache von fp16 auf int4 (per-block fp16 scale, KV_BLOCK_SIZE=16). 3,56× Speicherkompression bei vernachlässigbarem Performance-Impact. Ring-Buffer + paralleles Tiling in der Attention.
-- **Int4 FFN Rescaling Fix (Root Cause CANN-8B Regression)**: `f8915db` verwendete `7/max_abs` für beide — Weight-Packing UND Scale-Update. Scale-Update muss `max_abs/7` (invers) sein. Für max_abs=127 wurde FFN-Output um ~300× attenuiert → Signal-Collapse bei DeepNorm. Fix: Separate `pack_rescale` und `scale_rescale`.
-- **Split-Mode Guard Restoration**: `f8915db` entfernte `!m->use_f32_matmul` aus dem int4 FFN Dispatch. Dadurch wurden f32_bypass Modelle (CANN-8B) activation quantization ausgesetzt. Guard an allen 3 Dispatch-Punkten restauriert.
-- **Defense-in-Depth**: Python-Level Safety-Net im Büro (v2.11.3, `atlas_infer.py:379`) skippt int4 FFN für CANN-8B. C++ Root-Cause-Fix + Python-Sicherheitsschloss = doppelte Absicherung.
-- **PROFILE Telemetrie**: RDTSC-Mikro-Proben im Attention-Hotpath. Aufschlüsselung: nibble unpack (30%), scale multiply (29%), FMA (35%), block scale load (7%).
-- **Durchbruch**: Attention ist nur **3,4%** der Gesamtzeit. FFN gate+up (45%) + SiLU+down (25%) = **70% Bottleneck**. Int4 KV-Cache Overhead ist vernachlässigbar.
-- **31/31 Modelle getestet**: CANN-8B "Paris." korrekt, alle Regressionen grün.
-- **v2.12.0b** (C++ Root-Cause-Fix) + **v2.11.3** (Python Safety-Net) → **v2.12.0** merged.
-
-### v2.11.3 ✅ — CANN-8B int4 FFN Guard (ABGESCHLOSSEN, kein C++ Build)
-- **CANN-8B int4 FFN deaktiviert**: Der ttype=8 Dispatch in `forward_layer_internal` verwendet immer activation quantization, auch im f32_bypass-Mode. Bei DeepNorm-Architekturen (CANN-8B, hidden=4096) wird das Signal zerstört. Fix: `atlas_infer.py:379` überspringt `atlas_quantize_ffn_to_i4` für hidden>=4096 + vocab=73448.
-- **CANN-3B/0.5B**: int4 FFN bleibt aktiv (hidden=2560/1024, kein Signal-Collapse). ✅ Beide getestet.
-- **31/31 Modelle getestet**: CANN-8B "Paris." korrekt, CANN-3B "Paris." korrekt. 29 weitere per Regression.
-
-### v2.10.6 ✅ — OOM Error Propagation (Signal Chain) (ABGESCHLOSSEN)
-- **`ensure_cache` → `bool`**: Allocate both k/v caches before freeing old, `cache_max_seq_len` updated only on success. Safe partial free on failure.
-- **`ensure_buffers` → `bool`**: All 7 scratch buffers allocated before freeing old, `max_batch` updated only on success. Safe partial free on failure.
-- **`atlas_forward` → `int` Return**: Changed from `void` to `int` (0=success, -1=OOM). Checks both `ensure_buffers` and `ensure_cache` return values.
-- **`atlas_generate` / `atlas_generate_stream`**: Both prefill and decode loop call sites check `atlas_forward` return, free temporary allocations, return -1 on failure.
-- **`atlas_load`**: `fread` checks for directory entries and tensor names. Tensor data `atlas_valloc` checked. Corrupt/truncated files produce graceful error instead of segfault.
-- **Decompressors**: NULL checks in `atlas_decompress_all` (1 valloc), `atlas_decompress_ttype5` (1), `atlas_decompress_ttype7` (4), `atlas_decompress_ffn` (1), `atlas_quantize_ffn_to_i4` (1). Failed tensors skip with stderr error.
-- **`atlas_quantize_lm_head` / `atlas_lmhead_gemv`**: 3 + 2 allocations checked, early return on failure.
-- **Python FFI**: `dll.atlas_forward.restype` → `ctypes.c_int`. `forward()` raises `RuntimeError("ATLAS Core: Memory allocation failed during forward pass")` on non-zero return.
-- **37/37 `atlas_valloc` NULL-Checks**: Before: 12 (32%), after: 37 (100%). All critical paths guarded.
-- **55/55 Mock-Tests grün + 12/12 Sonde-Tests**: Keine Regression auf 7 Architekturen.
-- **`latest` tag gesetzt**: Zeigt auf v2.10.6.
-
-### v2.10.4 ✅ — BitCPM-CANN-1B/3B Support + Debug Print Fixes (ABGESCHLOSSEN)
-- **BitCPM-CANN-1B TQ1.0**: 28L/2048H/6144I/16:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 0.83 GB, MiniCPM v5 Tokenizer eingebettet. ChatML template: `<|im_start|>role\n{content}<|im_end|>\n`.
-- **BitCPM-CANN-3B TQ1.0**: 32L/2560H/10240I/32:2 heads/128hdim/73448vocab, Llama-Architektur (LongRoPE). 1.35 GB, MiniCPM v5 Tokenizer. Hybrid path. T=0/T=0.7 beide kohärent ("The capital of France is Paris. Paris is the most populous city in France...").
-- **Bug fix: Unconditional `logits[96944]` OOB Read**: Debug-Print in `atlas_generate` (Prefill top-5) las `logits[V-1]` mit V=73448. Der Print `logits[96944]` lag 586 Bytes über der Allokation → sporadischer Crash bei `0x...EAE0` je nach Heap-Layout. Fix: Alle unconditional Debug-Prints entfernt (attn_raw/attn_sft, DECLM/PRELM, LMHEAD, Prefill top-5, Decode top-5, before/after barriers).
-- **`[ACTDBG] max_val=` Spam entfernt**: Debug-Print in `matmul_tq2_f32` (lines 3490-3501) produziert >1000 Zeilen pro Forward. Entfernt.
-- **`ATLAS_DLL` env var fix**: `atlas_infer.py` prüfte `ATLAS_DLL`-Umgebungsvariable nur wenn `atlas.dll` nicht existierte. Fix: `ATLAS_DLL` überschreibt immer. Erleichtert Debug-DLL-Switching via `$env:ATLAS_DLL="C:\atlas\atlas_d.dll"`.
-- **Packing fix: ZIP-based pytorch_model.bin**: CANN-3B uses modern PyTorch ZIP serialization (not safetensors). Packer loads lazily via `torch.load` — no OOM.
-- **Performance**: 9.7 tok/s auf i7-7700T (CANN-1B, T=0.7, top_k=40, 30 Tokens).
-- **43/43 Mock-Tests grün**: 4 zusätzliche BitCPM-Tests. Keine Regression auf 7 Architekturen.
-
-### v2.10.3 ✅ — Bug Hunt Round 2+3 + Llama3-Support (ABGESCHLOSSEN)
-- **12 Bugs gefunden & gefixt**: Bug #1 (Falcon3 BPE Vocab cutoff), Bug #2 (Llama3 stops in generate_c), Bug #3 (Llama3 special token suppression), Bug #4 (unaligned `*(uint32_t*)ap` → memcpy), Bug #5 (rope_interleaved Heuristik überschreibt config.json), Bug #6 (xoshiro_state global → thread_local), Bug #7 (g_has_avx512_vnni Init-Race), Bug #8 (EOS sentinel=0 konfligiert mit Token-ID 0), Bug #9 (fehlende BitNet-Stops in generate_c/_cpp_decode/generate), Bug #10 (silent except:pass → warn).
-- **Llama3-8B-1.58-100B-tokens**: 32L/4096H/14336I, GQA (8 KV heads), QK-Norm, Tie Embeddings, V=128256. 256 added tokens (IDs 128000-128255) in v6 binary tokenizer. Instruct model (Llama3 chat template). T=0 argmax: stable (correct "Paris."). T=0.7: unstable sampling (model-inherent).
-- **v6 added_tokens Support**: C++ preencode scannt longest-first via sortierte `added_specs`. Decode per ID-Nachschlag. Preencode integriert in `tokenize_to_ids()`.
-- **`rope_interleaved_set` Flag**: Neues Struct-Feld. Config-JSON setzt es → Heuristik in `ensure_layer_idx` feuert nicht. Default `true` (interleaved). Qwen3/Bonsai setzen auf `false` (half-split).
-- **39/39 Mock-Tests grün**: 7 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant, Llama3, Bonsai). E2E v6 tokenizer roundtrip mit added_tokens.
-- **8/8 HF-Modelle regression-getestet**: Falcon3 (1B/3B/7B/10B), Bonsai (1.7B/4B/8B), BitNet-2B4T — alle heruntergeladen, inferiert, gelöscht. Keine Regression.
-
-### v2.10.2 ✅ — Consistent Naming + HF-Repos + Bugfixes (ABGESCHLOSSEN)
-- **HF-Repos konsistent**: Falcon3 Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. Bonsai-8B in Performance-Tabelle ergänzt.
-- **`matmul_reorder_deq` pre-divide**: Scale-Division (÷127) zur Pack-Zeit, runtime nur noch Mul — minimale Optimierung.
-- **v2.10.2 getaggt und gepusht** ✅.
-
-### v2.10.1 ✅ — BitNet EOS Fix + HF-Deployment (ABGESCHLOSSEN)
-- **BitNet EOS Token Fix**: `build_tokenizer_binary` Pattern-Matching priority fix. `eos_token_id=128001` (BOS) → `128009` (`<|eot_id|>`). Generiert `"Paris.<|eot_id|>"`.
-- **HF-Deployment**: [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) (1.04 GB, MIT). [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) (3 Größen, Apache-2.0).
-- **v2.10.1 getaggt und gepusht** ✅.
-
-### v2.10.0 ✅ — Unified Packer + BF16 Weight-Scale Fix (ABGESCHLOSSEN)
-- **Unified `pack_to_atlas.py`**: Single packer replaces all individual packers (`atlas_packer.py`, `atlas_packer_g128.py`, `atlas_packer_bitnet.py`). Architecture auto-detection via `config.json`. Single pipeline for Falcon3/Qwen3/BitNet/TriLM/Llama.
-- **BF16 weight_scale Fix**: `weight_scale`-Tensoren sind bfloat16 dtype → `get_tensor_np()` mit `framework="np"` wirft Exception → `scales.get(sname, 1.0)` liefert immer 1.0. Fix: Fallback auf `reader.get_bf16_manual(tname)` in `pack_to_atlas.py:510-519`. Betrifft Falcon3, BitNet und alle Modelle mit BF16 weight_scale.
-- **4 Falcon3 Modelle gepackt**: 1B (1.22 GB) ✅ "Paris." korrekt, 3B (1.97 GB) ✅ "Paris." korrekt, 7B (2.75 GB), 10B (3.28 GB).
-- **Scale-Formel Analyse**: `matmul_reorder_deq` und `matmul_f32_reorder` dividieren durch scale (`sum / scale`) statt zu multiplizieren (`scale * sum`). Da dies ein konstanter Faktor auf alle Logits ist, hebt er sich in argmax/softmax auf → kein Einfluss auf Output-Qualität. Fix wäre `deq_scale = scale / 127.0f` statt `1/(127 * scale)`, aber nicht notwendig für korrekte Generierung.
-- **TQ2-Pfad korrekt**: Multipliziert explizit mit `scale` in Zeile 3495 (`sf = fp16_to_fp32(sptr[j]) * scale`).
-- **22/22 Mock-Tests**: CI grün. 5 Architekturen (Falcon3, falcon3-ttype0, Qwen3, BitNet, TurboQuant).
-- **Realistischer ttype=0 Mock**: `atlas_mock_model.py` mit `falcon3-ttype0` Arch, `pack_tq1_per_tensor()` für echten TQ1-Dispatch-Pfad.
-- **release_to_hf.py** unterstützt jetzt `--atlas-path` für Pre-Packed Files + HF-Upload mit korrektem YAML-Frontmatter.
-- **BitNet EOS Token Fix**: `build_tokenizer_binary` in `pack_to_atlas.py` hatte zwei Bugs: (1) `tid == 0` Fallback vor Pattern-Matching setzte `eos=0` zu früh, (2) config.json `eos_token_id=128001` (BOS) statt korrektem 128009 (`<|eot_id|>`). Fix: Pattern-Matching zuerst, `tid == 0` Fallback entfernt, Header-EOS bevorzugt `tokenizer_config.json` String-Lookup via `tokenizer.token_to_id()`. BitNet generiert jetzt `"The capital of France is Paris.<|eot_id|>"` — korrektes Stoppen.
-- **BitNet HF-Deployment**: [`xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS`](https://huggingface.co/xxxn3m3s1sxxx/BitNet-2B4T-b1.58-ATLAS) — 1.04 GB, `base_model: microsoft/bitnet-b1.58-2B-4T`, `license: mit`, Tags: `ternary`, `quantized`, `atlas`, `tq1`, `cpu-optimized`, `bitnet`, `cpu-inference`.
-- **Bonsai HF-Deployment**: Alle 3 Bonsai-Modelle (1.7B/4B/8B) auf [`xxxn3m3s1sxxx/Ternary-Bonsai-*-ATLAS`](https://huggingface.co/models?search=xxxn3m3s1sxxx/Ternary-Bonsai) deployed — `base_model: prism-ml/Ternary-Bonsai-*-unpacked`, `license: apache-2.0`, Tags: `ternary`, `quantized`, `atlas`, `tq1`, `cpu-optimized`, `bonsai`, `llm`, `cpu-llm`, `edge-ai`, `no-gpu`, `efficient-inference`.
-- **bitnet_2b4t Mock-Modell**: `tests/atlas_mock_model.py` mit 2L/2560H/6912I/20/5 heads/128256 vocab, SubLN arch="bitnet", `f32_bypass`-Corridor-Test. 655 MB Datei, load/forward korrekt.
-- **`release_to_hf.py` BitNet-Unterstützung**: `_read_atlas_arch()`, `"2B"` Size-Detection, `is_bitnet`-Branch in README-Gen (MIT license, korrektes Prompt-Template).
-- **DLL+CLI Build OK**: Release-Build kompiliert sauber.
-- **v2.10.0 getaggt und gepusht** ✅.
-
-### v2.9.3 ✅ — AKI-Bug-Fix + HF-Alignment-Check + CI-Hardening (ABGESCHLOSSEN)
-- **AKI-Bug fix**: `row_dim==vocab_size` Heuristik in `atlas_api.cpp:707-710` durch Name-Guard abgesichert (`embed_tokens`/`token_embd` substring check via `m->tensor_names[i]`). Schützt vor Fehlklassifikation von 1D-Norm-Tensoren (`model.norm.weight`) als 2D-Embedding bei `hidden_dim == vocab_size`. In keinem Produktionsmodell getriggert (8/8 HF-Modelle OK), aber defensiv notwendig.
-- **HF-Alignment-Verifikation**: `scripts/verify_hf_alignment.py` — Zero-Download-Check gegen HuggingFace Hub (config.json + model.safetensors.index.json). **18 Modelle: 16 PASS, 0 FAIL, 2 SKIP** (restricted). Coverage: 4 Falcon3 + 3 Bonsai + 10 TriLM (99M→3.9B) + 1 BitNet (restricted). Auto-Discovery via `--discover` scannt alle bekannten HF-Orgs.
-- **TriLM 3.9B Blindspot entdeckt**: TriLM-Familie ist intern inkonsistent! ≤2.4B = SubLN (head_dim=64, 11 Tensoren), 3.9B = Standard-Llama (head_dim=128, 9 Tensoren, KEIN SubLN). `derive_arch` erkennt via head_dim-Schwelle (`trilm` vs `trilm_nosubln`). Packer muss beim Packen entsprechend triggern.
-- **Coverage gefixt**: Stale gcda/gcno-mismatch durch `del /Q *.gcda *.gcno` vor Rebuild. `compile.bat` läuft jetzt alle 44 Tests (inkl. OMP-Stress + E2E-Pipeline) unter Coverage. `--gcov-ignore-parse-errors` für Robustheit.
-- **CI gehärtet**: `build.yml` läuft jetzt `verify_hf_alignment.py` als eigenen Step. Coverage auf Linux+Windows inkl. OMP+E2E-Tests.
-- **Qwen-Arch-Differenzierung**: `qwen25` (ohne QK-Norm, `Qwen2ForCausalLM`) vs `qwen3` (mit QK-Norm, `Qwen3ForCausalLM`) — Arch-Detektion via `model_type`, nicht via Modell-ID.
-- **EOS-Fix aus tokenizer**: `eos_id` von `m->tok.special[0]` statt `header_guess(11)`. TriLM 1.5B jetzt korrektes EOS.
-- **2 neue C-APIs**: `atlas_set_rope_interleaved`, `atlas_set_rope_theta`.
-- **`tests/atlas_mock_model.py`**: Synthetische v8.8-Modelle (200-300 KB) mit echtem TQ1-Packing für 3 Architekturen. `pack_tq1_g128` aus Produktions-Packer.
-- **`tests/test_mock_model.py`**: 9 parametrisierte pytest-Tests (load/forward/batch × Falcon3/Qwen3/BitNet) in 1.14s.
-- **Regression**: Falcon3-3B "Paris" ✓, Bonsai-8B "Paris" ✓, TriLM-1.5B coherent ✓.
-
-### v2.8.0 ✅ — Load-Time int4 FFN Quantization (ABGESCHLOSSEN)
-- **New AVX2 kernel `atlas_matmul_i4_f32`**: Nibble-unpack + `(nibble^8)-8` sign-extension + `vpmaddubsw` — 64 elements per iteration.
-- **`atlas_quantize_ffn_to_i4()`**: Load-time int8→int4 conversion for gate/down/up FFN tensors. Clip to [-8,7], pack 2/byte. Guarded by `use_f32_matmul` for hybrid architecture safety.
-- **ttype=8 dispatch**: Gate+up and down projection branches in `forward_layer_internal`, inserted before ternary/f32/fallback dispatch.
-- **Lane-permute fix**: `_mm256_unpack*_epi8` per-128-bit-lane behavior corrected via `_mm256_permute2f128_si256`.
-- **Python reorder**: `set_use_f32_matmul()` called before `quantize_ffn_to_i4()` to ensure f32_bypass models skip int4 conversion.
-- **Target erreicht**: 7B +26% (2.5→3.15 tok/s), 10B +18% (1.9→2.25 tok/s). Alle 6 Modelle (3B/7B/10B/Bonsai-1.7B/Bonsai-4B/BitNet) korrekt.
-
-### v2.4.0 ✅ — Qwen3/Bonsai-Okosystem-Upgrade (ABGESCHLOSSEN)
-- **Packer (`atlas_packer_bonsai.py`)**: Tensor-Mapping (Qwen3→ATLAS), Skalierungsfaktor-Extraktion (`max(abs(w))`), Ternarisierung (`round(w/scale)`), 5-Trit-Packing.
-- **head_dim=128**: Alle Attention-Pfade (RoPE, Scores, Weighted Sum, KV-Cache) auf variablen head_dim umstellen.
-- **QK-Norm**: Zwei neue RMSNorm-Tensoren pro Layer (`q_norm`, `k_norm`) im Attention-Hotpath.
-- **Dynamisches Vocab**: `vocab_size` aus Datei-Header statt hardcoded 131072 (Bonsai: 151669). EOS/PAD-IDs aus Header.
-- **YaRN RoPE**: Frequenz-Skalierung mit NTK-Approximation für rope_theta=5M, factor=4.0.
-- **Tie Word Embeddings**: `lm_head` = `embed_tokens` (shared weights). Int8-Quantisierung des Embedding-Tensors.
-- **SwiGLU-Hotpath**: `gate`/`up` parallel berechnet, SiLU fusioniert — identisch zu Falcon3, kein Umbau nötig.
-- **Target**: Bonsai-4B TQ1.0 ~1.5 GB. Kompatibilität mit Qwen3 Familie.
-
-### v2.5.0 ✅ — Context Window Extension (ABGESCHLOSSEN)
-- **Ring Buffer KV Cache**: Zirkuläres Überschreiben der ältesten `max_seq_len` Positionen. `seq_now` kann `max_seq_len` überschreiten — der Cache wickelt modulo `max_seq_len` und überschreibt die ältesten Einträge.
-- **NTK Context Extension**: `ctx_scale = max_seq_len / base_seq_len` kompoundiert mit `rope_scale` für NTK-aware Frequenzanpassung. Erlaubt sanfte Skalierung über die trainierte Kontextlänge hinaus (z.B. 4K→8K für Falcon3, 8K→16K für Bonsai-4B).
-- **`set_base_seq_len()` API**: Neue C-API + Python-Methode. `base_seq_len` = trainierte Kontextlänge (z.B. 4096 Falcon3, 2048 Bonsai-1.7B, 8192 Bonsai-4B). NTK-Scaling wird automatisch angewandt wenn `max_seq_len > base_seq_len`.
-- **Dynamisches `max_seq_len`**: Pro `atlas_generate`-Aufruf konfigurierbar (Python: `generate_c(..., max_seq_len=8192)`).
-- **Kein RAM-Wachstum**: Cache bleibt `n_layers × n_kv_heads × max_seq_len × head_dim` — keine lineare Skalierung mit `seq_now`.
-- **Target erreicht**: 8K Kontext auf Falcon3-3B getestet, 16K auf Bonsai-4B getestet. Ring Buffer für 128→200+ Token Wrapping validiert.
-
-### v2.6.0 ✅ — Pipeline: SSE Web-Server + Prompt-Caching (ABGESCHLOSSEN)
-- **SSE Web-Server**: `atlas_server.py` — FastAPI/SSE-Wrapper für HTTP-Streaming. `/v1/chat/completions` Endpoint, `StreamingResponse` für token-by-token SSE.
-- **Prompt-Caching**: KV-Cache persistiert über `generate_c`-Aufrufe hinweg. `asyncio.Lock()` serialisiert Zugriff. `POST /reset` zum manuellen Cache-Leeren.
-- **`atlas_reset_cache()` C-API**: Neue C-Funktion + Python `AtlasModel.reset_cache()`. Zeros KV-Cache-Daten, Allokation bleibt erhalten.
-- **CI Pipeline**: `.github/workflows/build.yml` — GitHub Actions Build-Test auf Ubuntu/Windows/macOS mit Clang/LLVM. Automatischer Build bei Push auf main.
-- **Target**: 10B Chat-Client mit sub-second Prefill für kurze Folgefragen.
-
-### ❌ FLUX.2/Bonsai-Image Diffusion Post-Mortem (ABGEBROCHEN)
-- **Modell**: `prism-ml/bonsai-image-ternary-4B-unpacked` — FLUX.2 Klein 4B MMDiT (12 double blocks + 19 single blocks + 3 VAE).
-- **CPU-Port**: Komplette `atlas_diffusion.cpp` MMDiT-Implementierung in C++ mit TQ1 g128 Quantisierung, 28-step Heun 2nd-order Solver, CFG-guidance (scale=3-50), Ring-Buffer KV-Cache.
-- **Symptom**: "cat" und "robot" Prompts erzeugen nahezu identische Outputs (Korrelation 0.998). img_gate=0.1 limitiert text→img attention auf ~10%.
-- **Root Cause**: Die BF16 Ternary-Gewichte in den safetensors haben **36-47 eindeutige Nicht-Null-Werte pro Row** mit 11.8% durchschnittlicher relativer Standardabweichung. Der TQ1-Packer zerdrückt jede Row auf exakt `{-scale, 0, +scale}` — ein Verlust von >90% der Gewichts-Expressivität. Das Signal-Relief des Text-Embeddings kann durch die drei verbleibenden Zustände nicht abgebildet werden.
-- **Vergleich**: Offizielles PrismML-Demo verwendet GPU mit **HQQ int2 gemlite** auf vollen BF16-Gewichten — fundamental anderer Stack. Der GPU-Pfad behält die Multi-Scale-Struktur pro Row.
-- **Heun-Korrelationstest (28 steps)**: cat mean=0.773 std=5.247; robot mean=0.822 std=5.238; corr=0.9980; diff std=0.328. Heun half nicht — korrelation identisch zu Euler. std=5.2 vs erwartet ~1 zeigt Latent-Norm-Divergenz durch akkumulierte TQ1-Fehler über 28 Forward-Passes.
-- **Fazit**: TQ1-CPU-Path kann dieses Modell nicht prompt-differenzieren. Alle Source-Files und Test-Artefakte entfernt. Fokus zurück auf LLM-Inferenz (Plan B).
-
-## Version History
-
-| Version | Key Changes |
-|---------|-------------|
-| **v2.16.1** | **vpmaddubsw overflow fix in atlas_matmul_i8_f32**: XOR-0x80 centering + `_mm256_madd_epi16` replaces saturating `_mm256_maddubs_epi16`. Eliminates `row_sums` correction — `sum((act-128)×w) = sum(act×w) - 128×sum(w)`. Three secondary bugs fixed (`_mm256_set1_epi8(0x80)` zero-extension, tail loop uint8 wrap, same in `atlas_matmul_i4_f32`). 94 tests (27 parity + 67 mock) on 7 architectures. Bonsai-4B-Pro baseline: 19.2 tok/s (+10%). Confirm: hybrid+int4 path "achuachuachu" — f32_bypass is mandatory for Bonsai-4B (rope_theta=5M >= 3M). int4 FFN + fp32 activations deferred (nibble-unpack overhead uncertain). CI: macOS ARM64 `--break-system-packages` fix for PEP 668. **ARM64 NEON kernel audit**: alle 8 Kernels mathematisch äquivalent zu x86. Tail-loop Bug gefixt (`(int)(a[c]-128)` → `((int)a[c]-128)` in `atlas_matmul_i8_f32`, Dead Code aber defensive Korrektheit). |
-| **v2.16.0** | **Triangular tiled weighted sum**: Same 32×32 three-zone SKIP/DENSE/PARTIAL over the `s`-dimension. Output-init in tile `s0==0` only. DENSE path: full FMA without branching. SKIP path: zero V-cache reads (2 KB/tile/KV-head stays hot in L1d). B=1024: weighted sum 57.7s (−35.7% from baseline). Total 656.1s (−27.8% from baseline). 64/67 mock tests. |
-| **v2.15.0** | **Triangular tiled QK-scores**: Replaced the single `#pragma omp parallel for` over all heads×positions with a tile-loop over 32×32 key-position tiles. Three-zone dispatch: SKIP (~48% tiles, zero compute), DENSE (~48%, branchless AVX2), PARTIAL (~3%, per-element causal check). Eliminates all O(B²) computation for future tokens. Per-query thread-local scores buffer initialized to -1e9f — SKIP/PARTIAL stay masked. B=1024: scores 292s (−43.1%), total 664s (−26.9%). Bonsai-4B-Pro decode: 12.65 tok/s (+16%). 64/67 mock tests. |
-| **v2.14.0** | **OMP schedule(dynamic) + i8 Prefetch Removal**. `schedule(dynamic, 64)` on `atlas_matmul_i8_f32`, `atlas_matmul_i4_f32`, `atlas_matmul_i4_vnni` — prevents cache-miss stragglers from blocking OMP barriers. `schedule(dynamic, 32)` on 4-row grouped hybrid int8 gate+up. Removed stale `_MM_HINT_T1` from i8 and VNNI kernels (consistent with v2.13.0). 64/67 mock tests. Bonsai-4B-Pro: 10.57→10.91 tok/s (+3% within noise). Key insight: dynamic scheduling overhead negligible (~4 µs for 38 chunks), but DRAM bandwidth remains the real bottleneck — no schedule change can fix that. |
-| **v2.13.0** | **Fused Gate+Up Attempt + Prefetch Removal (−7.5% fused, +5.1% prefetch removal)**. `matmul_i4_fused_gate_up` kernel with 4-row grouping (−7.5% — activation in L1d, register pressure, OMP granularity). NTA prefetch attempt (−3.7% — fill buffer overflow). Winner: removed T1 software prefetch from `atlas_matmul_i4_f32` (+5.1%). Hardware L2 streamer handles row-stride prefetch autonomously. 55/55 mock tests. Key insight: activation (4KB) sits entirely in L1d for decode; real bottleneck is 56 MB DRAM bandwidth for gate+up weights. |
-| **v2.12.0** | **Int4 KV-Cache + Defense-in-Depth + Telemetry**. Int4 KV-Cache mit Ring-Buffer + Tiling (3,56× compression, <3,4% overhead). Int4 FFN Rescaling Fix (CANN-8B root cause: `7/max_abs` vs `max_abs/7`). Split-mode Guard Restoration. Python Safety-Net (v2.11.3). PROFILE RDTSC Mikro-Telemetrie. 31/31 Modelle getestet. FFN = 70% Bottleneck — KV-Cache freigesprochen. |
-| **v2.11.3** | **CANN-8B int4 FFN Guard**. Der ttype=8 Dispatch verwendet activation quantization auch in f32_bypass — bei DeepNorm (CANN-8B, hidden=4096) Signal-Collapse. Skip in `atlas_infer.py:379` für hidden>=4096 + vocab=73448. CANN-3B/0.5B int4 bleibt aktiv. 31/31 Modelle getestet. |
-| **v2.11.2** | **Bug Hunt Round 4: f32_bypass Auto-Detection + Llama3 Base Fix**. CANN 3B/8B f32_bypass via vocab=73448. TriLM-2.4B f32_bypass via head_dim=64. Llama3 Base: kein Chat-Template. 29/29 Modelle getestet. |
-| **v2.11.1** | **Kernel Cleanup + tritplane3 Dok**. `ternary_tensors`-Infrastruktur entfernt (pre-ternarized path in `quantize_tq1_block_scaled`, `extract_ternary_and_fp32`, lookup + pre-shuffle in packer). `docs/double-quant.md`: Warum tritplane3 + TQ1.0 Signal-Collapse produziert (48% Gesamtfehler), per-row int8 als einzig stabile Brücke. `pack_to_atlas.py`: 92 Zeilen entfernt. Benchmark bestätigt: Bonsai-1.7B (7.8 tok/s), Bonsai-4B (3.0 tok/s), tritplane→per-row int8 (7.1-8.4 tok/s). |
-| **v2.11.0** | **Falcon-E Edge + TriLM Full Series + CI Hardening**. Falcon-E 1B/3B Base+Instruct TQ1.0 (BitNet 1.58 arch). TriLM 99M–560M added (9-model series). CANN dual EOS, thread_local block scales, relaxed QK-Norm guard. README: TriLM, Falcon-E, Llama3-8B-1.58 entries. CI: sanitizer-build (ASan+UBSan), coverage gates, pip cache, fail-fast, macOS fix, release_to_hf.py Falcon-E support. 58/58 mock tests across 9 architectures. |
-| **v2.10.6** | **OOM Error Propagation (Signal Chain)**: Complete memory failure cascade from `atlas_valloc` NULL → `generate_c` → Python `RuntimeError`. `atlas_forward` → `int` (-1/0), `ensure_cache`/`ensure_buffers` → `bool`, all 37 `atlas_valloc` NULL-checked, all 6 `fread` checked, 7 decompressors NULL-checked. 55/55 mock tests, 12/12 sonde. |
-| **v2.10.4** | **BitCPM-CANN-1B Support + Debug Print Crash Fix**: 28L/2048H/6144I/16:2 heads/73448vocab, Llama-Architektur (LongRoPE), MiniCPM v5 Tokenizer. Unconditional `logits[96944]` OOB Read in Debug-Print gefixt (586 Bytes über Allokation bei V=73448). Alle unconditional Debug-Prints entfernt. `ATLAS_DLL` env var fix (überschreibt jetzt immer). 9.7 tok/s auf i7-7700T. |
-| **v2.10.3** | **Bug Hunt Round 2+3 + Llama3-Support**: 12 Bugs gefixt (Falcon3 BPE Vocab cutoff, Llama3 stops/specials, unaligned memcpy, rope_interleaved Heuristik, xoshiro_state thread_local, VNNI Init-Race, EOS sentinel=0→None, BitNet-Stops, silent except→warn). v6 added_tokens Support (IDs 128000-128255, longest-first preencode). `rope_interleaved_set` Flag. Llama3-8B-1.58-100B-tokens Base Model (32L/4096H/14336I). 39/39 Tests, 7 Architekturen. |
-| **v2.10.2** | **Consistent Naming + HF-Repos**: Falcon3 HF-Modelle umbenannt zu `Falcon3-*-1.58bit-ATLAS`. `matmul_reorder_deq` pre-divide Optimierung. Bonsai-8B in Performance-Tabelle. |
-| **v2.10.1** | **BitNet EOS Fix + HF-Push**: `build_tokenizer_binary` Pattern-Matching priority fix. BitNet-2B4T + Bonsai (3 Größen) auf HF Hub deployed. `eos_token_id=128001→128009`. |
-| **v2.10.0** | **Unified Packer + BF16 Weight_Scale Fix**: `pack_to_atlas.py` ersetzt alle Einzel-Packer. BF16 weight_scale Fallback. 4 Falcon3 Modelle gepackt. BitNet EOS Token Fix. CLI Build OK. 22/22 Mock-Tests. |
-| **v2.9.2** | **Mock-CI-Infrastruktur + Bugfixes**: 3 Bugs gekillt (ttype=1 data_size heuristic, ensure_buffers Q-buffer overflow, _cache_indices BitNet stride). 2 neue C-APIs (atlas_set_rope_interleaved, atlas_set_rope_theta). `tests/atlas_mock_model.py` generiert synthetische v8-Modelle (200-300 KB) für 3 Architekturen (Falcon3/Qwen3/BitNet) mit echtem TQ1-Packing. `tests/test_mock_model.py`: 9 parametrisierte pytest-Tests (load/forward/batch) in 1.14s. EOS-fix aus tokenizer special[0] statt header-guess. Regression: Falcon3-3B/Bonsai-8B/TriLM-1.5B — 3/3 pass. |
-| **v2.9.1** | **Hardening-Release**: Windows UTF-8 argv über `CommandLineToArgvW`+`WideCharToMultiByte` — Umlaute/Akzente korrekt. 6 Argument-Guards (NaN/Overflow/Sektor 2). CI/CD Smoke-Test (`tests/test_mock_model.py`). Proaktiver CPUID-AVX2-Check (`check_avx2()`) mit Fehlermeldung statt SIGILL. cross-platform release.yml mit shell32. |
-| **v2.9.0** | **Standalone C++ CLI** (`atlas_cli.cpp`): 575 Zeilen, `LoadLibrary`/`dlopen` dynamisches DLL-Binding, interaktiver `/reset`-Modus, Chat-Template-Detection (Falcon3/BitNet/Qwen3), vollständiges Arg-Parsing. `compile.bat` baut jetzt `atlas.dll` + `atlas.exe`. GitHub Auto-Release (`release.yml`) mit Windows/Linux Zip/Tar + LLVM-Runtime-DLLs. README komplett umgeschrieben — Community-Framing. |
-| **v2.8.0** | **Load-time int4 FFN quantization (18-26% faster)**: New `atlas_matmul_i4_f32` AVX2 kernel — nibble-unpack + sign-extension via `(nibble^8)-8` + `vpmaddubsw`. `atlas_quantize_ffn_to_i4()` converts int8→int4 at load time, halves FFN memory bandwidth. ttype=8 dispatch in `forward_layer_internal` with `use_f32_matmul` guard for hybrid safety. 7B: 2.5→3.15 tok/s (+26%), 10B: 1.9→2.25 tok/s (+18%). Lane-permute bug fixed: `_mm256_unpack*_epi8` per-128-bit-lane issue patched via `_mm256_permute2f128_si256`. |
-| **v2.7.9** | **Fix duplicate attn_sub_norm (BitNet collapse)**: Merge-Artefakt in `forward_layer_internal` — sub-norm wurde zweimal auf Attention-Output angewandt. BitNet-2B4T: `/ / / / /` → `"The capital of France is Paris."`. `data_size`-Formel für ttype=5 korrigiert (`row_dim * n_blocks * 2`). |
-| **v2.7.7** | **BitNet Packing Fixes**: Fixed U8 bit ordering (Microsoft I2_S stores row 0 in high bits, was reading from low). Switched BF16 to per-tensor absmean + `weight_scale` loading. Fixed `data_size` header calc for ttype=5. U8 `--packed` path recommended. |
-| **v2.7.6** | **BitNet b1.58 Final Fixes**: AGENTS.md dimensions corrected to 30L/2560H/6912I/20/5 heads. ReLU² confirmed correct (Microsoft `hidden_act: "relu2"`). `--packed` flag for U8 pre-quantized Microsoft weights. Python BitNet detection (`_is_bitnet` via attn_sub_norm), correct chat template (`Role: content<|eot_id|>`), correct EOS (128009). Misidentification as Qwen3 fixed. |
-|---------|-------------|
-| **v2.7.5** | **ttype=5 Decompress + f32_bypass everywhere**: Reverted fused-kernel-only approach. All ttype=5 tensors decompressed to int8 at load. `f32_bypass` forced for block-scaled models (rope_theta≥3M or hidden≤2048) — no uint8+128 activation quant, no signal collapse. Bonsai-8B: 0.2→1.6-2.2 tok/s with perfect T=0.7 coherence. |
-| **v2.6.3** | **BitNet ARCH_BITNET + Repo Cleanup**: `atlas_ensure_layer_idx()` C API für Python `forward()`-Pfad. f32_bypass forced für SubLN-Architekturen (u8+128 Activation Quant zerstört ~0.01× SubLN-Signal). 91 Scratch-Dateien gelöscht, tote Packer entfernt, `.gitignore` gehärtet. |
-| **v2.6.2** | Safe decompress_ttype5 dispatch (try/except guard) |
-| **v2.6.1** | ttype=5 decompress + f32_bypass for all block-scaled models |
-| **v2.6.0** | **SSE Web-Server + Prompt-Caching**: `atlas_server.py` — FastAPI/SSE `/v1/chat/completions`, `atlas_reset_cache()` C-API + Python wrapper, `asyncio.Lock()`-serialisierter Cache, `.github/workflows/build.yml` CI Pipeline (Ubuntu/Windows/macOS). |
-| **v2.4.1** | **Static Analysis Bug Hunt**: 5 C++ bugs fixed (strict aliasing `*(uint16_t*)(odd_addr)`→memcpy, negative memset, unaligned AVX2 cast→pre-decoded float scales, thread-unsafe `static` buffers→`thread_local`). `atlas_decompress_all` now handles ttype=5 (g128 block-scaled) tensors — enables int8 cache for Bonsai models (10× speedup: 0.58→5.78 tok/s). Python `generate()` uses `_apply_chat_template()` for all paths (fixes Bonsai v5 template error). |
-| **v2.4.0** | **Qwen3/Bonsai-4B**: head_dim=128, QK-Norm, YaRN RoPE 5M+f4, Tie Embeddings, dyn. Vocab (151669), EOS/PAD aus Header, Bonsai-4B Packer (`atlas_packer_qwen.py`). C++: `rope_scale`/`layer_stride`-Setters, `ensure_layer_idx` mit stride-11-Detektion, QK-Norm in `atlas_attention_f32`, NTK-YaRN in RoPE-Schleife. ✅ Falcon3-1B Regression, ✅ Bonsai-4B 100 Tokens (kein Crash). |
-| **v2.3.1** | **Windows MSVCRT File-Buffer Hotfix**: `out.flush()` vor `out.seek(64)` im `atlas_packer.py` hinzugefügt. Verhindert Directory-Korruption bei Modellen >2 GB (7B v6). 7B v6 lädt nun fehlerfrei und generiert korrekt. |
-| **v2.3.0** | **Int8 KV-Cache Quantisierung**: FP16→int8 mit dynamischer Skalierung pro (KV-Head, Position). Cache aus API-Signaturen entfernt, vollständig intern im `AtlasModel`-Struct via `ensure_cache()`. SIMD-In-Flight-Dequantisierung im Attention-Hotpath. 10B@4K: 320 MB → 173 MB RAM. Python-Schnittstelle bereinigt (kein manuelles Cache-Array-Management mehr). |
-| v2.2.2 | F16C in attention score + weighted sum (batch _mm256_cvtph_ps + FMA), 10B +47%, 3B +5.7% |
-| v2.2.1 | BPE-PQ priority queue in tokenizer merge (O(n²)→O(n log n)), 1401 tokens in 24ms |
-| v2.2.0 | TQ1-LUT in decompression (replace %3//3 with lookup), F16C (_mm256_cvtph_ps) for fp16→fp32 in RMSNorm + scalar, ~30% throughput gain on 3B/10B |
-| v2.1.1 | Repetition penalty in C-core (before top-k), exposed in Python generate_c/generate_stream |
-| v2.1.0 | Streaming `atlas_generate_stream` callback C API, Python `generate_stream` generator, `set_system_prompt`, chat history via `list[dict]` messages |
-| v2.0.4 | softmax sampling (replace Gumbel-max), thread_local→static revert, AGENTS.md benchmarks corrected, default T=0.7 |
-| v2.0.3 | thread_local buffers, cache validation, std::call_once, seq clamp, seed fix |
-| v2.0.1 | Task 0: scores alloca → heap (stack fully sterile) |
-| v2.0.0 | C++ binary tokenizer (v6 format, no transformers dep) |
-| v1.4.0 | Stack overflow fix (attn_ws heap alloc), survivor-list sampling |
-| v1.3.2 | Hybrid mode (FFN int8 + QKV packed), per-tensor dispatch |
-| v1.3.1 | Direct TQ1-packed matmul + atlas_set_num_threads |
-| v1.3.0 | Ternary-add kernel (_mm256_sign_epi8), eliminates row_sum correction |
-| v1.2.0 | C++ sampling (Xoshiro256**, Gumbel-max), atlas_generate |
-| v1.1.0 | AllocHdr-based valloc/vfree, production hardening |
-| v1.0.0 | Initial release — TQ1.0 inference engine |
+Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synthetische `.atlas`-Modelle (200-300 KB) automatisch in `mock/`. `KMP_DUPLICATE_LIB_OK=TRUE` auf Windows setzen für MKL-Kompatibilität.
 
 ## File Layout
 
-- `atlas_api.cpp` — Full engine: AVX2 kernels, attention, RMSNorm, sampling, generate loop
-- `atlas_cli.cpp` — Standalone C++ CLI (LoadLibrary/dlopen, Arg-Parsing, Chat-Template, Interactive)
-- `atlas_infer.py` — Python `AtlasModel` class with `generate_c()`
-- `atlas_ffi.h` — C API declarations (v6 header layout)
-- `pack_to_atlas.py` — **Unified packer** (v2.10.0): auto-detects architecture from config.json, single pipeline for Falcon3/Qwen3/BitNet/TriLM/Llama. Deprecates individual packers.
-- `atlas_packer_mappings.py` — Architecture definitions used by `pack_to_atlas.py` (tensor name patterns, quantization rules, flags per arch).
-- `atlas_packer.py` — [DEPRECATED] v5/v6 format writer for Falcon3 models. Use `pack_to_atlas.py`.
-- `atlas_packer_g128.py` — [DEPRECATED] Block-scaled g128 packer for Bonsai/Qwen3. Use `pack_to_atlas.py`.
-- `atlas_packer_bitnet.py` — [DEPRECATED] BitNet b1.58 packer. Use `pack_to_atlas.py`.
-- `atlas_server.py` — FastAPI SSE Web-Server mit Prompt-Caching (v2.6.0)
-- `scripts/release_to_hf.py` — Deployment-Wrapper: packt Modell via `pack_to_atlas.py` + optionaler HF-Hub-Upload (`--push`). Generiert YAML-Frontmatter (base_model, license, tags per Architektur-Familie). Keine Netzwerk-Abhängigkeit im Kern-Packer.
-- `add_v6_block.py` — Append v6 binary tokenizer block to existing v5 files
-- `compile.bat` — Windows Build-Script (DLL + optional CLI)
-- `tests/atlas_mock_model.py` — Minimales Mock-Modell für CI-Smoke-Tests (7 Architekturen, TQ1-Packing)
-- `tests/test_mock_model.py` — CI Smoke-Test (39 parametrisierte Tests)
-- `.github/workflows/build.yml` — CI Pipeline: Build-Test auf Ubuntu/Windows/macOS
-- `.github/workflows/release.yml` — Auto-Release bei v*-Tag (Windows/Linux Zip/Tar)
+| File | Role |
+|------|------|
+| `atlas_api.cpp` | Engine: AVX2-Kernels, Attention, RoPE, Sampling, Generate-Loop |
+| `atlas_kernel_arm64.cpp` | NEON-Äquivalente (8 Kernels, v2.16.1) |
+| `atlas_vnni.cpp` | VNNI-Kernel (x86, AVX-VNNI falls verfügbar) |
+| `atlas_cli.cpp` | Standalone-CLI (LoadLibrary/dlopen, Chat-Template) |
+| `atlas_infer.py` | Python `AtlasModel`-Klasse mit `generate_c()` |
+| `atlas_server.py` | FastAPI/SSE `/v1/chat/completions` mit Prompt-Caching |
+| `atlas_ffi.h` | C-API-Contract + v6-Header-Layout |
+| `pack_to_atlas.py` | Unified Packer: HF safetensors → TQ1.0 (auto-detect) |
+| `atlas_packer_mappings.py` | Architektur-Definitionen pro Modell-Familie |
+| `compile.bat` | Windows-Build |
+| `compile-linux.sh` | Linux-Build |
+| `scripts/release_to_hf.py` | Pack + optional HF-Upload |
 
-## Technical Details
+## Critical Gotchas
 
-- **v5 format**: `[header:64] [dir:n*12] [name_block] [token_data...] [tokenizer_block]`. Header bytes 29-32: tokenizer_size, 33-36: tokenizer_offset.
-- **v6 format**: v5 + binary tokenizer block (128-byte header, offsets/lengths/pool, BPE merges, byte_encoder, special tokens).
-- **v6 added_tokens**: Up to 256 extra tokens (IDs ≥ V) stored in binary tokenizer block. Encoded as `(offs[10], offs[11], offs[12], len_specials)` in 128-byte header. `offs[10]` = special_pool_offset, `offs[11]` = special_pool_len, `offs[12]` = special_map_offset. Preencode scans longest-first via `memcmp`. Decode looks up by ID.
-- **Chat template**:
-  - Falcon3: `<|role|>\n{content}\n` — NO `<|im_end|>` tokens. Generation: `<|assistant|>\n`.
-  - BitCPM-CANN/Qwen3/Bonsai: `<|im_start|>role\n{content}<|im_end|>\n` (ChatML). Generation: `<|im_start|>assistant\n`.
-  - BitNet: `{Role}: {content}<|eot_id|>\n` — generation: `Assistant: `. EOS `<|eot_id|>` = 128009.
-  - Llama3 (Instruct): Chat template `<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`. T=0 argmax stabil, T=0.7 Sampling instabil (Modell-Limit, 1.58 Bit). Stopp-Tokens: `<|eot_id|>`, `<|start_header_id|>`, `<|end_header_id|>`.
-  - **CANN EOS tokens**: Both `</s>` (ID 2) and `<|im_end|>` (ID 73440) act as end-of-sequence. Python stop_tokens catches both.
-- **Sampling overhead**: 1B top_k=40+p: ~3 tok/s (survivor-list makes top_p ≈ free after top_k).
-- **Prefill**: All prompt tokens processed in single batched `atlas_forward` call (B=prompt_len).
-- **Cache**: `.i8` cache auto-generated on first full int8 decompress, mmap'd on reload.
+- **f32_bypass**: Auto-enabled für `hidden <= 2048`, `rope_theta >= 3M`, oder `ARCH_BITNET`. Hybrid/int4-Pfad erzeugt "achuachuachu"-Garbage bei rope_theta >= 3M (Bonsai-4B/8B, CANN 3B/8B). Bei Bonsai-8B (`rope_theta=1M` < 3M) nicht auto-triggered → `AtlasModel(..., use_f32_matmul=True)` setzen.
+- **`ATLAS_DLL` env**: Überschreibt den DLL-Pfad. `$env:ATLAS_DLL="C:\atlas\atlas_d.dll"` für Debug-Switching.
+- **int4 FFN**: Nur für memory-bandwidth-gebundene Modelle (7B +26%, 10B +18%). Für compute-gebundene (Bonsai-4B) ist int8 optimal. Automatisch geskippt für f32_bypass-Modelle.
+- **Chat Templates pro Arch**:
+  - Falcon3: `<|role|>\n{content}\n`, Generation: `<|assistant|>\n`
+  - Qwen3/Bonsai/CANN: ChatML (`<|im_start|>role\n...<|im_end|>\n`)
+  - BitNet: `{Role}: {content}<|eot_id|>\n`, EOS=128009
+  - Llama3 Instruct: `<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`
+  - Llama3 Base: Kein Template anwenden!
+- **CANN dual EOS**: Sowohl `</s>` (ID 2) als auch `<|im_end|>` (ID 73440) terminieren.
+- **C++ binary tokenizer**: v6-Format, kein transformers-Dependency zur Runtime. `tokenizers`-Lib nur für Python-seitiges Encoding nötig.
+- **ARM64 Port**: `atlas_kernel_arm64.cpp` wird bei x86-Build nicht kompiliert. Build mit `-D__aarch64__`. `__arm64__` statt `__aarch64__` unter Homebrew LLVM → die Portabilitäts-Block mapped auch `_M_ARM64`.
+- **KV Cache Reset**: `model.reset_cache()` nach Kontext-Wechsel. Ring-Buffer überschreibt älteste Positionen bei `seq_now > max_seq_len`.
 
-## ARM64 NEON Parity (v2.16.1)
+## Skills (in .opencode/skills/)
 
-`atlas_kernel_arm64.cpp` (856 Zeilen) stellt NEON-Äquivalente für alle heißen x86-Pfade bereit:
+- `atlas-build`: Build-Prozess (Release/Debug/Coverage/ARM64)
+- `atlas-kernel`: AVX2-Matmul, NEON, Kernel-Entwicklung
+- `atlas-hashline`: Hash-anchored Editing für atlas_api.cpp
+- `atlas-benchmark`: Performance-Messung (tok/s, Ladezeit)
 
-| Kernel | NEON-Status | Anmerkungen |
-|--------|-------------|-------------|
-| `matmul_i8_f32` | ✅ XOR-0x80 + `vdotq_s32` | `vdotq_s32` akkumuliert direkt in int32 — keine `vpmaddubsw`-Sättigung |
-| `matmul_i4_f32` | ✅ `vzipq_s8` Nibble + XOR-0x80 | Tail loop via `(a[c] ^ 0x80)`, korrekt |
-| `matmul_ternary_f32` | ✅ `vdotq_s32` + XOR-0x80 | Tail loop via `(int)a[c] - 128`, korrekt |
-| TQ1 fused (s8) | ✅ Fused decode + `vdotq_s32` | Kein x86-Äquivalent (x86 trennt decode + matmul) |
-| TQ1 fused (f32) | ✅ Fused decode + `vfmaq_f32` | Kein x86-Äquivalent |
-| TQ2 s8/f32 | ✅ Delegiert an fused_* | Wrapper |
-| Fused gate+up (f32) | ✅ `vfmaq_f32` | Tail loop via float, korrekt |
-| Fused gate+up (default) | ✅ XOR-0x80 + `vdotq_s32` | Tail loop via `(int8_t)(a[c] ^ 0x80)`, korrekt |
+## TQ1.0 Format Summary
 
-**Audit-Ergebnis**: Alle 8 Kernels mathematisch äquivalent zu x86. Einziger Fix (v2.16.1): Tail-Loop-Bug in `atlas_matmul_i8_f32` (Zeile 178), `(int)(a[c] - 128)` → `((int)a[c] - 128)`. Dead Code für alle Produktionsmodelle (`cols % 16 == 0`), aber defensive Korrektheit.
-
-**Key insight**: ARM64 NEON hatte nie das `vpmaddubsw`-Sättigungsproblem, weil `vdotq_s32` direkt in int32 akkumuliert. Die x86-seitige Zentrierungs-Formel (XOR-0x80 + `_mm256_madd_epi16`) war auf ARM64 seit jeher korrekt implementiert.
+- 5 ternäre Trits pro Byte (Base-3), ~1.58 bits/weight
+- v6 Header: 64 Bytes, gefolgt von Tensor-Directory, Name-Block, Tensor-Daten, Binary-Tokenizer
+- ttype=0: TQ1 packed, ttype=3: int8 dekomprimiert, ttype=5: TQ1 g128 block-scaled, ttype=8: int4 packed, ttype=10: TQ2 universal
+- `.i8` Cache: Auto-generiert bei erstem int8-Decompress, mmap'd beim Reload

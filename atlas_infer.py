@@ -11,6 +11,11 @@ _dll_name = "atlas.dll" if sys.platform == "win32" else "libatlas.so"
 _dll_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _dll_name)
 if "ATLAS_DLL" in os.environ:
     _dll_path = os.environ["ATLAS_DLL"]
+if sys.platform == "win32":
+    os.add_dll_directory(os.path.dirname(_dll_path))
+    _llvm_bin = r"C:\llvm-mingw\llvm-mingw-20260505-ucrt-x86_64\bin"
+    if os.path.isdir(_llvm_bin):
+        os.add_dll_directory(_llvm_bin)
 dll = ctypes.CDLL(_dll_path)
 
 dll.atlas_load.restype = ctypes.c_void_p
@@ -969,7 +974,7 @@ class AtlasModel:
 
     def generate_c(self, prompt, max_new_tokens=50, temperature=0.7,
                    top_k=40, top_p=0.9, repetition_penalty=1.0,
-                   max_seq_len=None, min_new_tokens=20, cache_enabled=True):
+                   max_seq_len=None, min_new_tokens=0, cache_enabled=True):
         """Generate via atlas_generate (single C call, v1.2.1).
         max_seq_len: override KV cache window (default: self.max_seq_len).
         min_new_tokens: suppress EOS for first N generated tokens.
@@ -1024,6 +1029,11 @@ class AtlasModel:
             idx = decoded.find(stop)
             if idx >= 0:
                 decoded = decoded[:idx]
+        import re
+        decoded = re.sub(r'\n```+\s*$', '', decoded)
+        decoded = re.sub(r'\n#{1,6}\s*$', '', decoded)
+        decoded = re.sub(r'\n\}+\s*$', '', decoded)
+        decoded = decoded.rstrip()
 
         # Update persistent cache state
         if cache_enabled and n_gen > 0:
@@ -1037,7 +1047,7 @@ class AtlasModel:
 
     def generate_stream(self, prompt, max_new_tokens=200, temperature=0.7,
                         top_k=40, top_p=0.9, repetition_penalty=1.0,
-                        max_seq_len=None, min_new_tokens=20, cache_enabled=True):
+                        max_seq_len=None, min_new_tokens=0, cache_enabled=True):
         """Streaming generator — yields token IDs as they are produced.
         max_seq_len: override KV cache window (default: self.max_seq_len).
         min_new_tokens: suppress EOS for first N generated tokens.

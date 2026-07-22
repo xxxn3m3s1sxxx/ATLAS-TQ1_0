@@ -27,6 +27,27 @@ if %ERRORLEVEL% NEQ 0 (
 )
 echo [Atlas] OK -- atlas.dll built
 
+REM Auto-copy libomp.dll from LLVM-MinGW if not present
+if not exist libomp.dll (
+    for /d %%D in ("C:\llvm-mingw\llvm-mingw-*\bin") do (
+        if exist "%%D\libomp.dll" (
+            copy /Y "%%D\libomp.dll" libomp.dll >nul 2>nul
+            echo [Atlas] Copied libomp.dll from %%D
+            goto :omp_done
+        )
+    )
+    REM Also check LLVM-MinGW with ucrt subfolder
+    for /d %%D in ("C:\llvm-mingw\llvm-mingw-*\x86_64-w64-mingw32\bin") do (
+        if exist "%%D\libomp.dll" (
+            copy /Y "%%D\libomp.dll" libomp.dll >nul 2>nul
+            echo [Atlas] Copied libomp.dll from %%D
+            goto :omp_done
+        )
+    )
+    echo [Atlas] WARNING -- libomp.dll not found, OpenMP may fail at runtime
+)
+:omp_done
+
 echo [Atlas] Compiling atlas.exe (standalone CLI)...
 %CC% -o atlas.exe atlas_cli.cpp -O2 -std=c++17 -lshell32
 if %ERRORLEVEL% EQU 0 (

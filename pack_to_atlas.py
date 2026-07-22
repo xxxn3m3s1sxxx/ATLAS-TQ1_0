@@ -661,9 +661,19 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
     head_dim = cfg.get("head_dim", hidden // n_heads)
     rope_theta = cfg.get("rope_theta", 10000.0)
 
+    # MoE-specific config (DeepSeek-V2 / V2-Lite)
+    n_routed_experts = cfg.get("n_routed_experts", 0)
+    n_shared_experts = cfg.get("n_shared_experts", 0)
+    first_k_dense_replace = cfg.get("first_k_dense_replace", 0)
+    moe_intermediate_size = cfg.get("moe_intermediate_size", inter)
+    num_experts_per_tok = cfg.get("num_experts_per_tok", 0)
+
     print(f"[ATLAS] {model_dir}")
     print(f"  Layers:{n_layers} Hidden:{hidden} Heads:{n_heads}/{n_kv_heads}")
     print(f"  Intermediate:{inter} Vocab:{vocab} Head_dim:{head_dim}")
+    if n_routed_experts > 0:
+        print(f"  MoE: {n_routed_experts} experts, {n_shared_experts} shared, "
+              f"top-{num_experts_per_tok}, dense_replace={first_k_dense_replace}")
 
     # ── Open reader ────────────────────────────────────────────────
     reader = SafetensorsReader(model_dir, in_memory=in_memory_tensors)
@@ -700,12 +710,39 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
     # ── Build ordered tensor list ──────────────────────────────────
     tensor_names = []
 
-    # Layer tensors
+    # Layer tensors (standard dense layers)
     for L in range(n_layers):
         for pattern in arch["layer_tensors"]:
             tname = pattern.format(L)
             if reader.has_tensor(tname):
                 tensor_names.append(tname)
+
+    # MoE tensors (if arch has MoE support)
+    if arch.get("is_moe") and n_routed_experts > 0:
+        for L in range(n_layers):
+            if L < first_k_dense_replace:
+                # Dense layer: add standard FFN tensors
+                for pattern in arch.get("moe_dense_ffn_patterns", []):
+                    tname = pattern.format(L)
+                    if reader.has_tensor(tname):
+                        tensor_names.append(tname)
+            else:
+                # MoE layer: router + expert weights + shared experts
+                # Router/gate weight (stored as fp16, NOT quantized)
+                router_name = arch["moe_router_pattern"].format(L)
+                if reader.has_tensor(router_name):
+                    tensor_names.append(router_name)
+                # Per-expert weights (will be quantized)
+                for E in range(n_routed_experts):
+                    for pattern in arch["moe_expert_patterns"]:
+                        tname = pattern.format(L, E)
+                        if reader.has_tensor(tname):
+                            tensor_names.append(tname)
+                # Shared expert weights (will be quantized)
+                for pattern in arch.get("moe_shared_patterns", []):
+                    tname = pattern.format(L)
+                    if reader.has_tensor(tname):
+                        tensor_names.append(tname)
 
     # Conditional layer tensors (optional, detected by presence)
     for L in range(n_layers):
@@ -829,6 +866,25 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             meta_bytes = struct.pack("<I", 4 + len(meta_json)) + meta_json
             struct.pack_into("<H", header, 5, 8)  # upgrade to v8
 
+        # v9 meta block (for MoE models: DeepSeek-V2/V3)
+        if n_routed_experts > 0:
+            meta = {
+                "arch": "deepseek_v2",
+                "n_routed_experts": n_routed_experts,
+                "n_shared_experts": n_shared_experts,
+                "first_k_dense_replace": first_k_dense_replace,
+                "moe_intermediate_size": moe_intermediate_size,
+                "num_experts_per_tok": num_experts_per_tok,
+                "rope_theta": rope_theta,
+                "kv_lora_rank": cfg.get("kv_lora_rank", 0),
+                "qk_nope_head_dim": cfg.get("qk_nope_head_dim", 0),
+                "qk_rope_head_dim": cfg.get("qk_rope_head_dim", 0),
+                "v_head_dim": cfg.get("v_head_dim", 0),
+            }
+            meta_json = json.dumps(meta).encode("utf-8")
+            meta_bytes = struct.pack("<I", 4 + len(meta_json)) + meta_json
+            struct.pack_into("<H", header, 5, 9)  # upgrade to v9
+
         # Name block
         name_bytes = b"".join(n.encode() + b"\0" for n in tensor_names)
         name_block = struct.pack("<I", 4 + len(name_bytes)) + name_bytes
@@ -848,9 +904,31 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
         for idx, name in enumerate(tensor_names):
             is_weight = "proj" in name and "weight" in name
+            # MoE router/gate weight: store as fp16, NOT quantized
+            is_moe_router = ("mlp.gate.weight" in name and
+                             "experts" not in name and
+                             "shared_experts" not in name)
 
             # ── Determine quantization path ──────────────────────────
-            if is_weight and raw_int8:
+            if is_moe_router:
+                # MoE router/gate weight: store as fp16 (needed for softmax)
+                try:
+                    tensor = reader.get_tensor_np(name)
+                except Exception:
+                    tensor = reader.get_bf16_manual(name)
+                if tensor.dtype in (np.float32, np.float64):
+                    tensor = tensor.astype(np.float16)
+                elif tensor.dtype == np.uint16:
+                    tensor = tensor.astype(np.float16)
+                if tensor.dtype != np.float16:
+                    tensor = tensor.astype(np.float16)
+                data_bytes = tensor.tobytes()
+                packed_per_row = 0
+                n_blocks = 0
+                row_dim = tensor.shape[0]
+                tens_ttype = 2  # fp16 matrix
+
+            elif is_weight and raw_int8:
                 # Raw int8 path: store dequantized weights as int8, skip ternary
                 try:
                     tensor_fp32 = reader.get_bf16_manual(name)

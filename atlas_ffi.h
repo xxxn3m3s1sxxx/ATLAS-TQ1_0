@@ -177,6 +177,10 @@ ATLAS_API int atlas_load_cache(void* model, const char* atlas_path);
 // Call after decompress or cache load to prevent pagefault stalls.
 ATLAS_API void atlas_prefetch_int8(void* model);
 
+// Repack MoE expert weights into contiguous memory for cache-friendly access.
+// Called automatically by atlas_load() for MoE models. Returns number of expert layers.
+ATLAS_API int atlas_repack_experts(void* model);
+
 // Set full-precision matmul mode (no activation quantization).
 // Enable for small models (1B) where u8 quantization degrades coherence.
 ATLAS_API void atlas_set_use_f32_matmul(void* model, int val);
