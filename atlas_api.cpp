@@ -816,12 +816,13 @@ struct AtlasModel {
 
     // Allocate FFN + attention scratch buffers for batch size B.
     // Returns false on allocation failure (old buffers preserved).
-    bool ensure_buffers(int B) {
+        bool ensure_buffers(int B) {
         if (B <= max_batch) return true;
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
         int max_aligned = ((max_dim + 7) + 31) & ~31;
-        int ws = (int)((size_t)B * n_heads * head_dim * 4);
+        int effective_hd = is_mla ? (qk_nope_head_dim + qk_rope_head_dim) : head_dim;
+        int ws = (int)((size_t)B * n_heads * effective_hd * 4);
         float* new_gate = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         float* new_up = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         float* new_hidden = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
@@ -854,12 +855,14 @@ struct AtlasModel {
         buf_out = new_out;
         attn_ws = new_ws;
         max_batch = B;
-        // MLA scratch buffers (allocated once, never reallocated)
-        if (is_mla && !buf_c_kv) {
+        // MLA scratch buffers (reallocate when batch grows)
+        if (is_mla) {
+            if (buf_c_kv) atlas_vfree((uint8_t*)buf_c_kv);
             buf_c_kv = (float*)atlas_valloc((size_t)B * kv_lora_rank * sizeof(float));
-        }
-        if (is_mla && n_experts > 0 && !buf_router) {
-            buf_router = (float*)atlas_valloc((size_t)B * n_experts * sizeof(float));
+            if (n_experts > 0) {
+                if (buf_router) atlas_vfree((uint8_t*)buf_router);
+                buf_router = (float*)atlas_valloc((size_t)B * n_experts * sizeof(float));
+            }
         }
         return true;
     }
@@ -4163,10 +4166,10 @@ static void matmul_ternary_add_reorder(int rows, int input_dim,
                 out4[sub] = (float)dot * max_abs[b] / (127.0f * scale);
             }
             float* dst = output + b * rows;
-            dst[0 * rows_packed + ur] = out4[0];
-            dst[1 * rows_packed + ur] = out4[1];
-            dst[2 * rows_packed + ur] = out4[2];
-            dst[3 * rows_packed + ur] = out4[3];
+            dst[ur * 4 + 0] = out4[0];
+            dst[ur * 4 + 1] = out4[1];
+            dst[ur * 4 + 2] = out4[2];
+            dst[ur * 4 + 3] = out4[3];
         }
     }
     #endif
@@ -5398,10 +5401,10 @@ static void matmul_f32_per_row(int rows, int input_dim,
                 out4[sub] = s / rsc[sub];
             }
             float* dst = output + b * rows;
-            dst[0 * rows_packed + ur] = out4[0];
-            dst[1 * rows_packed + ur] = out4[1];
-            dst[2 * rows_packed + ur] = out4[2];
-            dst[3 * rows_packed + ur] = out4[3];
+            dst[ur * 4 + 0] = out4[0];
+            dst[ur * 4 + 1] = out4[1];
+            dst[ur * 4 + 2] = out4[2];
+            dst[ur * 4 + 3] = out4[3];
         }
     }
 }
@@ -6159,7 +6162,7 @@ static void atlas_moe_forward(
 
     // ── 4. Shared experts (always active): gate + up → SiLU → down ──
     // Shared expert tensors at idx[6,7,8] — same format as dense FFN
-    {
+    if (n_shared > 0) {
         auto& t_sg = m->tensors[idx[6]];
         auto& t_su = m->tensors[idx[7]];
         auto& t_sd = m->tensors[idx[8]];
@@ -6302,15 +6305,18 @@ static void atlas_moe_forward(
             for (int i = inter; i < inter_sd; i++) tmp[i] = 0.0f;
         }
 
-        // down projection: tmp → output (m->buf_gate, accumulates MoE result)
+        // down projection: tmp → accumulate into output (m->buf_gate)
+        float* tmp_shared = m->buf_hidden;
         if (t_sd.ttype == 11) {
             const uint16_t* rs_fp16 = (const uint16_t*)(t_sd.data);
             const int8_t* w = (int8_t*)(t_sd.data + t_sd.row_dim * 2);
             int dim11 = t3_dim(t_sd);
-            matmul_f32_row_major_per_row_batched(t_sd.row_dim, dim11, w, m->buf_act, inter_sd, rs_fp16, output, B);
+            matmul_f32_row_major_per_row_batched(t_sd.row_dim, dim11, w, m->buf_act, inter_sd, rs_fp16, tmp_shared, B);
+            for (int i = 0; i < B * H; i++) output[i] += tmp_shared[i];
         } else if (t_sd.ttype == 3) {
             get_i8(t_sd, sd_w, sd_rs, sd_rows, sd_dim, sd_scale);
-            matmul_f32_row_major_batched(sd_rows, sd_dim, sd_w, m->buf_act, inter_sd, sd_scale, output, B);
+            matmul_f32_row_major_batched(sd_rows, sd_dim, sd_w, m->buf_act, inter_sd, sd_scale, tmp_shared, B);
+            for (int i = 0; i < B * H; i++) output[i] += tmp_shared[i];
         } else if (t_sd.ttype == 8) {
             uint16_t s16; memcpy(&s16, t_sd.data, 2); float sc = fp16_to_fp32(s16);
             int rows = t_sd.row_dim, pw = t_sd.packed_cols;
@@ -6344,10 +6350,11 @@ static void atlas_moe_forward(
                                                 : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
                             s += a[c] * (float)wv;
                         }
-                        output[b * rows + ur * 4 + sub] = s / sc;
+                        m->buf_hidden[b * rows + ur * 4 + sub] = s / sc;
                     }
                 }
             }
+            for (int i = 0; i < B * H; i++) output[i] += m->buf_hidden[i];
         }
     }
 }
