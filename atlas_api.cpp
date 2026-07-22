@@ -5832,6 +5832,7 @@ static void atlas_attention_mla(
 
                 // nope dot product: Q_nope[h] · K_nope[h]
                 int d = 0;
+#ifndef __aarch64__
                 __m256 sv_sum = _mm256_setzero_ps();
                 for (; d + 8 <= nope; d += 8) {
                     __m256 qv = _mm256_loadu_ps(qh + d);
@@ -5839,10 +5840,12 @@ static void atlas_attention_mla(
                     sv_sum = _mm256_fmadd_ps(qv, kv, sv_sum);
                 }
                 score = hsum_ps(sv_sum);
+#endif
                 for (; d < nope; d++) score += qh[d] * k_nope_h[d];
 
                 // rope dot product: Q_pe[h] · K_pe (shared across heads)
                 const float* q_pe = qh + nope;
+#ifndef __aarch64__
                 __m256 rv_sum = _mm256_setzero_ps();
                 d = 0;
                 for (; d + 8 <= rope; d += 8) {
@@ -5851,6 +5854,7 @@ static void atlas_attention_mla(
                     rv_sum = _mm256_fmadd_ps(qv, kv, rv_sum);
                 }
                 score += hsum_ps(rv_sum);
+#endif
                 for (; d < rope; d++) score += q_pe[d] * k_pe_f32[d];
 
                 scores[h * ring_len + s] = score * inv_sqrt_d;
@@ -5903,6 +5907,7 @@ static void atlas_attention_mla(
                 if (sc == 0.0f) continue;
                 const float* v_h = kv_out + v_offset + h * m->v_head_dim;
                 float* out_h = out_b + h * hd;
+#ifndef __aarch64__
                 __m256 sv = _mm256_set1_ps(sc);
                 int d = 0;
                 for (; d + 8 <= m->v_head_dim; d += 8) {
@@ -5913,6 +5918,10 @@ static void atlas_attention_mla(
                 }
                 for (; d < m->v_head_dim; d++)
                     out_h[d] += sc * v_h[d];
+#else
+                for (int d = 0; d < m->v_head_dim; d++)
+                    out_h[d] += sc * v_h[d];
+#endif
             }
         }
     }
