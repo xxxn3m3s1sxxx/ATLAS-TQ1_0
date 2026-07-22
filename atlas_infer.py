@@ -92,6 +92,9 @@ dll.atlas_prefetch_int8.argtypes = [ctypes.c_void_p]
 dll.atlas_quantize_lmhead.restype = None
 dll.atlas_quantize_lmhead.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 
+dll.atlas_repack_experts.restype = ctypes.c_int
+dll.atlas_repack_experts.argtypes = [ctypes.c_void_p]
+
 dll.atlas_set_use_f32_matmul.restype = None
 dll.atlas_set_use_f32_matmul.argtypes = [ctypes.c_void_p, ctypes.c_int]
 

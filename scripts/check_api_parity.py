@@ -44,6 +44,7 @@ NO_PYTHON_WRAPPER_NEEDED = INTERNAL_C_APIS | {
     "atlas_load_cache",
     "atlas_prefetch_int8",
     "atlas_quantize_lmhead",
+    "atlas_repack_experts",
     "atlas_set_layer_stride",
     "atlas_ensure_layer_idx",
     "atlas_forward",
