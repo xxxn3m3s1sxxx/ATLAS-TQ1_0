@@ -5683,8 +5683,8 @@ static void atlas_attention_mla(
     for (int b = 0; b < B; b++) {
         int pos = positions[b];
         int cache_pos = pos % max_seq_len;
-        uint16_t* dst = (uint16_t*)(m->compressed_kv_cache +
-            ((size_t)layer * max_seq_len + cache_pos) * stride);
+        uint16_t* dst = (uint16_t*)m->compressed_kv_cache +
+            ((size_t)layer * max_seq_len + cache_pos) * stride;
         // Store c_kv (fp32 → fp16)
         for (int i = 0; i < lora; i++)
             dst[i] = fp32_to_fp16(c_kv_new[b * lora + i]);
@@ -5745,8 +5745,8 @@ static void atlas_attention_mla(
             int cache_pos = key_pos % max_seq_len;
 
             // Load compressed c_kv from cache (fp16 → f32)
-            const uint16_t* c_kv_fp16 = (const uint16_t*)(m->compressed_kv_cache +
-                ((size_t)layer * max_seq_len + cache_pos) * stride);
+            const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
+                ((size_t)layer * max_seq_len + cache_pos) * stride;
 
             float c_kv_f32[512];
             for (int i = 0; i < lora; i++)
@@ -5836,8 +5836,8 @@ static void atlas_attention_mla(
             int cache_pos = key_pos % max_seq_len;
 
             // Reload c_kv and recompute kv_b output for V
-            const uint16_t* c_kv_fp16 = (const uint16_t*)(m->compressed_kv_cache +
-                ((size_t)layer * max_seq_len + cache_pos) * stride);
+            const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
+                ((size_t)layer * max_seq_len + cache_pos) * stride;
             float c_kv_f32[512];
             for (int i = 0; i < lora; i++)
                 c_kv_f32[i] = fp16_to_fp32(c_kv_fp16[i]);
@@ -6106,17 +6106,18 @@ static void atlas_moe_forward(
 
             // ── down projection: ab[inter] → accumulate into output[b*H] ──
             float* ob = output + b * H;
+            float* tmp_down = m->buf_hidden + b * H;
             if (t_d.ttype == 3) {
                 int8_t* dw; int32_t* drs; int d_rows, d_dim; float d_scale;
                 get_i8(t_d, dw, drs, d_rows, d_dim, d_scale);
-                matmul_f32_row_major(d_rows, d_dim, dw, ab, d_scale, gb);
-                for (int i = 0; i < H; i++) ob[i] += w * gb[i];
+                matmul_f32_row_major(d_rows, d_dim, dw, ab, d_scale, tmp_down);
+                for (int i = 0; i < H; i++) ob[i] += w * tmp_down[i];
             } else if (t_d.ttype == 11) {
                 const uint16_t* rs = (const uint16_t*)(t_d.data);
                 const int8_t* dw = (int8_t*)(t_d.data + t_d.row_dim * 2);
                 int dim11 = t3_dim(t_d);
-                matmul_f32_row_major_per_row(t_d.row_dim, dim11, dw, ab, rs, gb);
-                for (int i = 0; i < H; i++) ob[i] += w * gb[i];
+                matmul_f32_row_major_per_row(t_d.row_dim, dim11, dw, ab, rs, tmp_down);
+                for (int i = 0; i < H; i++) ob[i] += w * tmp_down[i];
             } else if (t_d.ttype == 8) {
                 uint16_t s16; memcpy(&s16, t_d.data, 2); float sc = fp16_to_fp32(s16);
                 int rows = t_d.row_dim, pw = t_d.packed_cols;
@@ -6148,10 +6149,10 @@ static void atlas_moe_forward(
                                                 : (int8_t)(((wd[c / 2] & 0x0F) ^ 8) - 8);
                             s += ab[c] * (float)wv;
                         }
-                        gb[ur * 4 + sub] = s / sc;
+                        tmp_down[ur * 4 + sub] = s / sc;
                     }
                 }
-                for (int i = 0; i < H; i++) ob[i] += w * gb[i];
+                for (int i = 0; i < H; i++) ob[i] += w * tmp_down[i];
             }
         }
     }
@@ -6468,6 +6469,9 @@ static void forward_layer_internal_mla(
     }
 
     // ─── 4. Apply RoPE to Q (q_pe portion only) ───
+    float total_scale = fmaxf(1.0f, (float)m->compressed_kv_max_seq / 4096.0f);
+    float rope_scale = fmaxf(1.0f, total_scale);
+    float eff_theta = theta * powf(rope_scale, (float)rope / (rope - 2));
     for (int b = 0; b < B; b++) {
         int pos = positions[b];
         float* qb = q_full + b * qd;
@@ -6475,7 +6479,7 @@ static void forward_layer_internal_mla(
             float* qh = qb + h * hd;
             float* q_pe = qh + nope;
             for (int i = 0; i < rope / 2; i++) {
-                float freq = 1.0f / powf(theta, 2.0f * i / rope);
+                float freq = 1.0f / powf(eff_theta, 2.0f * i / rope);
                 float cv = cosf(pos * freq), sv = sinf(pos * freq);
                 int j = i + rope / 2;
                 float a = q_pe[i], b0 = q_pe[j];
@@ -6500,16 +6504,20 @@ static void forward_layer_internal_mla(
             int o_rows = to.row_dim;
             int o_dim = t3_dim(to);
             for (int b = 0; b < B; b++) {
-                memcpy(m->buf_act + b * o_dim, attn_out + b * qd, qd * sizeof(float));
-                memset(m->buf_act + b * o_dim + qd, 0, (o_dim - qd) * sizeof(float));
+                float* dst = m->buf_act + b * o_dim;
+                const float* src = attn_out + b * qd;
+                for (int h = 0; h < nH; h++)
+                    memcpy(dst + h * m->v_head_dim, src + h * hd, m->v_head_dim * sizeof(float));
             }
             matmul_f32_row_major_per_row_batched(o_rows, o_dim, ow, m->buf_act, o_dim, o_rs_fp16, m->buf_gate, B);
         } else {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
             get_i8(to, w, rs, rows, dim, scale);
             for (int b = 0; b < B; b++) {
-                memcpy(m->buf_act + b * dim, attn_out + b * qd, qd * sizeof(float));
-                memset(m->buf_act + b * dim + qd, 0, (dim - qd) * sizeof(float));
+                float* dst = m->buf_act + b * dim;
+                const float* src = attn_out + b * qd;
+                for (int h = 0; h < nH; h++)
+                    memcpy(dst + h * m->v_head_dim, src + h * hd, m->v_head_dim * sizeof(float));
             }
             matmul_f32_row_major_batched(rows, dim, w, m->buf_act, dim, scale, m->buf_gate, B);
         }
@@ -8410,9 +8418,9 @@ static void ensure_layer_idx(AtlasModel* m) {
                 push("mlp.down_proj.weight");         // idx[8]
             } else {
                 // MoE layer: shared experts
-                push("mlp.shared_expert_gate_proj.weight"); // idx[6]
-                push("mlp.shared_expert_up_proj.weight");   // idx[7]
-                push("mlp.shared_expert_down_proj.weight"); // idx[8]
+                push("mlp.shared_experts.gate_proj.weight"); // idx[6]
+                push("mlp.shared_experts.up_proj.weight");   // idx[7]
+                push("mlp.shared_experts.down_proj.weight"); // idx[8]
             }
             push("self_attn.kv_a_layernorm.weight"); // idx[9]
             if (L >= m->first_k_dense_replace) {

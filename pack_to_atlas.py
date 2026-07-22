@@ -874,7 +874,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 "n_shared_experts": n_shared_experts,
                 "first_k_dense_replace": first_k_dense_replace,
                 "moe_intermediate_size": moe_intermediate_size,
-                "num_experts_per_tok": num_experts_per_tok,
+                "n_activated_experts": num_experts_per_tok,
                 "rope_theta": rope_theta,
                 "kv_lora_rank": cfg.get("kv_lora_rank", 0),
                 "qk_nope_head_dim": cfg.get("qk_nope_head_dim", 0),
@@ -1119,7 +1119,8 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         if use_v6:
             binary_tok_block = build_tokenizer_binary(model_dir)
             if len(binary_tok_block) > 0:
-                struct.pack_into("<H", header, 5, 7)
+                current_ver = struct.unpack_from("<H", header, 5)[0]
+                struct.pack_into("<H", header, 5, max(current_ver, 7))
                 binary_offset = current_offset
                 if binary_offset % 32 != 0:
                     pad = 32 - (binary_offset % 32)
