@@ -5968,15 +5968,18 @@ static void atlas_moe_forward(
         for (int b = 0; b < B; b++) {
             for (int e = 0; e < n_experts; e++) {
                 const int8_t* wrow = w8 + (int64_t)e * w_dim;
-                __m256 vs = _mm256_setzero_ps();
+                float sum = 0.0f;
                 int d = 0;
+#ifndef __aarch64__
+                __m256 vs = _mm256_setzero_ps();
                 for (; d + 8 <= w_dim; d += 8) {
                     __m256 hv = _mm256_loadu_ps(x_norm + b * H + d);
                     __m128i w8v = _mm_loadl_epi64((const __m128i*)(wrow + d));
                     __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(w8v));
                     vs = _mm256_fmadd_ps(hv, wf, vs);
                 }
-                float sum = hsum_ps(vs);
+                sum = hsum_ps(vs);
+#endif
                 for (; d < w_dim; d++)
                     sum += x_norm[b * H + d] * (float)wrow[d];
                 router_logits[b * n_experts + e] = sum / rscale;
@@ -6069,15 +6072,18 @@ static void atlas_moe_forward(
                 memcpy(ab, xb, H * sizeof(float));
                 memset(ab + H, 0, (dim_w - H) * sizeof(float));
                 const uint8_t* gw = t_g.data + 2;
-                const __m128i mask_low = _mm_set1_epi8(0x0F);
-                const __m128i xor8 = _mm_set1_epi8(8);
                 int rows_packed = rows / 4;
                 for (int ur = 0; ur < rows_packed; ur++) {
                     const uint8_t* gw4 = gw + ur * 4 * pw;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* wg = gw4 + sub * pw;
-                        __m256 gs = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 gs = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(ab + c);
                             uint32_t p4; memcpy(&p4, wg + c / 2, 4);
@@ -6089,7 +6095,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             gs = _mm256_fmadd_ps(af, wf, gs);
                         }
-                        float s = hsum_ps(gs);
+                        s = hsum_ps(gs);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((wg[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((wg[c / 2] & 0x0F) ^ 8) - 8);
@@ -6121,15 +6129,18 @@ static void atlas_moe_forward(
                 memcpy(ab, xb, H * sizeof(float));
                 memset(ab + H, 0, (dim_w - H) * sizeof(float));
                 const uint8_t* uw = t_u.data + 2;
-                const __m128i mask_low = _mm_set1_epi8(0x0F);
-                const __m128i xor8 = _mm_set1_epi8(8);
                 int rows_packed = rows / 4;
                 for (int ur = 0; ur < rows_packed; ur++) {
                     const uint8_t* uw4 = uw + ur * 4 * pw;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* w = uw4 + sub * pw;
-                        __m256 us = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 us = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(ab + c);
                             uint32_t p4; memcpy(&p4, w + c / 2, 4);
@@ -6141,7 +6152,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             us = _mm256_fmadd_ps(af, wf, us);
                         }
-                        float s = hsum_ps(us);
+                        s = hsum_ps(us);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((w[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
@@ -6177,15 +6190,18 @@ static void atlas_moe_forward(
                 int rows = t_d.row_dim, pw = t_d.packed_cols;
                 int dim_w = pw * 2;
                 const uint8_t* dw = t_d.data + 2;
-                const __m128i mask_low = _mm_set1_epi8(0x0F);
-                const __m128i xor8 = _mm_set1_epi8(8);
                 int rows_packed = rows / 4;
                 for (int ur = 0; ur < rows_packed; ur++) {
                     const uint8_t* dw4 = dw + ur * 4 * pw;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* wd = dw4 + sub * pw;
-                        __m256 ds = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 ds = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(ab + c);
                             uint32_t p4; memcpy(&p4, wd + c / 2, 4);
@@ -6197,7 +6213,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             ds = _mm256_fmadd_ps(af, wf, ds);
                         }
-                        float s = hsum_ps(ds);
+                        s = hsum_ps(ds);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((wd[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((wd[c / 2] & 0x0F) ^ 8) - 8);
@@ -6247,13 +6265,10 @@ static void atlas_moe_forward(
                 memcpy(m->buf_act + b * dim, x_norm + b * H, H * sizeof(float));
                 memset(m->buf_act + b * dim + H, 0, (dim - H) * sizeof(float));
             }
-            // Fall through: use blocked matmul for int4
             uint16_t s16; memcpy(&s16, t_sg.data, 2); float sc = fp16_to_fp32(s16);
             int rows = t_sg.row_dim, pw = t_sg.packed_cols;
             int dim_w = pw * 2;
             const uint8_t* gw = t_sg.data + 2;
-            const __m128i mask_low = _mm_set1_epi8(0x0F);
-            const __m128i xor8 = _mm_set1_epi8(8);
             int rows_packed = rows / 4;
             for (int ur = 0; ur < rows_packed; ur++) {
                 const uint8_t* gw4 = gw + ur * 4 * pw;
@@ -6261,8 +6276,13 @@ static void atlas_moe_forward(
                     const float* a = m->buf_act + b * dim_w;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* wg = gw4 + sub * pw;
-                        __m256 gs = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 gs = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(a + c);
                             uint32_t p4; memcpy(&p4, wg + c / 2, 4);
@@ -6274,7 +6294,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             gs = _mm256_fmadd_ps(af, wf, gs);
                         }
-                        float s = hsum_ps(gs);
+                        s = hsum_ps(gs);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((wg[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((wg[c / 2] & 0x0F) ^ 8) - 8);
@@ -6313,8 +6335,6 @@ static void atlas_moe_forward(
             int rows = t_su.row_dim, pw = t_su.packed_cols;
             int dim_w = pw * 2;
             const uint8_t* uw = t_su.data + 2;
-            const __m128i mask_low = _mm_set1_epi8(0x0F);
-            const __m128i xor8 = _mm_set1_epi8(8);
             int rows_packed = rows / 4;
             for (int ur = 0; ur < rows_packed; ur++) {
                 const uint8_t* uw4 = uw + ur * 4 * pw;
@@ -6322,8 +6342,13 @@ static void atlas_moe_forward(
                     const float* a = m->buf_act + b * dim_w;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* w = uw4 + sub * pw;
-                        __m256 us = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 us = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(a + c);
                             uint32_t p4; memcpy(&p4, w + c / 2, 4);
@@ -6335,7 +6360,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             us = _mm256_fmadd_ps(af, wf, us);
                         }
-                        float s = hsum_ps(us);
+                        s = hsum_ps(us);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((w[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
@@ -6373,8 +6400,6 @@ static void atlas_moe_forward(
             int rows = t_sd.row_dim, pw = t_sd.packed_cols;
             int dim_w = pw * 2;
             const uint8_t* dw = t_sd.data + 2;
-            const __m128i mask_low = _mm_set1_epi8(0x0F);
-            const __m128i xor8 = _mm_set1_epi8(8);
             int rows_packed = rows / 4;
             for (int ur = 0; ur < rows_packed; ur++) {
                 const uint8_t* dw4 = dw + ur * 4 * pw;
@@ -6382,8 +6407,13 @@ static void atlas_moe_forward(
                     const float* a = m->buf_act + b * dim_w;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* w = dw4 + sub * pw;
-                        __m256 ds = _mm256_setzero_ps();
+                        float s = 0.0f;
                         int c = 0;
+#ifndef __aarch64__
+                        {
+                        const __m128i mask_low = _mm_set1_epi8(0x0F);
+                        const __m128i xor8 = _mm_set1_epi8(8);
+                        __m256 ds = _mm256_setzero_ps();
                         for (; c + 8 <= dim_w; c += 8) {
                             __m256 af = _mm256_loadu_ps(a + c);
                             uint32_t p4; memcpy(&p4, w + c / 2, 4);
@@ -6395,7 +6425,9 @@ static void atlas_moe_forward(
                             __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ws));
                             ds = _mm256_fmadd_ps(af, wf, ds);
                         }
-                        float s = hsum_ps(ds);
+                        s = hsum_ps(ds);
+                        }
+#endif
                         for (; c < dim_w; c++) {
                             int8_t wv = (c & 1) ? (int8_t)((((w[c / 2] >> 4) & 0x0F) ^ 8) - 8)
                                                 : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
