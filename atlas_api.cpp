@@ -2473,7 +2473,11 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
 
         free(decoded_scales);
         free(f32_row);
-        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+        // Guard: don't vfree a repacked sub-pointer (MoE contiguous buffer)
+        bool is_repacked = m->repacked_expert_data &&
+            t.data >= m->repacked_expert_data &&
+            t.data < m->repacked_expert_data + m->repacked_expert_size;
+        if (t.data && !m->is_mapped(t.data) && !is_repacked) atlas_vfree(t.data);
         t.data = new_data;
         t.data_size = 2 + n_vals + t.row_dim * 4;
         t.ttype = 3;
@@ -5793,7 +5797,7 @@ static void atlas_attention_mla(
             const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
                 ((size_t)layer * max_seq_len + cache_pos) * stride;
 
-            float c_kv_f32[512];
+            float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
             for (int i = 0; i < lora; i++)
                 c_kv_f32[i] = fp16_to_fp32(c_kv_fp16[i]);
 
@@ -5806,7 +5810,7 @@ static void atlas_attention_mla(
             }
 
             // Load k_pe from cache (fp16 → f32), apply RoPE based on position
-            float k_pe_f32[128];
+            float* k_pe_f32 = (float*)alloca(rope * sizeof(float));
             for (int i = 0; i < rope; i++)
                 k_pe_f32[i] = fp16_to_fp32(c_kv_fp16[lora + i]);
 
@@ -5887,7 +5891,7 @@ static void atlas_attention_mla(
             // Reload c_kv and recompute kv_b output for V
             const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
                 ((size_t)layer * max_seq_len + cache_pos) * stride;
-            float c_kv_f32[512];
+            float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
             for (int i = 0; i < lora; i++)
                 c_kv_f32[i] = fp16_to_fp32(c_kv_fp16[i]);
 
