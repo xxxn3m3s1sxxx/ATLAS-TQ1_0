@@ -1084,16 +1084,25 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 out.write(b"\x00" * pad)
 
             # ── Directory entry (v10: 16-byte stride, 64-bit offset) ────
-            directory[idx * 16] = tens_ttype
-            struct.pack_into("<Q", directory, idx * 16 + 1, current_offset)
-            struct.pack_into("<I", directory, idx * 16 + 9, row_dim)
+            entry = bytearray(16)
+            entry[0] = tens_ttype
+            struct.pack_into("<Q", entry, 1, current_offset)
+            struct.pack_into("<I", entry, 9, row_dim)
             if n_blocks:
                 ppr_entry = (packed_per_row & 0x1FFFFF) | (n_blocks << 21)
             else:
                 ppr_entry = packed_per_row & 0xFFFFFF
-            directory[idx * 16 + 13] = ppr_entry & 0xFF
-            directory[idx * 16 + 14] = (ppr_entry >> 8) & 0xFF
-            directory[idx * 16 + 15] = (ppr_entry >> 16) & 0xFF
+            entry[13] = ppr_entry & 0xFF
+            entry[14] = (ppr_entry >> 8) & 0xFF
+            entry[15] = (ppr_entry >> 16) & 0xFF
+            # Write dir entry immediately to disk (survives timeout/kill)
+            dir_entry_pos = dir_offset + idx * 16
+            import os as _os_pos
+            saved_pos = out.tell()
+            out.seek(dir_entry_pos)
+            out.write(bytes(entry))
+            out.seek(saved_pos)
+            directory[idx * 16:idx * 16 + 16] = entry
 
             out.write(data_bytes)
             current_offset += len(data_bytes)
@@ -1102,9 +1111,10 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
 
             if idx % 8 == 0:
                 print(f"  [{idx}/{len(tensor_names)}] {name[:55]:55s} {len(data_bytes)/1024:7.1f}KB ttype={tens_ttype}")
+                out.flush()
 
         # ── Tokenizer block (v5 JSON) ───────────────────────────────
-        if tokenizer_block:
+        if tokenizer_block and current_offset < 0xFFFFFFFF - len(tokenizer_block) - 1024:
             tokenizer_offset = current_offset
             if tokenizer_offset % 32 != 0:
                 pad = 32 - (tokenizer_offset % 32)
@@ -1116,7 +1126,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             current_offset = tokenizer_offset + len(tokenizer_block)
 
         # ── v6 binary tokenizer ─────────────────────────────────────
-        if use_v6:
+        if use_v6 and current_offset < 0xFFFFFFFF - 1024:
             binary_tok_block = build_tokenizer_binary(model_dir)
             if len(binary_tok_block) > 0:
                 current_ver = struct.unpack_from("<H", header, 5)[0]
@@ -1134,11 +1144,16 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 print("  WARNING: v6 binary tokenizer block empty, skipping")
 
         # ── Finalize header + directory ─────────────────────────────
+        # Flush buffered data first, then write directory via direct fd
+        # to avoid issues with large file seek after14+ GB sequential write
         out.flush()
-        out.seek(dir_offset)
-        out.write(directory)
-        out.seek(0)
-        out.write(header)
+        import os as _os
+        fd = _os.open(output_path, _os.O_WRONLY | _os.O_BINARY)
+        _os.lseek(fd, dir_offset, _os.SEEK_SET)
+        _os.write(fd, bytes(directory))
+        _os.lseek(fd, 0, _os.SEEK_SET)
+        _os.write(fd, bytes(header))
+        _os.close(fd)
 
     reader.close()
     total_gb = current_offset / 1024 ** 3
