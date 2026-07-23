@@ -821,8 +821,17 @@ struct AtlasModel {
         int max_dim = inter_dim > hidden_dim ? inter_dim : hidden_dim;
         if (n_heads * head_dim > max_dim) max_dim = n_heads * head_dim;
         int max_aligned = ((max_dim + 7) + 31) & ~31;
-        int effective_hd = is_mla ? (qk_nope_head_dim + qk_rope_head_dim) : head_dim;
-        int ws = (int)((size_t)B * n_heads * effective_hd * 4);
+        size_t ws;
+        if (is_mla) {
+            size_t qd_sz = (size_t)B * n_heads * (qk_nope_head_dim + qk_rope_head_dim);
+            ws = qd_sz * 2
+                + (size_t)B * qk_rope_head_dim
+                + (size_t)n_heads * (qk_nope_head_dim + v_head_dim)
+                + (size_t)kv_lora_rank
+                + (size_t)qk_rope_head_dim;
+        } else {
+            ws = (size_t)B * n_heads * head_dim * 4;
+        }
         float* new_gate = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         float* new_up = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         float* new_hidden = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
@@ -5764,13 +5773,11 @@ static void atlas_attention_mla(
         kv_b_dim = t3_dim(t_kv_b);
     }
 
-    // Scratch for per-position kv_b output
-    float* kv_out = (float*)alloca((size_t)kv_b_rows * sizeof(float));
-
-    // Hoist c_kv_f32 and k_pe_f32 outside ring loops to avoid alloca accumulation
-    // (alloca is only freed when the FUNCTION returns, not when loop scope exits)
-    float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
-    float* k_pe_f32 = (float*)alloca(rope * sizeof(float));
+    // Scratch for per-position kv_b output + RoPE scratch (from attn_ws heap)
+    size_t qd_sz = (size_t)B * nH * hd;
+    float* kv_out   = m->attn_ws + 2 * qd_sz + (size_t)B * rope;
+    float* c_kv_f32 = kv_out + kv_b_rows;
+    float* k_pe_f32 = c_kv_f32 + lora;
 
     // Attention scores buffer (heap-allocated for large seq)
     static thread_local float* scores_buf = nullptr;
@@ -6042,7 +6049,8 @@ static void atlas_moe_forward(
 
     // Copy x_norm to scratch to avoid aliasing: x_norm == buf_act == ab.
     // For B>1, SiLU for b=0 overwrites buf_act[0..inter], corrupting x_norm for b=1+.
-    float* x_safe = (float*)alloca((size_t)B * H * sizeof(float));
+    // Reuse attn_ws — q_full is dead post-attention, safe for B*H scratch.
+    float* x_safe = m->attn_ws;
     memcpy(x_safe, x_norm, (size_t)B * H * sizeof(float));
 
     // Process each (batch, selected-expert) pair
@@ -6550,8 +6558,8 @@ static void forward_layer_internal_mla(
     }
 
     // ─── 3b. Extract k_pe from kv_comp BEFORE layernorm (layernorm only touches c_kv portion) ───
-    // k_pe is small: B * rope floats (B * 64 = 256 bytes), safe for stack
-    float* k_pe_all = (float*)alloca((size_t)B * rope * sizeof(float));
+    size_t qd_sz_mla = (size_t)B * nH * (m->qk_nope_head_dim + m->qk_rope_head_dim);
+    float* k_pe_all = m->attn_ws + 2 * qd_sz_mla;
     for (int b = 0; b < B; b++) {
         const float* src = kv_comp + b * (lora + rope) + lora;
         float* dst = k_pe_all + b * rope;
