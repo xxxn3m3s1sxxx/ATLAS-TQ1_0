@@ -614,35 +614,61 @@ class AtlasModel:
         self._i8_cache = {}
         # Call C ensure_layer_idx which auto-detects stride + model_arch
         dll.atlas_ensure_layer_idx(self.model_ptr)
+        # Detect MLA architecture (kv_a_proj_with_mqa is MLA-only)
+        has_mla = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight" in self.idx
+        self._is_mla = has_mla
         # Read back the stride
         has_qk_norm = "model.layers.0.self_attn.q_norm.weight" in self.idx
         has_sub_norm = "model.layers.0.self_attn.attn_sub_norm.weight" in self.idx
         stride = 11 if (has_qk_norm or has_sub_norm) else 9
         # Build flat index array for atlas_forward (fused C++ layer loop)
         idx = self.idx
-        per_layer = ['input_layernorm.weight',
-            'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
-            'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
-            'post_attention_layernorm.weight',
-            'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
-            'self_attn.q_norm.weight', 'self_attn.k_norm.weight']
-        if has_sub_norm:
-            per_layer = [
-                'input_layernorm.weight',
+        if has_mla:
+            # MLA: C++ forward_layer_internal_mla uses its own layer_idx_cache.
+            # Python passes a dummy array; C++ ignores it for MLA models.
+            ld = ['input_layernorm.weight',
+                'self_attn.q_proj.weight',
+                'self_attn.kv_a_proj_with_mqa.weight',
+                'self_attn.kv_b_proj.weight',
+                'self_attn.o_proj.weight',
+                'post_attention_layernorm.weight',
+                'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
+                'mlp.shared_experts.gate_proj.weight',
+                'mlp.shared_experts.up_proj.weight',
+                'mlp.shared_experts.down_proj.weight',
+                'self_attn.kv_a_layernorm.weight',
+                'mlp.gate.weight']
+            mla_stride = len(ld)  # 14 for n_shared=2
+            arrs = []
+            for L in range(self.n_layers):
+                for n in ld:
+                    arrs.append(idx.get(f'model.layers.{L}.{n}', -1))
+            self._layer_idx_arr = np.array(arrs, dtype=np.int32)
+            self._stride = mla_stride
+        else:
+            per_layer = ['input_layernorm.weight',
                 'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
                 'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
                 'post_attention_layernorm.weight',
                 'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
-                'self_attn.attn_sub_norm.weight', 'mlp.ffn_sub_norm.weight']
-        elif not has_qk_norm:
-            # Falcon3: remove q_norm/k_norm from per_layer
-            per_layer = [n for n in per_layer if 'q_norm' not in n and 'k_norm' not in n]
-        arrs = []
-        for L in range(self.n_layers):
-            for n in per_layer:
-                arrs.append(idx[f'model.layers.{L}.{n}'])
-        self._layer_idx_arr = np.array(arrs, dtype=np.int32)
-        self._stride = stride
+                'self_attn.q_norm.weight', 'self_attn.k_norm.weight']
+            if has_sub_norm:
+                per_layer = [
+                    'input_layernorm.weight',
+                    'self_attn.q_proj.weight', 'self_attn.k_proj.weight',
+                    'self_attn.v_proj.weight', 'self_attn.o_proj.weight',
+                    'post_attention_layernorm.weight',
+                    'mlp.gate_proj.weight', 'mlp.up_proj.weight', 'mlp.down_proj.weight',
+                    'self_attn.attn_sub_norm.weight', 'mlp.ffn_sub_norm.weight']
+            elif not has_qk_norm:
+                # Falcon3: remove q_norm/k_norm from per_layer
+                per_layer = [n for n in per_layer if 'q_norm' not in n and 'k_norm' not in n]
+            arrs = []
+            for L in range(self.n_layers):
+                for n in per_layer:
+                    arrs.append(idx[f'model.layers.{L}.{n}'])
+            self._layer_idx_arr = np.array(arrs, dtype=np.int32)
+            self._stride = stride
 
     def _get_rope_theta(self):
         with open(self._atlas_path, 'rb') as f:

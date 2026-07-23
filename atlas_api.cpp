@@ -939,6 +939,8 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     } else if (strcmp(arch, "bitnet") == 0 || strcmp(arch, "trilm") == 0) {
         m->model_arch = ARCH_BITNET;
         m->layer_stride = 11;
+    } else if (strcmp(arch, "deepseek_v2") == 0) {
+        m->model_arch = ARCH_LLAMA;  // MLA detected by kv_lora_rank below
     }
 
     v = find_after(json, "\"rope_interleaved\"");
@@ -1359,9 +1361,15 @@ fail:
 // ─── Free model ─────────────────────────────────────────────────────────
 ATLAS_API void atlas_free(AtlasModel* m) {
     if (!m) return;
-    // Free valloc'd tensors (not mmap'd ones)
+    // Free valloc'd tensors (not mmap'd ones, not repacked sub-pointers)
+    // Note: repacked_expert_data + compressed_kv_cache freed in ~AtlasModel()
     for (auto& t : m->tensors) {
-        if (t.data && !m->is_mapped(t.data)) atlas_vfree(t.data);
+        if (!t.data) continue;
+        if (m->is_mapped(t.data)) continue;
+        // Skip tensors pointing into the MoE repacked buffer
+        if (m->repacked_expert_data && t.data >= m->repacked_expert_data
+            && t.data < m->repacked_expert_data + m->repacked_expert_size) continue;
+        atlas_vfree(t.data);
     }
     // Unmap cache if loaded
     if (m->mmap_base) {
@@ -6494,6 +6502,17 @@ static void forward_layer_internal_mla(
 
     const int* idx = m->layer_idx_cache.data() + layer * m->layer_stride;
 
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d idx=[%d %d %d %d %d %d %d %d %d] attn_ws=%p buf_gate=%p buf_c_kv=%p\n",
+            layer, idx[0], idx[1], idx[2], idx[3], idx[4], idx[5],
+            idx[6], idx[7], idx[8],
+            (void*)m->attn_ws, (void*)m->buf_gate, (void*)m->buf_c_kv);
+    #endif
+
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step1_rmsnorm t_ln1.data=%p\n", layer, (void*)m->tensors[idx[0]].data);
+    #endif
+
     // ─── 1. Pre-attention RMSNorm ───
     auto& t_ln1 = m->tensors[idx[0]];
     float* x_norm = output;  // write normalized into output buffer
@@ -6511,6 +6530,10 @@ static void forward_layer_internal_mla(
             }
         }
     }
+
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step2_post_rmsnorm\n", layer);
+    #endif
 
     // ─── 2. Q projection: x_norm → W_q → [B, qd] (row-major, no blocked layout) ───
     float* q_full = m->attn_ws;  // [B * qd]
@@ -6536,6 +6559,10 @@ static void forward_layer_internal_mla(
             matmul_f32_row_major_per_row_batched(rows, dim, w, m->buf_act, dim, rs_fp16, q_full, B);
         }
     }
+
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step3_post_q\n", layer);
+    #endif
 
     // ─── 3. KV compression: x_norm → W_kv_a → [B, lora + rope] (row-major) ───
     float* kv_comp = m->buf_hidden;  // [B, lora + rope]
@@ -6618,10 +6645,16 @@ static void forward_layer_internal_mla(
     }
 
     // ─── 5. MLA Attention ───
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step5_pre_attn\n", layer);
+    #endif
     float* attn_out = m->attn_ws + B * qd;  // use second half of attn_ws
     atlas_attention_mla(m, q_full, attn_out,
         c_kv_all, k_pe_all,
         layer, positions, max_seq_len, seq_now, B);
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step5_post_attn\n", layer);
+    #endif
 
     // ─── 6. O projection: attn_out → W_o → [B, H] (row-major) ───
     {
@@ -6651,9 +6684,17 @@ static void forward_layer_internal_mla(
         }
     }
 
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step6_post_oproj B=%d\n", layer, B);
+    #endif
+
     // ─── 7. Residual: output = input + O_proj ───
     for (int i = 0; i < B * H; i++)
         output[i] = input[i] + m->buf_gate[i] * m->scale_depth_factor;
+
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step7_post_residual\n", layer);
+    #endif
 
     // ─── 8. Post-attention RMSNorm ───
     {
@@ -6671,6 +6712,10 @@ static void forward_layer_internal_mla(
             }
         }
     }
+
+    #ifdef ATLAS_DEBUG_MODE
+    fprintf(stderr, "[MLA_STEP] L=%d step8_post_rmsnorm2\n", layer);
+    #endif
 
     // ─── 9. FFN: Dense (L < first_k_dense_replace) or MoE (L >= first_k_dense_replace) ───
     if (layer < m->first_k_dense_replace) {
@@ -6698,18 +6743,33 @@ static void forward_layer_internal_mla(
             const uint8_t* uw_raw = tu.data + tu.row_dim * 2;
             int8_t* uw = (int8_t*)uw_raw;
             int dim11 = t3_dim(tg);
+            #ifdef ATLAS_DEBUG_MODE
+            fprintf(stderr, "[MLA_STEP] L=%d step9a_gate_t11 g_rows=%d dim11=%d\n", layer, tg.row_dim, dim11);
+            #endif
             matmul_f32_per_row(tg.row_dim, dim11, gw, m->buf_act, ffn_dim, g_rs, m->buf_gate, B);
+            #ifdef ATLAS_DEBUG_MODE
+            fprintf(stderr, "[MLA_STEP] L=%d step9b_up_t11\n", layer);
+            #endif
             matmul_f32_per_row(tu.row_dim, dim11, uw, m->buf_act, ffn_dim, u_rs, m->buf_up, B);
         } else if (m->use_f32_matmul) {
             int8_t* gw; int32_t* grs; int g_rows, g_dim_v; float g_scale;
             int8_t* uw; int32_t* urs; int u_rows, u_dim_v; float u_scale;
             get_i8(tg, gw, grs, g_rows, g_dim_v, g_scale);
             get_i8(tu, uw, urs, u_rows, u_dim_v, u_scale);
+            #ifdef ATLAS_DEBUG_MODE
+            fprintf(stderr, "[MLA_STEP] L=%d step9a_gate g_rows=%d g_dim=%d B=%d\n", layer, g_rows, g_dim_v, B);
+            #endif
             matmul_f32_reorder(g_rows, g_dim_v, gw, m->buf_act, g_scale, m->buf_gate, B);
+            #ifdef ATLAS_DEBUG_MODE
+            fprintf(stderr, "[MLA_STEP] L=%d step9b_up u_rows=%d\n", layer, u_rows);
+            #endif
             matmul_f32_reorder(u_rows, u_dim_v, uw, m->buf_act, u_scale, m->buf_up, B);
         }
 
         // SiLU(gate) * up → down
+        #ifdef ATLAS_DEBUG_MODE
+        fprintf(stderr, "[MLA_STEP] L=%d step9c_silu inter=%d\n", layer, inter);
+        #endif
         auto& t_down = m->tensors[idx[8]];
         int d_dim = t3_dim(t_down);
         for (int b = 0; b < B; b++) {
@@ -6719,6 +6779,9 @@ static void forward_layer_internal_mla(
                          * m->buf_up[b * inter + i];
             for (int i = inter; i < d_dim; i++) tmp[i] = 0.0f;
         }
+        #ifdef ATLAS_DEBUG_MODE
+        fprintf(stderr, "[MLA_STEP] L=%d step9d_down_pre\n", layer);
+        #endif
         if (m->use_f32_matmul && t_down.ttype == 11) {
             const uint16_t* d_rs = (const uint16_t*)(t_down.data);
             const int8_t* dw = (int8_t*)(t_down.data + t_down.row_dim * 2);
@@ -6727,8 +6790,14 @@ static void forward_layer_internal_mla(
         } else {
             int8_t* dw; int32_t* drs; int d_rows, d_dim_v; float d_scale;
             get_i8(t_down, dw, drs, d_rows, d_dim_v, d_scale);
+            #ifdef ATLAS_DEBUG_MODE
+            fprintf(stderr, "[MLA_STEP] L=%d step9d_down d_rows=%d d_dim=%d\n", layer, d_rows, d_dim_v);
+            #endif
             matmul_f32_reorder(d_rows, d_dim_v, dw, m->buf_act, d_scale, m->buf_gate, B);
         }
+        #ifdef ATLAS_DEBUG_MODE
+        fprintf(stderr, "[MLA_STEP] L=%d step9e_down_post\n", layer);
+        #endif
     } else {
         // MoE FFN: Router + Sparse Experts + Shared Experts
         atlas_moe_forward(m, output, m->buf_gate, B, m->buf_act, layer);
@@ -8528,7 +8597,7 @@ static void ensure_layer_idx(AtlasModel* m) {
             push("mlp.down_proj.weight");
             push("self_attn.attn_sub_norm.weight");
             push("mlp.ffn_sub_norm.weight");
-        } else if (stride == 12 && m->is_mla) {
+        } else if (stride > 9 && m->is_mla) {
             // ─── MLA layer index: dynamic stride = 6 + 3*n_shared + 2 ───
             // [0] ln1, [1] q, [2] kv_a, [3] kv_b, [4] o, [5] ln2
             // [6..6+3*n_shared-1] shared experts (gate/up/down per expert)

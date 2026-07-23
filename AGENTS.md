@@ -71,6 +71,8 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 - **Shared Expert Names**: C++ nutzt `mlp.shared_experts.gate_proj.weight` (Plural, Dot-separated) — nicht `shared_expert`.
 - **Buffer Aliasing MoE**: `tmp_down = buf_hidden + b*H` — darf nicht `output` oder `buf_gate` aliasen (wird bei MoE-Dispatch überschrieben).
 - **moe_expert_tidx**: Flat vector `[layer * n_experts * 3 + expert * 3 + proj]` → tensor index. proj: 0=gate, 1=up, 2=down. Populated in `atlas_repack_experts()`.
+- **Mock Model FFN Dimensions**: `_shape_of()` muss für MLA-Architekturen `moe_intermediate_size` statt `cfg["inter"]` für alle FFN-Projektionen verwenden (dense + MoE). Die C++ Engine setzt `inter_dim = moe_intermediate_size` (JSON override in `atlas_load`). Wenn Mock `gate_proj.row_dim = cfg["inter"]` nutzt, überschreibt `matmul_f32_reorder` den `buf_gate`-Buffer → Access Violation.
+- **`atlas_load_cache` mmap_base**: `atlas_load_cache` (line ~2094) speichert `mmap_base`/`mmap_handle`/`mmap_file`/`mmap_size` UNCONDITIONAL vor `if (replaced > 0)`. Bei Cache-Miss bleibt `mmap_base` gesetzt → `atlas_save_cache` scheitert an Sharing-Violation (nur `FILE_SHARE_READ`).
 - **Kein alloca/VLA auf dem heißen Pfad**: `alloca` und VLAs sind auf dem Inferenzpfad (`atlas_attention_mla`, `atlas_moe_forward`, `forward_layer_internal_mla`) strikt verboten — `alloca` gibt Speicher erst beim Verlassen der Funktion frei, nicht pro Schleifeniteration. Bei32K Kontext → Stack Overflow. Al temporärer Workspace muss über pre-kalkulierte Heap-Offsets (`attn_ws`) alloziert und recycelt werden.
 - **attn_ws Layout (MLA)**: `attn_ws` dient als wiederverwendbares Ring-Scratchpad für die gesamte MLA-Inferenz:
   ```

@@ -343,6 +343,70 @@ ARCHES = {
             "mlp.down_proj.weight",
         ],
     ),
+    # MLA (Multi-head Latent Attention) + MoE — scaled-down DeepSeek-V2-Lite
+    # layer_stride = 6 + 3*n_shared + 2 = 14 for n_shared=2
+    # Layer 0: dense (first_k_dense_replace=1), layers 1+: MoE
+    # use_f32_bypass=1 required: MLA forward uses get_i8() + matmul_f32_row_major_batched path
+    "deepseek_v2": dict(
+        n_layers=2, hidden=128, inter=512,
+        n_heads=4, n_kv_heads=0, head_dim=12,  # head_dim = qk_nope + qk_rope
+        vocab=256, rope_theta=10000.0,
+        rope_interleaved=True, stride=14,
+        arch="deepseek_v2", use_f32_bypass=1,
+        is_mla=True,
+        kv_lora_rank=32, qk_nope_head_dim=8, qk_rope_head_dim=4,
+        v_head_dim=8, n_shared_experts=2,
+        first_k_dense_replace=1, n_routed_experts=4, n_activated_experts=2,
+        moe_intermediate_size=256,
+        # Dense layer (L=0): q, kv_a, kv_b, o, ln2, gate/up/down FFN, shared×3 (dummy), kv_a_layernorm (dummy), router (dummy)
+        # MoE layer (L=1): q, kv_a, kv_b, o, ln2, shared×3, kv_a_layernorm, router
+        # Plus routed experts: experts.{E}.gate/up/down_proj for E in 0..n_routed_experts-1
+        layer_tensors_dense=[
+            "input_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "mlp.shared_experts.gate_proj.weight",  # dummy for dense layer
+            "mlp.shared_experts.up_proj.weight",
+            "mlp.shared_experts.down_proj.weight",
+            "self_attn.kv_a_layernorm.weight",       # dummy for dense layer
+            "mlp.gate.weight",                         # dummy for dense layer
+        ],
+        layer_tensors_moe=[
+            "input_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.shared_experts.gate_proj.weight",
+            "mlp.shared_experts.up_proj.weight",
+            "mlp.shared_experts.down_proj.weight",
+            "mlp.shared_experts.2.gate_proj.weight",  # shared expert 2
+            "mlp.shared_experts.2.up_proj.weight",
+            "mlp.shared_experts.2.down_proj.weight",
+            "self_attn.kv_a_layernorm.weight",
+            "mlp.gate.weight",
+            "mlp.experts.0.gate_proj.weight",          # routed expert 0
+            "mlp.experts.0.up_proj.weight",
+            "mlp.experts.0.down_proj.weight",
+            "mlp.experts.1.gate_proj.weight",          # routed expert 1
+            "mlp.experts.1.up_proj.weight",
+            "mlp.experts.1.down_proj.weight",
+            "mlp.experts.2.gate_proj.weight",          # routed expert 2
+            "mlp.experts.2.up_proj.weight",
+            "mlp.experts.2.down_proj.weight",
+            "mlp.experts.3.gate_proj.weight",          # routed expert 3
+            "mlp.experts.3.up_proj.weight",
+            "mlp.experts.3.down_proj.weight",
+        ],
+        layer_tensors=None,  # overridden by dense/moe variants
+    ),
 }
 
 GLOBAL_TENSORS = ["model.embed_tokens.weight", "model.norm.weight"]
@@ -421,6 +485,39 @@ def _shape_of(name, cfg):
         return (h,)
     if "q_norm" in name or "k_norm" in name:
         return (hd,)
+
+    # MLA tensor shapes (DeepSeek-V2)
+    if cfg.get("is_mla"):
+        lora = cfg["kv_lora_rank"]
+        nope = cfg["qk_nope_head_dim"]
+        rope = cfg["qk_rope_head_dim"]
+        vhd = cfg["v_head_dim"]
+        nH = cfg["n_heads"]
+        n_shared = cfg.get("n_shared_experts", 1)
+        moe_inter = cfg.get("moe_intermediate_size", cfg["inter"])
+        if "q_proj" in name:
+            return (nH * (nope + rope), h)
+        if "kv_a_proj_with_mqa" in name:
+            return (lora + rope, h)
+        if "kv_b_proj" in name:
+            return (nH * (nope + vhd), lora)
+        if "o_proj" in name:
+            return (h, nH * vhd)
+        if "kv_a_layernorm" in name:
+            return (lora,)
+        if "mlp.gate.weight" in name and "experts" not in name and "shared" not in name:
+            return (cfg.get("n_routed_experts", 16), h)
+        if "shared_experts" in name or "mlp.experts" in name:
+            if "gate_proj" in name or "up_proj" in name:
+                return (moe_inter, h)
+            if "down_proj" in name:
+                return (h, moe_inter)
+        if "gate_proj" in name or "up_proj" in name:
+            return (moe_inter, h)
+        if "down_proj" in name:
+            return (h, moe_inter)
+        return (v, h)
+
     if "q_proj" in name:
         return (qd, h)
     if "k_proj" in name or "v_proj" in name:
@@ -540,17 +637,35 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
         cfg["head_dim"] = head_dim
     core = dict(CORRIDORS[corridor]) if corridor else None
     n_layers = cfg["n_layers"]
-    n_layers = cfg["n_layers"]
-    n_tensors = n_layers * len(cfg["layer_tensors"]) + len(GLOBAL_TENSORS)
+    is_mla = cfg.get("is_mla", False)
+
+    if is_mla:
+        ld = cfg.get("layer_tensors_dense", [])
+        lm = cfg.get("layer_tensors_moe", [])
+        first_dense = cfg.get("first_k_dense_replace", 1)
+        n_tensors = len(GLOBAL_TENSORS)
+        for L in range(n_layers):
+            n_tensors += len(ld) if L < first_dense else len(lm)
+    else:
+        n_tensors = n_layers * len(cfg["layer_tensors"]) + len(GLOBAL_TENSORS)
     h = cfg["hidden"]
     i = cfg["inter"]
     v = cfg["vocab"]
 
     # Ordered tensor names
     tensor_names = []
-    for L in range(n_layers):
-        for tname in cfg["layer_tensors"]:
-            tensor_names.append(f"model.layers.{L}.{tname}")
+    if is_mla:
+        ld = cfg.get("layer_tensors_dense", [])
+        lm = cfg.get("layer_tensors_moe", [])
+        first_dense = cfg.get("first_k_dense_replace", 1)
+        for L in range(n_layers):
+            tlist = ld if L < first_dense else lm
+            for tname in tlist:
+                tensor_names.append(f"model.layers.{L}.{tname}")
+    else:
+        for L in range(n_layers):
+            for tname in cfg["layer_tensors"]:
+                tensor_names.append(f"model.layers.{L}.{tname}")
     tensor_names.extend(GLOBAL_TENSORS)
 
     rng = np.random.RandomState(42)
@@ -560,48 +675,51 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
     for name in tensor_names:
         shape = _shape_of(name, cfg)
         is_norm = len(shape) == 1
-
+        # Determine tensor type
         if is_norm:
-            data = np.ones(shape, dtype=np.float32) + rng.randn(*shape).astype(np.float32) * 0.01
-            tensor_entries.append((name, data, 1))
+            ttype = 1
+        elif is_mla:
+            if "mlp.gate.weight" in name and "experts" not in name and "shared" not in name:
+                ttype = 2  # fp16 router
+            elif any(x in name for x in ["q_proj", "kv_a_proj", "kv_b_proj", "o_proj"]):
+                ttype = 3  # int8 MLA attention projections
+            elif any(x in name for x in ["gate_proj", "up_proj", "down_proj"]):
+                ttype = 3  # int8 FFN
+            elif "embed_tokens" in name or "lm_head" in name:
+                ttype = 1  # fp16
+            else:
+                ttype = 1
         elif core is not None:
             if _is_qkv(name):
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, core["qkv_ttype"]))
+                ttype = core["qkv_ttype"]
             elif _is_ffn(name):
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, core["ffn_ttype"]))
+                ttype = core["ffn_ttype"]
             else:
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 1))
+                ttype = 1
         elif use_tq1 == "ttype7":
             if _is_qkv(name):
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 7))
+                ttype = 7
             elif _is_ffn(name):
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 3))
+                ttype = 3
             else:
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 1))
+                ttype = 1
         elif use_tq1 == "ttype0":
-            if "proj" in name:
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 0))
-            else:
-                data = rng.randn(*shape).astype(np.float32) * 0.1
-                tensor_entries.append((name, data, 1))
+            ttype = 0 if "proj" in name else 1
         elif use_tq1 and "proj" in name:
-            data = rng.randn(*shape).astype(np.float32) * 0.1
-            tensor_entries.append((name, data, 5))
+            ttype = 5
         else:
-            data = rng.randn(*shape).astype(np.float32) * 0.1
-            tensor_entries.append((name, data, 1))
+            ttype = 1
+
+        data = rng.randn(*shape).astype(np.float32) * 0.1
+        tensor_entries.append((name, data, ttype))
 
     # ─── Write file ────────────────────────────────────────────────────
-    use_f32 = (1 if arch_name == "bitnet" else
-               (0 if use_tq1 == "ttype7" else
-                (core["use_f32_bypass"] if core else 0)))
+    if "use_f32_bypass" in cfg:
+        use_f32 = cfg["use_f32_bypass"]
+    else:
+        use_f32 = (1 if arch_name == "bitnet" else
+                   (0 if use_tq1 == "ttype7" else
+                    (core["use_f32_bypass"] if core else 0)))
     meta = {
         "arch": arch_name,
         "rope_interleaved": cfg["rope_interleaved"],
@@ -611,6 +729,16 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
         "rope_scale": 1.0,
         "base_seq_len": 2048,
     }
+    if is_mla:
+        meta["kv_lora_rank"] = cfg["kv_lora_rank"]
+        meta["qk_nope_head_dim"] = cfg["qk_nope_head_dim"]
+        meta["qk_rope_head_dim"] = cfg["qk_rope_head_dim"]
+        meta["v_head_dim"] = cfg["v_head_dim"]
+        meta["n_shared_experts"] = cfg["n_shared_experts"]
+        meta["first_k_dense_replace"] = cfg["first_k_dense_replace"]
+        meta["n_routed_experts"] = cfg["n_routed_experts"]
+        meta["n_activated_experts"] = cfg["n_activated_experts"]
+        meta["moe_intermediate_size"] = cfg["moe_intermediate_size"]
     meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
     meta_size = 4 + len(meta_bytes)
 
@@ -679,6 +807,11 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
                           row_sums.tobytes())
                 ppr = 0
                 tens_ttype = 3
+            elif ttype == 2:
+                # fp16 matrix (router gate)
+                packed = data_f32.astype(np.float16).tobytes()
+                ppr = 0
+                tens_ttype = 2
             else:
                 packed = data_f32.astype(np.float16).tobytes()
                 ppr = 0
