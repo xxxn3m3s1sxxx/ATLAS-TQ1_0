@@ -71,6 +71,17 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 - **Shared Expert Names**: C++ nutzt `mlp.shared_experts.gate_proj.weight` (Plural, Dot-separated) — nicht `shared_expert`.
 - **Buffer Aliasing MoE**: `tmp_down = buf_hidden + b*H` — darf nicht `output` oder `buf_gate` aliasen (wird bei MoE-Dispatch überschrieben).
 - **moe_expert_tidx**: Flat vector `[layer * n_experts * 3 + expert * 3 + proj]` → tensor index. proj: 0=gate, 1=up, 2=down. Populated in `atlas_repack_experts()`.
+- **Kein alloca/VLA auf dem heißen Pfad**: `alloca` und VLAs sind auf dem Inferenzpfad (`atlas_attention_mla`, `atlas_moe_forward`, `forward_layer_internal_mla`) strikt verboten — `alloca` gibt Speicher erst beim Verlassen der Funktion frei, nicht pro Schleifeniteration. Bei32K Kontext → Stack Overflow. Al temporärer Workspace muss über pre-kalkulierte Heap-Offsets (`attn_ws`) alloziert und recycelt werden.
+- **attn_ws Layout (MLA)**: `attn_ws` dient als wiederverwendbares Ring-Scratchpad für die gesamte MLA-Inferenz:
+  ```
+  [0, B·qd)              q_full
+  [B·qd, 2·B·qd)         attn_out
+  [2·B·qd, +B·rope)       k_pe_all (→ danach x_safe reusen)
+  [+, +kv_out)             kv_out (per-position)
+  [+, +lora)               c_kv_f32 (per-position)
+  [+, +rope)               k_pe_f32 (per-position)
+  ```
+  `x_safe` (MoE) reusert `attn_ws[0..B·H)` — q_full ist tot nach Attention. Lebenszyklen überlappen zu keinem Zeitpunkt.
 
 ## Skills (in .opencode/skills/)
 
