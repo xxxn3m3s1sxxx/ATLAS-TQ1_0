@@ -1,6 +1,6 @@
 # ATLAS — TQ1.0 Ternary Inference Engine (ARCHIVED)
 
-**Status**: v2.16.1, Juni 2026. Eingestellt. Keine weiteren Commits.
+**Status**: v2.17.0, Juli 2026.
 **Repo**: `xxxn3m3s1sxxx/ATLAS-TQ1_0` auf GitHub.
 
 Keine Weiterentwicklung. Das TQ1.0-Format und der Packer sind das eigentliche Artefakt — die Engine ist durch DDR4-Bandbreite physikalisch begrenzt (~20 GB/s → ~3 tok/s für 7B).
