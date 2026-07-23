@@ -61,13 +61,16 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
   - BitNet: `{Role}: {content}<|eot_id|>\n`, EOS=128009
   - Llama3 Instruct: `<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\n{content}<|eot_id|>`
   - Llama3 Base: Kein Template anwenden!
+  - DeepSeek-V2: ChatML (identisch zu Qwen3/CANN) + MLA compressed KV cache
 - **CANN dual EOS**: Sowohl `</s>` (ID 2) als auch `<|im_end|>` (ID 73440) terminieren.
 - **C++ binary tokenizer**: v6-Format, kein transformers-Dependency zur Runtime. `tokenizers`-Lib nur für Python-seitiges Encoding nötig.
 - **ARM64 Port**: `atlas_kernel_arm64.cpp` wird bei x86-Build nicht kompiliert. Build mit `-D__aarch64__`. `__arm64__` statt `__aarch64__` unter Homebrew LLVM → die Portabilitäts-Block mapped auch `_M_ARM64`.
 - **KV Cache Reset**: `model.reset_cache()` nach Kontext-Wechsel. Ring-Buffer überschreibt älteste Positionen bei `seq_now > max_seq_len`.
+- **MLA layer_stride**: 12 — indices: [0]ln1 [1]q [2]kv_a [3]kv_b [4]o [5]ln2 [6]shared_gate [7]shared_up [8]shared_down [9]kv_a_layernorm [10]router [11]dummy
 - **MLA compressed KV**: DeepSeek-V2 nutzt komprimierte KV-Cache (kv_lora_rank + qk_rope_head_dim) pro Position. `compressed_kv_stride = kv_lora_rank + qk_rope_head_dim`.
 - **Shared Expert Names**: C++ nutzt `mlp.shared_experts.gate_proj.weight` (Plural, Dot-separated) — nicht `shared_expert`.
 - **Buffer Aliasing MoE**: `tmp_down = buf_hidden + b*H` — darf nicht `output` oder `buf_gate` aliasen (wird bei MoE-Dispatch überschrieben).
+- **moe_expert_tidx**: Flat vector `[layer * n_experts * 3 + expert * 3 + proj]` → tensor index. proj: 0=gate, 1=up, 2=down. Populated in `atlas_repack_experts()`.
 
 ## Skills (in .opencode/skills/)
 
@@ -80,5 +83,5 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 
 - 5 ternäre Trits pro Byte (Base-3), ~1.58 bits/weight
 - v6 Header: 64 Bytes, gefolgt von Tensor-Directory, Name-Block, Tensor-Daten, Binary-Tokenizer
-- ttype=0: TQ1 packed, ttype=3: int8 dekomprimiert, ttype=5: TQ1 g128 block-scaled, ttype=8: int4 packed, ttype=10: TQ2 universal
+- ttype=0: TQ1 packed, ttype=3: int8 dekomprimiert, ttype=5: TQ1 g128 block-scaled, ttype=8: int4 packed, ttype=11: int8 row-scaled, ttype=10: TQ2 universal
 - `.i8` Cache: Auto-generiert bei erstem int8-Decompress, mmap'd beim Reload
