@@ -5767,6 +5767,11 @@ static void atlas_attention_mla(
     // Scratch for per-position kv_b output
     float* kv_out = (float*)alloca((size_t)kv_b_rows * sizeof(float));
 
+    // Hoist c_kv_f32 and k_pe_f32 outside ring loops to avoid alloca accumulation
+    // (alloca is only freed when the FUNCTION returns, not when loop scope exits)
+    float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
+    float* k_pe_f32 = (float*)alloca(rope * sizeof(float));
+
     // Attention scores buffer (heap-allocated for large seq)
     static thread_local float* scores_buf = nullptr;
     static thread_local size_t scores_cap = 0;
@@ -5797,7 +5802,7 @@ static void atlas_attention_mla(
             const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
                 ((size_t)layer * max_seq_len + cache_pos) * stride;
 
-            float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
+            // c_kv_f32 already hoisted before ring loop
             for (int i = 0; i < lora; i++)
                 c_kv_f32[i] = fp16_to_fp32(c_kv_fp16[i]);
 
@@ -5809,8 +5814,7 @@ static void atlas_attention_mla(
                     matmul_f32_row_major(kv_b_rows, kv_b_dim, w_kv_b, c_kv_f32, kv_b_scale, kv_out);
             }
 
-            // Load k_pe from cache (fp16 → f32), apply RoPE based on position
-            float* k_pe_f32 = (float*)alloca(rope * sizeof(float));
+            // k_pe_f32 already hoisted before ring loop
             for (int i = 0; i < rope; i++)
                 k_pe_f32[i] = fp16_to_fp32(c_kv_fp16[lora + i]);
 
@@ -5891,7 +5895,7 @@ static void atlas_attention_mla(
             // Reload c_kv and recompute kv_b output for V
             const uint16_t* c_kv_fp16 = (const uint16_t*)m->compressed_kv_cache +
                 ((size_t)layer * max_seq_len + cache_pos) * stride;
-            float* c_kv_f32 = (float*)alloca(lora * sizeof(float));
+            // c_kv_f32 already hoisted before ring loop
             for (int i = 0; i < lora; i++)
                 c_kv_f32[i] = fp16_to_fp32(c_kv_fp16[i]);
 
@@ -6031,7 +6035,15 @@ static void atlas_moe_forward(
     }
 
     // ── 3. Expert dispatch: Sparse FFN for active experts ──
-    memset(output, 0, (size_t)B * H * sizeof(float));
+    // ACCUMULATE into buf_hidden (NOT output) to avoid aliasing:
+    // output == buf_gate (from caller), gate projection writes buf_gate[0..inter],
+    // so accumulating into output would be overwritten by next expert's gate proj.
+    memset(m->buf_hidden, 0, (size_t)B * H * sizeof(float));
+
+    // Copy x_norm to scratch to avoid aliasing: x_norm == buf_act == ab.
+    // For B>1, SiLU for b=0 overwrites buf_act[0..inter], corrupting x_norm for b=1+.
+    float* x_safe = (float*)alloca((size_t)B * H * sizeof(float));
+    memcpy(x_safe, x_norm, (size_t)B * H * sizeof(float));
 
     // Process each (batch, selected-expert) pair
     for (int k = 0; k < n_active; k++) {
@@ -6050,7 +6062,7 @@ static void atlas_moe_forward(
             auto& t_u = m->tensors[tidx_u];
             auto& t_d = m->tensors[tidx_d];
 
-            const float* xb = x_norm + b * H;
+            const float* xb = x_safe + b * H;
             float* gb = m->buf_gate;   // [inter] — reused per (b,k)
             float* ub = m->buf_up;     // [inter]
             float* ab = m->buf_act;    // [inter] — SiLU(gate)*up result
@@ -6175,9 +6187,9 @@ static void atlas_moe_forward(
                 ab[i] = gate_activation(gb[i], false) * ub[i];
             for (int i = inter; i < inter_e; i++) ab[i] = 0.0f;
 
-            // ── down projection: ab[inter] → accumulate into output[b*H] ──
-            float* ob = output + b * H;
-            float* tmp_down = m->buf_hidden + b * H;
+            // ── down projection: ab[inter] → accumulate into buf_hidden[b*H] ──
+            float* ob = m->buf_hidden + b * H;
+            float* tmp_down = m->buf_up + b * H;  // buf_up freed after SiLU
             if (t_d.ttype == 3) {
                 int8_t* dw; int32_t* drs; int d_rows, d_dim; float d_scale;
                 get_i8(t_d, dw, drs, d_rows, d_dim, d_scale);
@@ -6387,18 +6399,18 @@ static void atlas_moe_forward(
             for (int i = inter; i < inter_sd; i++) tmp[i] = 0.0f;
         }
 
-        // down projection: tmp → accumulate into output (m->buf_gate)
-        float* tmp_shared = m->buf_hidden;
+        // down projection: tmp → accumulate into buf_hidden (routed expert accumulator)
+        float* tmp_shared = m->buf_gate;  // buf_gate free after SiLU, use as scratch
         if (t_sd.ttype == 11) {
             const uint16_t* rs_fp16 = (const uint16_t*)(t_sd.data);
             const int8_t* w = (int8_t*)(t_sd.data + t_sd.row_dim * 2);
             int dim11 = t3_dim(t_sd);
             matmul_f32_row_major_per_row_batched(t_sd.row_dim, dim11, w, m->buf_act, inter_sd, rs_fp16, tmp_shared, B);
-            for (int i = 0; i < B * H; i++) output[i] += tmp_shared[i];
+            for (int i = 0; i < B * H; i++) m->buf_hidden[i] += tmp_shared[i];
         } else if (t_sd.ttype == 3) {
             get_i8(t_sd, sd_w, sd_rs, sd_rows, sd_dim, sd_scale);
             matmul_f32_row_major_batched(sd_rows, sd_dim, sd_w, m->buf_act, inter_sd, sd_scale, tmp_shared, B);
-            for (int i = 0; i < B * H; i++) output[i] += tmp_shared[i];
+            for (int i = 0; i < B * H; i++) m->buf_hidden[i] += tmp_shared[i];
         } else if (t_sd.ttype == 8) {
             uint16_t s16; memcpy(&s16, t_sd.data, 2); float sc = fp16_to_fp32(s16);
             int rows = t_sd.row_dim, pw = t_sd.packed_cols;
@@ -6437,13 +6449,16 @@ static void atlas_moe_forward(
                                                 : (int8_t)(((w[c / 2] & 0x0F) ^ 8) - 8);
                             s += a[c] * (float)wv;
                         }
-                        m->buf_hidden[b * rows + ur * 4 + sub] = s / sc;
+                        m->buf_gate[b * rows + ur * 4 + sub] = s / sc;
                     }
                 }
             }
-            for (int i = 0; i < B * H; i++) output[i] += m->buf_hidden[i];
+            for (int i = 0; i < B * H; i++) m->buf_hidden[i] += m->buf_gate[i];
         }
     }
+
+    // ── 5. Copy accumulated result from buf_hidden to output ──
+    memcpy(output, m->buf_hidden, (size_t)B * H * sizeof(float));
 }
 
 // ─── MLA Layer Wrapper: Complete transformer layer for DeepSeek-V2 ───
@@ -6563,9 +6578,14 @@ static void forward_layer_internal_mla(
     }
 
     // ─── 4. Apply RoPE to Q (q_pe portion only) ───
-    float total_scale = fmaxf(1.0f, (float)m->compressed_kv_max_seq / 4096.0f);
-    float rope_scale = fmaxf(1.0f, total_scale);
-    float eff_theta = theta * powf(rope_scale, (float)rope / (rope - 2));
+    // Use same NTK scaling formula as K RoPE in atlas_attention_mla
+    float ctx_scale = m->base_seq_len > 0 ? (float)max_seq_len / (float)m->base_seq_len : 1.0f;
+    if (ctx_scale < 1.0f) ctx_scale = 1.0f;
+    float total_scale = m->rope_scale;
+    if (ctx_scale > 1.001f) total_scale *= ctx_scale;
+    float eff_theta = theta;
+    if (total_scale > 1.001f)
+        eff_theta *= powf(total_scale, (float)rope / (float)(rope - 2));
     for (int b = 0; b < B; b++) {
         int pos = positions[b];
         float* qb = q_full + b * qd;
