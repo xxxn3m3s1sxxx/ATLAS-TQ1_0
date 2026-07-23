@@ -172,6 +172,19 @@ class SafetensorsReader:
     def has_tensor(self, tname):
         return tname in self.weight_map
 
+    def get_tensor_shape(self, tname):
+        sp = self.weight_map.get(tname)
+        if sp is None:
+            return None
+        if tname in self._in_memory:
+            return list(self._in_memory[tname].shape)
+        if sp.endswith(".safetensors"):
+            fp = os.path.join(self.model_dir, sp)
+            if fp not in self._shards_np:
+                self._shards_np[fp] = safe_open(fp, framework="np")
+            return list(self._shards_np[fp].get_slice(tname).get_shape())
+        return None
+
     def close(self):
         self._shards_np.clear()
         self._shards_pt.clear()
@@ -717,6 +730,29 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             if reader.has_tensor(tname):
                 tensor_names.append(tname)
 
+    # V3 detection: if q_a_proj exists in reader, it's a V3 model
+    has_v3 = reader.has_tensor("model.layers.0.self_attn.q_a_proj.weight")
+    if has_v3:
+        print("  V3 detected: using q_a/q_b projection + gated o_proj")
+        # Rebuild tensor list with V3 names — replace q_proj→q_a_proj, o_proj→o_proj.0
+        new_tensors = []
+        for tname in tensor_names:
+            if "self_attn.q_proj.weight" in tname:
+                new_tensors.append(tname.replace("self_attn.q_proj.weight",
+                                                  "self_attn.q_a_proj.weight"))
+            elif "self_attn.o_proj.weight" in tname:
+                new_tensors.append(tname.replace("self_attn.o_proj.weight",
+                                                  "self_attn.o_proj.0.weight"))
+            else:
+                new_tensors.append(tname)
+        tensor_names = new_tensors
+        # Add V3 extra tensors (q_b, q_a_layernorm, o_proj.1, o_proj.2)
+        for L in range(n_layers):
+            for extra in arch.get("layer_tensors_v3", []):
+                tname = extra.format(L)
+                if reader.has_tensor(tname) and tname not in tensor_names:
+                    tensor_names.append(tname)
+
     # MoE tensors (if arch has MoE support)
     if arch.get("is_moe") and n_routed_experts > 0:
         for L in range(n_layers):
@@ -763,6 +799,13 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             # Bare name like "lm_head.weight" — treat as conditional global
             if pattern not in tensor_names and reader.has_tensor(pattern):
                 tensor_names.append(pattern)
+
+    # tie_word_embeddings: if lm_head missing but embed_tokens exists, use embed as lm_head
+    if "lm_head.weight" not in tensor_names and "model.embed_tokens.weight" in tensor_names:
+        tie = cfg.get("tie_word_embeddings", False)
+        if tie:
+            tensor_names.append("lm_head.weight")
+            print("  tie_word_embeddings: using embed_tokens as lm_head")
 
     # SubLN tensors (BitNet/TriLM) — detect by presence
     for L in range(n_layers):
@@ -877,6 +920,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 "n_activated_experts": num_experts_per_tok,
                 "rope_theta": rope_theta,
                 "kv_lora_rank": cfg.get("kv_lora_rank", 0),
+                "q_lora_rank": cfg.get("q_lora_rank", 0),
                 "qk_nope_head_dim": cfg.get("qk_nope_head_dim", 0),
                 "qk_rope_head_dim": cfg.get("qk_rope_head_dim", 0),
                 "v_head_dim": cfg.get("v_head_dim", 0),
@@ -908,6 +952,14 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             is_moe_router = ("mlp.gate.weight" in name and
                              "experts" not in name and
                              "shared_experts" not in name)
+            # V3 bias vector (o_proj.1): 1D, treat as non-weight
+            if is_weight:
+                try:
+                    _shp = reader.get_tensor_shape(name)
+                    if _shp is not None and len(_shp) < 2:
+                        is_weight = False
+                except Exception:
+                    pass
 
             # ── Determine quantization path ──────────────────────────
             if is_moe_router:
@@ -1040,7 +1092,12 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 try:
                     tensor = reader.get_tensor_np(name)
                 except Exception:
-                    tensor = reader.get_bf16_manual(name)
+                    # tie_word_embeddings fallback: lm_head from embed_tokens
+                    if name == "lm_head.weight" and "model.embed_tokens.weight" in tensor_names:
+                        print(f"    tied: lm_head <- embed_tokens")
+                        tensor = reader.get_tensor_np("model.embed_tokens.weight")
+                    else:
+                        tensor = reader.get_bf16_manual(name)
 
                 if "embed" in name:
                     embed_ref = reader._in_memory.get(name) if reader._in_memory else None

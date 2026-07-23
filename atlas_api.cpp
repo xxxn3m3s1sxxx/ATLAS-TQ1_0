@@ -756,9 +756,11 @@ struct AtlasModel {
     // ─── MLA (Multi-head Latent Attention) — DeepSeek-V2/V3 ──────────────
     bool is_mla = false;             // true = MLA architecture (DeepSeek-V2)
     int kv_lora_rank = 0;            // compressed KV latent dimension (512 for DS-V2)
+    int q_lora_rank = 0;             // query compression rank (0=no compression=V2-Lite, >0=V3)
     int qk_nope_head_dim = 0;        // non-RoPE portion of Q/K head (128)
     int qk_rope_head_dim = 0;        // RoPE portion of Q/K head (64)
     int v_head_dim = 0;              // V head dimension (128)
+    bool has_gated_o_proj = false;   // V3: gated output projection (o_proj.0/1/2)
     int n_shared_experts = 0;        // always-active shared experts (2 for DS-V2)
     int first_k_dense_replace = 0;   // layers 0..N-1 are dense, N+ are MoE
     // Compressed KV cache: [n_layers × max_seq × compressed_kv_stride] fp16
@@ -991,6 +993,11 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     // ─── MLA (Multi-head Latent Attention) fields ───
     v = find_after(json, "\"kv_lora_rank\"");
     if (v) { m->kv_lora_rank = (int)strtol(v, nullptr, 10); m->is_mla = true; }
+    v = find_after(json, "\"q_lora_rank\"");
+    if (v) {
+        if (*v == 'n' || *v == 'N') m->q_lora_rank = 0;  // "null"
+        else m->q_lora_rank = (int)strtol(v, nullptr, 10);
+    }
     v = find_after(json, "\"qk_nope_head_dim\"");
     if (v) m->qk_nope_head_dim = (int)strtol(v, nullptr, 10);
     v = find_after(json, "\"qk_rope_head_dim\"");
@@ -1010,10 +1017,12 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     if (m->is_mla) {
         m->compressed_kv_stride = m->kv_lora_rank + m->qk_rope_head_dim;
         // MLA layer_stride: 6 fixed + 3*n_shared + kv_a_layernorm + router
+        // V3 adds: q_b_proj + q_a_layernorm + o_proj.1 + o_proj.2 = +4
         int ns = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
-        m->layer_stride = 6 + 3 * ns + 2;
-        printf("[ATLAS] MLA: kv_lora=%d nope=%d rope=%d v_head=%d dense_up_to=%d routed=%d act=%d shared=%d intermediate=%d stride=%d\n",
-               m->kv_lora_rank, m->qk_nope_head_dim, m->qk_rope_head_dim, m->v_head_dim,
+        int extra_v3 = (m->q_lora_rank > 0) ? 4 : 0;  // q_b, q_a_ln, o.1, o.2
+        m->layer_stride = 6 + 3 * ns + 2 + extra_v3;
+        printf("[ATLAS] MLA: kv_lora=%d q_lora=%d nope=%d rope=%d v_head=%d dense_up_to=%d routed=%d act=%d shared=%d intermediate=%d stride=%d\n",
+               m->kv_lora_rank, m->q_lora_rank, m->qk_nope_head_dim, m->qk_rope_head_dim, m->v_head_dim,
                m->first_k_dense_replace, m->n_experts, m->n_experts_active, m->n_shared_experts, m->inter_dim,
                m->layer_stride);
     }
@@ -6554,9 +6563,76 @@ static void forward_layer_internal_mla(
     fprintf(stderr, "[MLA_STEP] L=%d step2_post_rmsnorm\n", layer);
     #endif
 
-    // ─── 2. Q projection: x_norm → W_q → [B, qd] (row-major, no blocked layout) ───
+    // ─── 2. Q projection: V3 (q_a → layernorm → q_b) or V2-Lite (single q_proj) ───
     float* q_full = m->attn_ws;  // [B * qd]
-    {
+    int ns_fwd = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
+    int kv_ln_fwd = 6 + 3 * ns_fwd;
+    if (m->q_lora_rank > 0) {
+        // V3 path: x_norm → q_a_proj → rmsnorm → q_b_proj → q_full
+        float* q_comp = m->buf_hidden;  // [B, q_lora_rank] scratch
+        // Step 2a: q_a projection: x_norm[H] → q_comp[q_lora_rank]
+        {
+            auto& t_qa = m->tensors[idx[1]];  // q_a_proj
+            if (t_qa.ttype == 3 && m->use_f32_matmul) {
+                int8_t* w; int32_t* rs; int rows, dim; float scale;
+                get_i8(t_qa, w, rs, rows, dim, scale);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * dim, x_norm + b * H, H * sizeof(float));
+                    memset(m->buf_act + b * dim + H, 0, (dim - H) * sizeof(float));
+                }
+                matmul_f32_row_major_batched(rows, dim, w, m->buf_act, dim, scale, q_comp, B);
+            } else if (t_qa.ttype == 11 && m->use_f32_matmul) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(t_qa.data);
+                const int8_t* w = (int8_t*)(t_qa.data + t_qa.row_dim * 2);
+                int rows = t_qa.row_dim;
+                int dim = t3_dim(t_qa);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * dim, x_norm + b * H, H * sizeof(float));
+                    memset(m->buf_act + b * dim + H, 0, (dim - H) * sizeof(float));
+                }
+                matmul_f32_row_major_per_row_batched(rows, dim, w, m->buf_act, dim, rs_fp16, q_comp, B);
+            }
+        }
+        // Step 2b: q_a_layernorm: q_comp[B, q_lora_rank] → q_comp_norm
+        {
+            auto& t_qa_ln = m->tensors[idx[kv_ln_fwd + 3]];  // q_a_layernorm
+            if (t_qa_ln.data) {
+                for (int b = 0; b < B; b++) {
+                    float ss = 0.0f;
+                    for (int i = 0; i < m->q_lora_rank; i++) ss += q_comp[b * m->q_lora_rank + i] * q_comp[b * m->q_lora_rank + i];
+                    float rms = 1.0f / sqrtf(ss / m->q_lora_rank + 1e-6f);
+                    for (int i = 0; i < m->q_lora_rank; i++) {
+                        uint16_t w16; memcpy(&w16, t_qa_ln.data + i * 2, 2);
+                        q_comp[b * m->q_lora_rank + i] *= rms * fp16_to_fp32(w16);
+                    }
+                }
+            }
+        }
+        // Step 2c: q_b projection: q_comp[q_lora_rank] → q_full[nH * qk_head_dim]
+        {
+            auto& t_qb = m->tensors[idx[kv_ln_fwd + 2]];  // q_b_proj
+            if (t_qb.ttype == 3 && m->use_f32_matmul) {
+                int8_t* w; int32_t* rs; int rows, dim; float scale;
+                get_i8(t_qb, w, rs, rows, dim, scale);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * dim, q_comp + b * m->q_lora_rank, m->q_lora_rank * sizeof(float));
+                    memset(m->buf_act + b * dim + m->q_lora_rank, 0, (dim - m->q_lora_rank) * sizeof(float));
+                }
+                matmul_f32_row_major_batched(rows, dim, w, m->buf_act, dim, scale, q_full, B);
+            } else if (t_qb.ttype == 11 && m->use_f32_matmul) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(t_qb.data);
+                const int8_t* w = (int8_t*)(t_qb.data + t_qb.row_dim * 2);
+                int rows = t_qb.row_dim;
+                int dim = t3_dim(t_qb);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_act + b * dim, q_comp + b * m->q_lora_rank, m->q_lora_rank * sizeof(float));
+                    memset(m->buf_act + b * dim + m->q_lora_rank, 0, (dim - m->q_lora_rank) * sizeof(float));
+                }
+                matmul_f32_row_major_per_row_batched(rows, dim, w, m->buf_act, dim, rs_fp16, q_full, B);
+            }
+        }
+    } else {
+        // V2-Lite path: single q_proj
         auto& tq = m->tensors[idx[1]];
         if (tq.ttype == 3 && m->use_f32_matmul) {
             int8_t* w; int32_t* rs; int rows, dim; float scale;
@@ -6675,8 +6751,78 @@ static void forward_layer_internal_mla(
     fprintf(stderr, "[MLA_STEP] L=%d step5_post_attn\n", layer);
     #endif
 
-    // ─── 6. O projection: attn_out → W_o → [B, H] (row-major) ───
-    {
+    // ─── 6. O projection: V3 gated (compress → bias → expand) or V2-Lite (single) ───
+    if (m->has_gated_o_proj) {
+        // V3 path: attn_out → W_gate → bias → W_up → output
+        // Step 6a: Extract V from attn_out (same as V2-Lite: first v_head_dim of each head)
+        int v_out_dim = nH * m->v_head_dim;
+        for (int b = 0; b < B; b++) {
+            const float* src = attn_out + b * qd;
+            float* dst = m->buf_act + b * v_out_dim;
+            for (int h = 0; h < nH; h++)
+                memcpy(dst + h * m->v_head_dim, src + h * hd, m->v_head_dim * sizeof(float));
+        }
+        // Step 6b: Gate projection: v_out[v_out_dim] → latent[kv_lora+qk_rope]
+        int latent_dim = m->kv_lora_rank + m->qk_rope_head_dim;
+        {
+            auto& t_og = m->tensors[idx[4]];  // o_proj.0 (gate)
+            if (t_og.ttype == 3 && m->use_f32_matmul) {
+                int8_t* w; int32_t* rs; int rows, dim; float scale;
+                get_i8(t_og, w, rs, rows, dim, scale);
+                for (int b = 0; b < B; b++) {
+                    int copy_dim = v_out_dim < dim ? v_out_dim : dim;
+                    memcpy(m->buf_up + b * dim, m->buf_act + b * v_out_dim, copy_dim * sizeof(float));
+                    if (dim > copy_dim) memset(m->buf_up + b * dim + copy_dim, 0, (dim - copy_dim) * sizeof(float));
+                }
+                matmul_f32_row_major_batched(rows, dim, w, m->buf_up, dim, scale, m->buf_gate, B);
+            } else if (t_og.ttype == 11 && m->use_f32_matmul) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(t_og.data);
+                const int8_t* w = (int8_t*)(t_og.data + t_og.row_dim * 2);
+                int rows = t_og.row_dim;
+                int dim = t3_dim(t_og);
+                for (int b = 0; b < B; b++) {
+                    int copy_dim = v_out_dim < dim ? v_out_dim : dim;
+                    memcpy(m->buf_up + b * dim, m->buf_act + b * v_out_dim, copy_dim * sizeof(float));
+                    if (dim > copy_dim) memset(m->buf_up + b * dim + copy_dim, 0, (dim - copy_dim) * sizeof(float));
+                }
+                matmul_f32_row_major_per_row_batched(rows, dim, w, m->buf_up, dim, rs_fp16, m->buf_gate, B);
+            }
+        }
+        // Step 6c: Add bias (o_proj.1)
+        {
+            auto& t_ob = m->tensors[idx[kv_ln_fwd + 4]];  // o_proj.1 (bias)
+            if (t_ob.data) {
+                const uint16_t* bias16 = (const uint16_t*)t_ob.data;
+                for (int b = 0; b < B; b++)
+                    for (int i = 0; i < latent_dim; i++)
+                        m->buf_gate[b * latent_dim + i] += fp16_to_fp32(bias16[i]);
+            }
+        }
+        // Step 6d: Expand: latent[latent_dim] → output[H]
+        {
+            auto& t_ou = m->tensors[idx[kv_ln_fwd + 5]];  // o_proj.2 (up)
+            if (t_ou.ttype == 3 && m->use_f32_matmul) {
+                int8_t* w; int32_t* rs; int rows, dim; float scale;
+                get_i8(t_ou, w, rs, rows, dim, scale);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_up + b * dim, m->buf_gate + b * latent_dim, latent_dim * sizeof(float));
+                    if (dim > latent_dim) memset(m->buf_up + b * dim + latent_dim, 0, (dim - latent_dim) * sizeof(float));
+                }
+                matmul_f32_row_major_batched(rows, dim, w, m->buf_up, dim, scale, m->buf_gate, B);
+            } else if (t_ou.ttype == 11 && m->use_f32_matmul) {
+                const uint16_t* rs_fp16 = (const uint16_t*)(t_ou.data);
+                const int8_t* w = (int8_t*)(t_ou.data + t_ou.row_dim * 2);
+                int rows = t_ou.row_dim;
+                int dim = t3_dim(t_ou);
+                for (int b = 0; b < B; b++) {
+                    memcpy(m->buf_up + b * dim, m->buf_gate + b * latent_dim, latent_dim * sizeof(float));
+                    if (dim > latent_dim) memset(m->buf_up + b * dim + latent_dim, 0, (dim - latent_dim) * sizeof(float));
+                }
+                matmul_f32_row_major_per_row_batched(rows, dim, w, m->buf_up, dim, rs_fp16, m->buf_gate, B);
+            }
+        }
+    } else {
+        // V2-Lite path: single o_proj
         auto& to = m->tensors[idx[4]];
         if (to.ttype == 11 && m->use_f32_matmul) {
             const uint16_t* o_rs_fp16 = (const uint16_t*)(to.data);
@@ -8617,16 +8763,48 @@ static void ensure_layer_idx(AtlasModel* m) {
             push("self_attn.attn_sub_norm.weight");
             push("mlp.ffn_sub_norm.weight");
         } else if (stride > 9 && m->is_mla) {
-            // ─── MLA layer index: dynamic stride = 6 + 3*n_shared + 2 ───
-            // [0] ln1, [1] q, [2] kv_a, [3] kv_b, [4] o, [5] ln2
+            // ─── MLA layer index: dynamic stride ───
+            // V2-Lite: stride = 6 + 3*n_shared + 2
+            // V3 (+q_lora_rank): stride += 4 (q_b, q_a_layernorm, o_proj.1, o_proj.2)
+            // [0] ln1, [1] q (q_a_proj or q_proj), [2] kv_a, [3] kv_b, [4] o (o_proj.0 or o_proj), [5] ln2
             // [6..6+3*n_shared-1] shared experts (gate/up/down per expert)
             // [6+3*n_shared] kv_a_layernorm, [6+3*n_shared+1] router
+            // [6+3*n_shared+2] q_b (V3 only)
+            // [6+3*n_shared+3] q_a_layernorm (V3 only)
+            // [6+3*n_shared+4] o_proj.1 bias (V3 only)
+            // [6+3*n_shared+5] o_proj.2 up (V3 only)
             int ns = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
+            // Detect gated o_proj from tensor names
+            if (m->q_lora_rank > 0 && !m->has_gated_o_proj) {
+                for (int tn = 0; tn < (int)m->tensor_names.size(); tn++) {
+                    if (m->tensor_names[tn].find("self_attn.o_proj.0.weight") != std::string::npos) {
+                        m->has_gated_o_proj = true;
+                        break;
+                    }
+                }
+                // Adjust stride if gated o_proj detected (may differ from parse_meta_block estimate)
+                if (m->has_gated_o_proj) {
+                    int expected = 6 + 3 * ns + 2 + 4;
+                    if (m->layer_stride < expected) {
+                        printf("[ATLAS] V3 detected: extending MLA stride %d → %d (gated o_proj)\n",
+                               m->layer_stride, expected);
+                        m->layer_stride = expected;
+                    }
+                }
+            }
             push("input_layernorm.weight");          // idx[0]
-            push("self_attn.q_proj.weight");          // idx[1]
+            if (m->q_lora_rank > 0) {
+                push("self_attn.q_a_proj.weight");    // idx[1] V3: q_a
+            } else {
+                push("self_attn.q_proj.weight");      // idx[1] V2-Lite: q
+            }
             push("self_attn.kv_a_proj_with_mqa.weight"); // idx[2]
             push("self_attn.kv_b_proj.weight");       // idx[3]
-            push("self_attn.o_proj.weight");          // idx[4]
+            if (m->has_gated_o_proj) {
+                push("self_attn.o_proj.0.weight");    // idx[4] V3: gated o_proj gate
+            } else {
+                push("self_attn.o_proj.weight");      // idx[4] V2-Lite: simple o_proj
+            }
             push("post_attention_layernorm.weight");  // idx[5]
             if (L < m->first_k_dense_replace) {
                 // Dense layer: standard FFN (only 1 set, rest are dummy)
@@ -8647,12 +8825,6 @@ static void ensure_layer_idx(AtlasModel* m) {
                         push("mlp.shared_experts.down_proj.weight");
                     } else {
                         // Additional shared experts: naming convention varies
-                        // DeepSeek-V2: model.layers.{L}.mlp.shared_experts.{si+1}.XXX
-                        // Try numbered format first, fall back to same weights
-                        char buf[128];
-                        snprintf(buf, sizeof(buf), "model.layers.%%d.mlp.shared_experts.%d.gate_proj.weight", si + 1);
-                        // For now: reuse shared_experts weights (weight sharing)
-                        // If separate weights exist, packer will handle them
                         push("mlp.shared_experts.gate_proj.weight");
                         push("mlp.shared_experts.up_proj.weight");
                         push("mlp.shared_experts.down_proj.weight");
@@ -8665,6 +8837,15 @@ static void ensure_layer_idx(AtlasModel* m) {
                 push("mlp.gate.weight");              // idx[kv_ln_idx+1] router
             } else {
                 m->layer_idx_cache.push_back(-1);     // dummy
+            }
+            // ─── V3 extra slots (after router) ───
+            if (m->q_lora_rank > 0) {
+                push("self_attn.q_b_proj.weight");       // idx[kv_ln_idx+2]
+                push("self_attn.q_a_layernorm.weight");  // idx[kv_ln_idx+3]
+            }
+            if (m->has_gated_o_proj) {
+                push("self_attn.o_proj.1.weight");       // idx[kv_ln_idx+4] bias
+                push("self_attn.o_proj.2.weight");       // idx[kv_ln_idx+5] up
             }
         } else {
             push("input_layernorm.weight");

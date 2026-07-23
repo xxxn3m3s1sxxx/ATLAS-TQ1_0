@@ -157,23 +157,34 @@ LLAMA = {
     "flags_fn": lambda cfg: 0,
 }
 
-# ─── DeepSeek-V2 / V2-Lite (MoE + MLA) ─────────────────────────────────
+# ─── DeepSeek-V2 / V2-Lite / V3 (MoE + MLA) ─────────────────────────────
 # DeepSeek-V2 uses Multi-head Latent Attention (MLA) with joint KV compression
 # and Mixture-of-Experts FFN. Layer 0 is dense; layers 1+ are MoE.
-# MLA tensors: kv_a_proj_with_mqa, kv_b_proj, q_proj (V2-Lite: no q_a_proj)
+# V2-Lite: q_proj (no query compression), simple o_proj
+# V3: q_a_proj + q_b_proj (query compression), gated o_proj (o_proj.0/1/2)
+# MLA tensors: kv_a_proj_with_mqa, kv_b_proj
 # MoE tensors: mlp.gate (router), mlp.experts.{E}.gate/up/down, shared_experts
 DEEPSEEK_V2 = {
     "model_types": {"deepseek_v2", "deepseek_v3"},
     # Dense layer tensors (all layers have these)
     "layer_tensors": [
         "model.layers.{}.input_layernorm.weight",
-        # MLA attention (V2-Lite: q_proj; V2: q_a_proj + q_b_proj)
+        # MLA attention — V2-Lite uses q_proj, V3 uses q_a_proj (detected dynamically)
         "model.layers.{}.self_attn.q_proj.weight",
         "model.layers.{}.self_attn.kv_a_proj_with_mqa.weight",
         "model.layers.{}.self_attn.kv_a_layernorm.weight",
         "model.layers.{}.self_attn.kv_b_proj.weight",
         "model.layers.{}.self_attn.o_proj.weight",
         "model.layers.{}.post_attention_layernorm.weight",
+    ],
+    # V3 extra attention tensors (q_a, q_b, q_a_layernorm, gated o_proj)
+    "layer_tensors_v3": [
+        "model.layers.{}.self_attn.q_a_proj.weight",
+        "model.layers.{}.self_attn.q_b_proj.weight",
+        "model.layers.{}.self_attn.q_a_layernorm.weight",
+        "model.layers.{}.self_attn.o_proj.0.weight",
+        "model.layers.{}.self_attn.o_proj.1.weight",
+        "model.layers.{}.self_attn.o_proj.2.weight",
     ],
     "stride": 7,  # base stride (dense attention tensors per layer)
     "global_tensors": ["model.embed_tokens.weight", "model.norm.weight"],
