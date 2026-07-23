@@ -1,4 +1,4 @@
-# ATLAS — TQ1.0 Ternary Inference Engine (ARCHIVED)
+# ATLAS — TQ1.0 Ternary Inference Engine
 
 **Status**: v2.17.0, Juli 2026.
 **Repo**: `xxxn3m3s1sxxx/ATLAS-TQ1_0` auf GitHub.
