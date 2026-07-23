@@ -2091,13 +2091,23 @@ ATLAS_API int atlas_load_cache(AtlasModel* m, const char* atlas_path) {
         }
     }
 
-    // Store mmap handles + size for cleanup in atlas_free
-    m->mmap_base = base;
-    m->mmap_handle = hMap;
-    m->mmap_file = hFile;
-    m->mmap_size = file_size;
-
     printf("[CACHE] Loaded %d/%d tensors\n", replaced, n);
+
+    // Only keep mmap mapping if tensors were replaced (data pointers reference it).
+    // If nothing was replaced, unmap immediately — avoids blocking atlas_save_cache
+    // and keeps mmap_base/handle clean for the destructor.
+    if (replaced > 0) {
+        m->mmap_base = base;
+        m->mmap_handle = hMap;
+        m->mmap_file = hFile;
+        m->mmap_size = file_size;
+    } else {
+#ifdef _WIN32
+        UnmapViewOfFile(base); CloseHandle((HANDLE)hMap); CloseHandle((HANDLE)hFile);
+#else
+        munmap(base, (size_t)(intptr_t)hMap); close((int)(intptr_t)hFile);
+#endif
+    }
     return replaced > 0 ? 1 : 0;
 }
 
@@ -6016,9 +6026,10 @@ static void atlas_moe_forward(
 
     // ── 2. Softmax + Top-K selection per batch ──
     // Store selected expert indices and weights
-    // Use stack for small B, heap for large
-    int selected[B > 0 ? B : 1][64]; // [B, n_active]
-    float expert_weights[B > 0 ? B : 1][64];
+    // Allocate from attn_ws: x_safe [B·H] is dead post-expert-dispatch
+    int moe_ws_off = B * H;
+    int* selected = (int*)(m->attn_ws + moe_ws_off);
+    float* expert_weights = m->attn_ws + moe_ws_off + B * 64;
     for (int b = 0; b < B; b++) {
         float* logits = router_logits + b * n_experts;
         // Softmax
@@ -6047,8 +6058,8 @@ static void atlas_moe_forward(
                 float t = tmp[k]; tmp[k] = tmp[best]; tmp[best] = t;
                 int ti = tmp_idx[k]; tmp_idx[k] = tmp_idx[best]; tmp_idx[best] = ti;
             }
-            selected[b][cnt] = tmp_idx[k];
-            expert_weights[b][cnt] = tmp[k];
+            selected[b * 64 + cnt] = tmp_idx[k];
+            expert_weights[b * 64 + cnt] = tmp[k];
             cnt++;
         }
     }
@@ -6068,8 +6079,8 @@ static void atlas_moe_forward(
     // Process each (batch, selected-expert) pair
     for (int k = 0; k < n_active; k++) {
         for (int b = 0; b < B; b++) {
-            int e = selected[b][k];
-            float w = expert_weights[b][k];
+            int e = selected[b * 64 + k];
+            float w = expert_weights[b * 64 + k];
             if (w == 0.0f) continue;
 
             // Look up gate/up/down tensors via repacked mapping
