@@ -753,7 +753,7 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
         # Header (64 bytes)
         hdr = bytearray(64)
         hdr[0:5] = b"ATLAS"
-        struct.pack_into("<H", hdr, 5, 8)
+        struct.pack_into("<H", hdr, 5, 10)  # v10: 64-bit directory offsets
         struct.pack_into("<H", hdr, 7, n_layers)
         struct.pack_into("<H", hdr, 9, h)
         struct.pack_into("<H", hdr, 11, i)
@@ -770,8 +770,8 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
         f.write(struct.pack("<I", meta_size))
         f.write(meta_bytes)
 
-        # Directory placeholder
-        dir_buf = bytearray(n_tensors * 12)
+        # Directory placeholder (v10: 16-byte entries, 64-bit offset)
+        dir_buf = bytearray(n_tensors * 16)
         f.write(dir_buf)
         # Name block
         f.write(name_block)
@@ -817,14 +817,14 @@ def make(output_path, arch_name, use_tq1=True, corridor=None, head_dim=None):
                 ppr = 0
                 tens_ttype = 1
 
-            # Write directory entry
-            dir_buf[idx * 12] = tens_ttype
-            struct.pack_into("<I", dir_buf, idx * 12 + 1, offset)
-            struct.pack_into("<I", dir_buf, idx * 12 + 5, row_dim)
+            # Write directory entry (v10: 16-byte stride)
+            dir_buf[idx * 16] = tens_ttype
+            struct.pack_into("<Q", dir_buf, idx * 16 + 1, offset)
+            struct.pack_into("<I", dir_buf, idx * 16 + 9, row_dim)
             ppr_clamped = ppr & 0xFFFFFF
-            dir_buf[idx * 12 + 9] = ppr_clamped & 0xFF
-            dir_buf[idx * 12 + 10] = (ppr_clamped >> 8) & 0xFF
-            dir_buf[idx * 12 + 11] = (ppr_clamped >> 16) & 0xFF
+            dir_buf[idx * 16 + 13] = ppr_clamped & 0xFF
+            dir_buf[idx * 16 + 14] = (ppr_clamped >> 8) & 0xFF
+            dir_buf[idx * 16 + 15] = (ppr_clamped >> 16) & 0xFF
 
             f.write(packed)
 

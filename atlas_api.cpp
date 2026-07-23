@@ -1107,17 +1107,25 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         }
     }
 
-    // Read directory
+    // Read directory (v10+: 16-byte entries with 64-bit offset; v9-: 12-byte with 32-bit)
+    int dir_stride = (version >= 10) ? 16 : 12;
     m->tensors.resize(n_tensors);
     std::vector<uint32_t> file_offsets(n_tensors);
     FSEEK(f, 64 + meta_size, SEEK_SET);
     for (int i = 0; i < n_tensors; i++) {
-        uint8_t e[12]; if (fread(e, 1, 12, f) != 12) { fclose(f); delete m; fprintf(stderr, "[ATLAS] Error: truncated file (corrupt tensor directory)\n"); return nullptr; }
+        uint8_t e[16]; if (fread(e, 1, dir_stride, f) != (size_t)dir_stride) { fclose(f); delete m; fprintf(stderr, "[ATLAS] Error: truncated file (corrupt tensor directory)\n"); return nullptr; }
         m->tensors[i].ttype = e[0];
-        memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
-        memcpy(&m->tensors[i].row_dim, e+5, 4);
+        if (version >= 10) {
+            uint64_t off64; memcpy(&off64, e+1, 8);
+            file_offsets[i] = (uint32_t)off64; m->tensors[i].file_offset = file_offsets[i];
+        } else {
+            memcpy(&file_offsets[i], e+1, 4); m->tensors[i].file_offset = file_offsets[i];
+        }
+        int row_off = (version >= 10) ? 9 : 5;
+        memcpy(&m->tensors[i].row_dim, e+row_off, 4);
+        int ppr_off = (version >= 10) ? 13 : 9;
         {
-            uint32_t ppr_val = e[9] | (e[10]<<8) | (e[11]<<16);
+            uint32_t ppr_val = e[ppr_off] | (e[ppr_off+1]<<8) | (e[ppr_off+2]<<16);
             if (m->tensors[i].ttype == 5 || m->tensors[i].ttype == 7) {
                 m->tensors[i].packed_cols = ppr_val & 0x1FFFFF;
             } else {
@@ -1132,7 +1140,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
         int nb_size; memcpy(&nb_size, hdr+56, 4);
         if (nb_size > 0) {
             // Names stored right after directory: [name_block_size:4] [name_0\0]... 
-            FSEEK(f, 64 + meta_size + n_tensors * 12, SEEK_SET);
+            FSEEK(f, 64 + meta_size + n_tensors * dir_stride, SEEK_SET);
             uint8_t* nb = new uint8_t[nb_size];
             if (fread(nb, 1, nb_size, f) != (size_t)nb_size) { delete[] nb; fclose(f); delete m; fprintf(stderr, "[ATLAS] Error: truncated file (tensor names)\n"); return nullptr; }
             int pos = 4;  // skip size field

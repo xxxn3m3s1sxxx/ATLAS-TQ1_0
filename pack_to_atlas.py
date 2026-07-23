@@ -649,7 +649,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         per_row_int8: Per-row int8 quantization (ttype=11) instead of per-tensor. Reduces quantization noise.
     """
     # ── Read config ────────────────────────────────────────────────
-    with open(os.path.join(model_dir, "config.json")) as f:
+    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
 
     hidden = cfg["hidden_size"]
@@ -800,7 +800,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
     with open(output_path, "wb") as out:
         header = bytearray(64)
         header[0:5] = b"ATLAS"
-        struct.pack_into("<H", header, 5, 5)  # v5 (may upgrade to v7 later)
+        struct.pack_into("<H", header, 5, 10)  # v10: 64-bit directory offsets
         struct.pack_into("<H", header, 7, n_layers)
         struct.pack_into("<H", header, 9, hidden)
         struct.pack_into("<H", header, 11, inter)
@@ -827,7 +827,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         # where eos_token_id in config.json is wrong/points to BOS instead of EOT)
         tcfg_path = os.path.join(model_dir, "tokenizer_config.json")
         if os.path.exists(tcfg_path):
-            with open(tcfg_path) as tcf:
+            with open(tcfg_path, encoding="utf-8") as tcf:
                 tcfg = json.load(tcf)
             ec = tcfg.get("eos_token")
             if isinstance(ec, dict) and "id" in ec:
@@ -864,7 +864,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             }
             meta_json = json.dumps(meta).encode("utf-8")
             meta_bytes = struct.pack("<I", 4 + len(meta_json)) + meta_json
-            struct.pack_into("<H", header, 5, 8)  # upgrade to v8
+            struct.pack_into("<H", header, 5, 10)  # v10: 64-bit directory offsets
 
         # v9 meta block (for MoE models: DeepSeek-V2/V3)
         if n_routed_experts > 0:
@@ -883,7 +883,7 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
             }
             meta_json = json.dumps(meta).encode("utf-8")
             meta_bytes = struct.pack("<I", 4 + len(meta_json)) + meta_json
-            struct.pack_into("<H", header, 5, 9)  # upgrade to v9
+            struct.pack_into("<H", header, 5, 10)  # v10: 64-bit directory offsets
 
         # Name block
         name_bytes = b"".join(n.encode() + b"\0" for n in tensor_names)
@@ -894,11 +894,11 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
         out.write(meta_bytes)
 
         dir_offset = 64 + len(meta_bytes)
-        data_start = dir_offset + len(tensor_names) * 12 + len(name_block)
-        directory = bytearray(len(tensor_names) * 12)
+        data_start = dir_offset + len(tensor_names) * 16 + len(name_block)
+        directory = bytearray(len(tensor_names) * 16)
         current_offset = data_start
 
-        out.seek(dir_offset + len(tensor_names) * 12)
+        out.seek(dir_offset + len(tensor_names) * 16)
         out.write(name_block)
         out.seek(data_start)
 
@@ -1083,17 +1083,17 @@ def pack_to_atlas(model_dir, output_path, ttype=5, block_size=128, use_v6=True,
                 current_offset += pad
                 out.write(b"\x00" * pad)
 
-            # ── Directory entry ──────────────────────────────────────
-            directory[idx * 12] = tens_ttype
-            struct.pack_into("<I", directory, idx * 12 + 1, current_offset)
-            struct.pack_into("<I", directory, idx * 12 + 5, row_dim)
+            # ── Directory entry (v10: 16-byte stride, 64-bit offset) ────
+            directory[idx * 16] = tens_ttype
+            struct.pack_into("<Q", directory, idx * 16 + 1, current_offset)
+            struct.pack_into("<I", directory, idx * 16 + 9, row_dim)
             if n_blocks:
                 ppr_entry = (packed_per_row & 0x1FFFFF) | (n_blocks << 21)
             else:
                 ppr_entry = packed_per_row & 0xFFFFFF
-            directory[idx * 12 + 9] = ppr_entry & 0xFF
-            directory[idx * 12 + 10] = (ppr_entry >> 8) & 0xFF
-            directory[idx * 12 + 11] = (ppr_entry >> 16) & 0xFF
+            directory[idx * 16 + 13] = ppr_entry & 0xFF
+            directory[idx * 16 + 14] = (ppr_entry >> 8) & 0xFF
+            directory[idx * 16 + 15] = (ppr_entry >> 16) & 0xFF
 
             out.write(data_bytes)
             current_offset += len(data_bytes)
@@ -1177,6 +1177,10 @@ Supported architectures (auto-detected):
                         help="BitNet packed U8 path (--packed flag)")
     parser.add_argument("--thinking", action="store_true",
                         help="Set enable_thinking flag in header")
+    parser.add_argument("--raw-int8", action="store_true",
+                        help="Per-tensor int8 quantization (ttype=3) — for non-ternary models")
+    parser.add_argument("--per-row-int8", action="store_true",
+                        help="Per-row int8 quantization (ttype=11) — lower noise than per-tensor")
     args = parser.parse_args()
 
     pack_to_atlas(
@@ -1187,6 +1191,8 @@ Supported architectures (auto-detected):
         use_v6=args.use_v6,
         packed_path=args.packed,
         thinking=args.thinking,
+        raw_int8=args.raw_int8,
+        per_row_int8=args.per_row_int8,
     )
 
 
