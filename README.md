@@ -1,6 +1,6 @@
 # ATLAS — TQ1.0 Ternary Inference Engine
 
-**v2.16.1 — June 2026 — ARCHIVED**
+**v2.17.0 — July 2026**
 
 CPU inference engine for 1.58-bit ternary-quantized LLMs.
 Born from the question: *"How far can CPU-only + ternary go?"*
@@ -18,6 +18,7 @@ TQ1.0 remains the only production-grade format for ternary 1.58-bit quantization
 - **C API**: `atlas_load`, `atlas_generate`, `atlas_free`
 - **C++ CLI**: `atlas_cli.cpp`
 - **Streaming SSE Server**: `atlas_server.py`
+- **MLA + MoE**: DeepSeek-V2 latent attention + sparse mixture-of-experts (v2.17.0)
 - **ARM64 NEON**: All 8 hot-path kernels ported (v2.16.1)
 - **Binary Tokenizer**: v6 format, no transformers dependency at runtime
 
@@ -39,19 +40,10 @@ Measured on Intel Core i7-7700T (Kaby Lake, DDR4-2400, ~20 GB/s).
 **Detail**: All 29 HF-validated models are available on the [ATLAS Hub](https://huggingface.co/xxxn3m3s1sxxx)
 (Falcon3, Bonsai, BitNet, TriLM, CANN, Llama3-1.58).
 
-## Why archived?
+## Status
 
-Three reasons:
-
-1. **Physics**: DDR4 bandwidth (~20 GB/s) caps all CPU inference.
-   TQ1.0 halves weight size vs GGUF Q4, but the remaining
-   20 GB/s only allows ~3 tok/s for a 7B — kernel-independent.
-
-2. **Proprietary format**: GGUF is the de-facto standard. TQ1.0 is more compact
-   but incompatible. The packer is the missing tool — not the engine.
-
-3. **No ecosystem**: One author, zero users. A project nobody can operate
-   but its author is a diary entry, not a product.
+Active development. MLA (Multi-head Latent Attention) and MoE (Mixture-of-Experts)
+support for DeepSeek-V2 architecture added in v2.17.0.
 
 ## License
 
