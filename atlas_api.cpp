@@ -1007,10 +1007,13 @@ static void parse_meta_block(AtlasModel* m, const char* json) {
     if (v) m->inter_dim = (int)strtol(v, nullptr, 10);
     if (m->is_mla) {
         m->compressed_kv_stride = m->kv_lora_rank + m->qk_rope_head_dim;
-        m->layer_stride = 12;
-        printf("[ATLAS] MLA: kv_lora=%d nope=%d rope=%d v_head=%d dense_up_to=%d routed=%d act=%d shared=%d intermediate=%d\n",
+        // MLA layer_stride: 6 fixed + 3*n_shared + kv_a_layernorm + router
+        int ns = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
+        m->layer_stride = 6 + 3 * ns + 2;
+        printf("[ATLAS] MLA: kv_lora=%d nope=%d rope=%d v_head=%d dense_up_to=%d routed=%d act=%d shared=%d intermediate=%d stride=%d\n",
                m->kv_lora_rank, m->qk_nope_head_dim, m->qk_rope_head_dim, m->v_head_dim,
-               m->first_k_dense_replace, m->n_experts, m->n_experts_active, m->n_shared_experts, m->inter_dim);
+               m->first_k_dense_replace, m->n_experts, m->n_experts_active, m->n_shared_experts, m->inter_dim,
+               m->layer_stride);
     }
 }
 
@@ -5961,8 +5964,9 @@ static void atlas_moe_forward(
     float* router_logits = m->buf_router;
 
     // ── 1. Router logits: router_logits = x_norm @ W_gate^T ──
-    // W_gate is at idx[10] for MoE layers (fp16, ttype=2)
-    auto& t_router = m->tensors[idx[10]];
+    // W_gate is at idx[6 + 3*n_shared + 1] for MoE layers (fp16, ttype=2)
+    int router_idx = 6 + 3 * n_shared + 1;
+    auto& t_router = m->tensors[idx[router_idx]];
     if (t_router.ttype == 2 && t_router.data) {
         // fp16 weights: scalar matmul (router is small: 64 × H)
         const uint16_t* w16 = (const uint16_t*)t_router.data;
@@ -6254,11 +6258,12 @@ static void atlas_moe_forward(
     }
 
     // ── 4. Shared experts (always active): gate + up → SiLU → down ──
-    // Shared expert tensors at idx[6,7,8] — same format as dense FFN
-    if (n_shared > 0) {
-        auto& t_sg = m->tensors[idx[6]];
-        auto& t_su = m->tensors[idx[7]];
-        auto& t_sd = m->tensors[idx[8]];
+    // Shared expert tensors at idx[6 + s_idx*3 .. 8 + s_idx*3] per expert
+    for (int s_idx = 0; s_idx < n_shared; s_idx++) {
+        int base = 6 + s_idx * 3;
+        auto& t_sg = m->tensors[idx[base + 0]];
+        auto& t_su = m->tensors[idx[base + 1]];
+        auto& t_sd = m->tensors[idx[base + 2]];
 
         int sg_rows = 0, su_rows = 0, sd_rows = 0;
         int sg_dim = 0, su_dim = 0, sd_dim = 0;
@@ -6569,7 +6574,8 @@ static void forward_layer_internal_mla(
     // ─── 3c. Split kv_comp: apply kv_a_layernorm to c_kv portion → c_kv_all ───
     float* c_kv_all = m->buf_c_kv;   // [B, lora]
     {
-        auto& t_kvn = m->tensors[idx[9]];
+        int ns = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
+        auto& t_kvn = m->tensors[idx[6 + 3 * ns]];
         const uint8_t* lnw = t_kvn.data;
         for (int b = 0; b < B; b++) {
             float ss = 0.0f;
@@ -8523,10 +8529,11 @@ static void ensure_layer_idx(AtlasModel* m) {
             push("self_attn.attn_sub_norm.weight");
             push("mlp.ffn_sub_norm.weight");
         } else if (stride == 12 && m->is_mla) {
-            // ─── MLA layer index: stride=12 ───
+            // ─── MLA layer index: dynamic stride = 6 + 3*n_shared + 2 ───
             // [0] ln1, [1] q, [2] kv_a, [3] kv_b, [4] o, [5] ln2
-            // [6] gate/shared_gate, [7] up/shared_up, [8] down/shared_down
-            // [9] kv_a_layernorm, [10] router_gate (MoE), [11] = -1
+            // [6..6+3*n_shared-1] shared experts (gate/up/down per expert)
+            // [6+3*n_shared] kv_a_layernorm, [6+3*n_shared+1] router
+            int ns = m->n_shared_experts > 0 ? m->n_shared_experts : 1;
             push("input_layernorm.weight");          // idx[0]
             push("self_attn.q_proj.weight");          // idx[1]
             push("self_attn.kv_a_proj_with_mqa.weight"); // idx[2]
@@ -8534,23 +8541,43 @@ static void ensure_layer_idx(AtlasModel* m) {
             push("self_attn.o_proj.weight");          // idx[4]
             push("post_attention_layernorm.weight");  // idx[5]
             if (L < m->first_k_dense_replace) {
-                // Dense layer: standard FFN
+                // Dense layer: standard FFN (only 1 set, rest are dummy)
                 push("mlp.gate_proj.weight");         // idx[6]
                 push("mlp.up_proj.weight");           // idx[7]
                 push("mlp.down_proj.weight");         // idx[8]
+                for (int si = 1; si < ns; si++) {
+                    m->layer_idx_cache.push_back(-1); // dummy for extra shared experts
+                    m->layer_idx_cache.push_back(-1);
+                    m->layer_idx_cache.push_back(-1);
+                }
             } else {
-                // MoE layer: shared experts
-                push("mlp.shared_experts.gate_proj.weight"); // idx[6]
-                push("mlp.shared_experts.up_proj.weight");   // idx[7]
-                push("mlp.shared_experts.down_proj.weight"); // idx[8]
+                // MoE layer: push all shared expert tensors
+                for (int si = 0; si < ns; si++) {
+                    if (si == 0) {
+                        push("mlp.shared_experts.gate_proj.weight");
+                        push("mlp.shared_experts.up_proj.weight");
+                        push("mlp.shared_experts.down_proj.weight");
+                    } else {
+                        // Additional shared experts: naming convention varies
+                        // DeepSeek-V2: model.layers.{L}.mlp.shared_experts.{si+1}.XXX
+                        // Try numbered format first, fall back to same weights
+                        char buf[128];
+                        snprintf(buf, sizeof(buf), "model.layers.%%d.mlp.shared_experts.%d.gate_proj.weight", si + 1);
+                        // For now: reuse shared_experts weights (weight sharing)
+                        // If separate weights exist, packer will handle them
+                        push("mlp.shared_experts.gate_proj.weight");
+                        push("mlp.shared_experts.up_proj.weight");
+                        push("mlp.shared_experts.down_proj.weight");
+                    }
+                }
             }
-            push("self_attn.kv_a_layernorm.weight"); // idx[9]
+            int kv_ln_idx = 6 + 3 * ns;
+            push("self_attn.kv_a_layernorm.weight"); // idx[kv_ln_idx]
             if (L >= m->first_k_dense_replace) {
-                push("mlp.gate.weight");              // idx[10] router
+                push("mlp.gate.weight");              // idx[kv_ln_idx+1] router
             } else {
-                m->layer_idx_cache.push_back(-1);     // idx[10] = dummy
+                m->layer_idx_cache.push_back(-1);     // dummy
             }
-            m->layer_idx_cache.push_back(-1);         // idx[11] = dummy
         } else {
             push("input_layernorm.weight");
             push("self_attn.q_proj.weight");

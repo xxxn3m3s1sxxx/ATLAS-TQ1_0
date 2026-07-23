@@ -66,7 +66,7 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 - **C++ binary tokenizer**: v6-Format, kein transformers-Dependency zur Runtime. `tokenizers`-Lib nur für Python-seitiges Encoding nötig.
 - **ARM64 Port**: `atlas_kernel_arm64.cpp` wird bei x86-Build nicht kompiliert. Build mit `-D__aarch64__`. `__arm64__` statt `__aarch64__` unter Homebrew LLVM → die Portabilitäts-Block mapped auch `_M_ARM64`.
 - **KV Cache Reset**: `model.reset_cache()` nach Kontext-Wechsel. Ring-Buffer überschreibt älteste Positionen bei `seq_now > max_seq_len`.
-- **MLA layer_stride**: 12 — indices: [0]ln1 [1]q [2]kv_a [3]kv_b [4]o [5]ln2 [6]shared_gate [7]shared_up [8]shared_down [9]kv_a_layernorm [10]router [11]dummy
+- **MLA layer_stride**: Dynamisch: `6 + 3*n_shared + 2` — indices: [0]ln1 [1]q [2]kv_a [3]kv_b [4]o [5]ln2 [6..6+3*n_shared-1]shared_experts [6+3*n_shared]kv_a_layernorm [6+3*n_shared+1]router
 - **MLA compressed KV**: DeepSeek-V2 nutzt komprimierte KV-Cache (kv_lora_rank + qk_rope_head_dim) pro Position. `compressed_kv_stride = kv_lora_rank + qk_rope_head_dim`.
 - **Shared Expert Names**: C++ nutzt `mlp.shared_experts.gate_proj.weight` (Plural, Dot-separated) — nicht `shared_expert`.
 - **Buffer Aliasing MoE**: `tmp_down = buf_hidden + b*H` — darf nicht `output` oder `buf_gate` aliasen (wird bei MoE-Dispatch überschrieben).
