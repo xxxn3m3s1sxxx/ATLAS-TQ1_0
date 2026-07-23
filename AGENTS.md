@@ -3,7 +3,7 @@
 **Status**: v2.17.0, Juli 2026.
 **Repo**: `xxxn3m3s1sxxx/ATLAS-TQ1_0` auf GitHub.
 
-Keine Weiterentwicklung. Das TQ1.0-Format und der Packer sind das eigentliche Artefakt — die Engine ist durch DDR4-Bandbreite physikalisch begrenzt (~20 GB/s → ~3 tok/s für 7B).
+MLA (Multi-head Latent Attention) und MoE (Mixture-of-Experts) für DeepSeek-V2 ab v2.17.0. TQ1.0-Format und Packer bleiben das Kernartefakt.
 
 ## Schnellstart
 
@@ -37,7 +37,7 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 
 | File | Role |
 |------|------|
-| `atlas_api.cpp` | Engine: AVX2-Kernels, Attention, RoPE, Sampling, Generate-Loop |
+| `atlas_api.cpp` | Engine: AVX2-Kernels, Attention, MLA, MoE, RoPE, Sampling, Generate-Loop |
 | `atlas_kernel_arm64.cpp` | NEON-Äquivalente (8 Kernels, v2.16.1) |
 | `atlas_vnni.cpp` | VNNI-Kernel (x86, AVX-VNNI falls verfügbar) |
 | `atlas_cli.cpp` | Standalone-CLI (LoadLibrary/dlopen, Chat-Template) |
@@ -65,6 +65,9 @@ Fixture-Tests brauchen eine `atlas.dll` im Repo-Root. Mock-Tests generieren synt
 - **C++ binary tokenizer**: v6-Format, kein transformers-Dependency zur Runtime. `tokenizers`-Lib nur für Python-seitiges Encoding nötig.
 - **ARM64 Port**: `atlas_kernel_arm64.cpp` wird bei x86-Build nicht kompiliert. Build mit `-D__aarch64__`. `__arm64__` statt `__aarch64__` unter Homebrew LLVM → die Portabilitäts-Block mapped auch `_M_ARM64`.
 - **KV Cache Reset**: `model.reset_cache()` nach Kontext-Wechsel. Ring-Buffer überschreibt älteste Positionen bei `seq_now > max_seq_len`.
+- **MLA compressed KV**: DeepSeek-V2 nutzt komprimierte KV-Cache (kv_lora_rank + qk_rope_head_dim) pro Position. `compressed_kv_stride = kv_lora_rank + qk_rope_head_dim`.
+- **Shared Expert Names**: C++ nutzt `mlp.shared_experts.gate_proj.weight` (Plural, Dot-separated) — nicht `shared_expert`.
+- **Buffer Aliasing MoE**: `tmp_down = buf_hidden + b*H` — darf nicht `output` oder `buf_gate` aliasen (wird bei MoE-Dispatch überschrieben).
 
 ## Skills (in .opencode/skills/)
 

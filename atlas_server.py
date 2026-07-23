@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ATLAS v2.6.0 SSE Web-Server + Prompt-Caching.
+"""ATLAS v2.17.0 SSE Web-Server + Prompt-Caching.
 
 FastAPI/SSE wrapper with single-user prompt caching.
 Cache persists KV state across generate calls — sub-second prefill
@@ -69,7 +69,7 @@ async def _stream(m: AtlasModel, messages: list[dict], max_new_tokens: int,
     yield "data: [DONE]\n\n"
 
 # ─── Routes ────────────────────────────────────────────────────────────
-app = FastAPI(title="ATLAS TQ1.0", version="2.6.0",
+app = FastAPI(title="ATLAS TQ1.0", version="2.17.0",
               description="CPU inference engine for BitNet b1.58 ternary-quantized models")
 
 @app.get("/health")
