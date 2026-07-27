@@ -436,6 +436,10 @@ extern "C" {
 // Callback for streaming generation (v2.3.0)
 typedef void (*atlas_token_callback)(int token_id, void* user_data);
 
+// ─── v2.18.0: Grammar-constrained sampling callbacks ──────────────────
+typedef void (*atlas_logit_processor_cb)(float* logits, int vocab_size, void* user_data);
+typedef void (*atlas_token_notify_cb)(int token_id, void* user_data);
+
 // Timer for debug profiling
 #if defined(ATLAS_DEBUG_MODE) || defined(PROFILE_MODE)
 #include "atlas_timer.h"
@@ -654,6 +658,7 @@ struct AtlasModel {
     float* buf_up = nullptr;        // [max_batch * inter_dim]
     float* buf_hidden = nullptr;    // [max_batch * inter_dim]
     float* buf_act = nullptr;       // [max_batch * max_dim] quantized f32→i8 scratch
+    float* buf_ffn_f32 = nullptr;   // [max_batch * inter_dim] FP32 SwiGLU safety buffer
     uint8_t* buf_i8 = nullptr;      // [max_batch * max_dim] uint8 quantized activations
     float* buf_out = nullptr;       // [max_batch * hidden_dim] layer output ping-pong for atlas_forward
     // Attention workspace (heap-allocated, avoids stack overflow with large B)
@@ -790,6 +795,7 @@ struct AtlasModel {
         if (buf_up) atlas_vfree((uint8_t*)buf_up);
         if (buf_hidden) atlas_vfree((uint8_t*)buf_hidden);
         if (buf_act) atlas_vfree((uint8_t*)buf_act);
+        if (buf_ffn_f32) atlas_vfree((uint8_t*)buf_ffn_f32);
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
         if (attn_ws) atlas_vfree((uint8_t*)attn_ws);
@@ -840,14 +846,16 @@ struct AtlasModel {
         float* new_act = (float*)atlas_valloc((size_t)B * max_aligned * sizeof(float));
         uint8_t* new_i8 = (uint8_t*)atlas_valloc((size_t)B * max_aligned * sizeof(uint8_t));
         float* new_out = (float*)atlas_valloc((size_t)B * hidden_dim * sizeof(float));
+        float* new_ffn = (float*)atlas_valloc((size_t)B * max_dim * sizeof(float));
         float* new_ws = (float*)atlas_valloc((size_t)ws * sizeof(float));
-        if (!new_gate || !new_up || !new_hidden || !new_act || !new_i8 || !new_out || !new_ws) {
+        if (!new_gate || !new_up || !new_hidden || !new_act || !new_i8 || !new_out || !new_ffn || !new_ws) {
             if (new_gate) atlas_vfree((uint8_t*)new_gate);
             if (new_up) atlas_vfree((uint8_t*)new_up);
             if (new_hidden) atlas_vfree((uint8_t*)new_hidden);
             if (new_act) atlas_vfree((uint8_t*)new_act);
             if (new_i8) atlas_vfree((uint8_t*)new_i8);
             if (new_out) atlas_vfree((uint8_t*)new_out);
+            if (new_ffn) atlas_vfree((uint8_t*)new_ffn);
             if (new_ws) atlas_vfree((uint8_t*)new_ws);
             return false;
         }
@@ -855,6 +863,7 @@ struct AtlasModel {
         if (buf_up) atlas_vfree((uint8_t*)buf_up);
         if (buf_hidden) atlas_vfree((uint8_t*)buf_hidden);
         if (buf_act) atlas_vfree((uint8_t*)buf_act);
+        if (buf_ffn_f32) atlas_vfree((uint8_t*)buf_ffn_f32);
         if (buf_i8) atlas_vfree((uint8_t*)buf_i8);
         if (buf_out) atlas_vfree((uint8_t*)buf_out);
         if (attn_ws) atlas_vfree((uint8_t*)attn_ws);
@@ -862,6 +871,7 @@ struct AtlasModel {
         buf_up = new_up;
         buf_hidden = new_hidden;
         buf_act = new_act;
+        buf_ffn_f32 = new_ffn;
         buf_i8 = new_i8;
         buf_out = new_out;
         attn_ws = new_ws;
@@ -4914,29 +4924,26 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
         }
         int8_t* decode_buf = tl_decode_buf;
 
-        // Act quant single-threaded (sequential across b)
+        // Act quantization: parallel over B (each token is independent)
         #ifdef _OPENMP
-        #pragma omp single
+        #pragma omp for schedule(static)
         #endif
-        {
-            for (int b = 0; b < B; b++) {
-                const float* act = act_f32 + b * input_dim;
-                float max_val = 1e-5f;
-                for (int i = 0; i < input_dim; i++) {
-                    float av = fabsf(act[i]);
-                    if (av > max_val) max_val = av;
-                }
-                scale_x[b] = max_val / 127.0f;
-                float inv = 127.0f / max_val;
-                int8_t* aq = act_s8 + b * input_dim;
-                for (int i = 0; i < input_dim; i++) {
-                    int q = (int)(act[i] * inv + 0.5f);
-                    if (q < -127) q = -127;
-                    if (q > 127) q = 127;
-                    aq[i] = (int8_t)q;
-                }
+        for (int b = 0; b < B; b++) {
+            const float* act = act_f32 + b * input_dim;
+            float max_val = 1e-5f;
+            for (int i = 0; i < input_dim; i++) {
+                float av = fabsf(act[i]);
+                if (av > max_val) max_val = av;
             }
-            // (max_val debug removed)
+            scale_x[b] = max_val / 127.0f;
+            float inv = 127.0f / max_val;
+            int8_t* aq = act_s8 + b * input_dim;
+            for (int i = 0; i < input_dim; i++) {
+                int q = (int)(act[i] * inv + 0.5f);
+                if (q < -127) q = -127;
+                if (q > 127) q = 127;
+                aq[i] = (int8_t)q;
+            }
         }
 
         #ifdef _OPENMP
@@ -5570,6 +5577,9 @@ static void matmul_reorder_deq(int rows, int input_dim,
     atlas_matmul_i8_f32(rows, input_dim, weights, act_u8, row_sums, scratch, B);
     int rows_packed = rows / 4;
     float deq_scale = 1.0f / (127.0f * scale);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(B > 4)
+    #endif
     for (int t = 0; t < B; t++) {
         float mabs = max_abs[t];
         float* dst = output + t * rows;
@@ -5596,6 +5606,9 @@ static void matmul_i4_reorder_deq(int rows, int cols,
     atlas_matmul_i4_f32(rows, cols, packed_weights, act_u8, row_sums, scratch, B);
     int rows_packed = rows / 4;
     float deq_scale = 1.0f / (127.0f * scale);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(B > 4)
+    #endif
     for (int t = 0; t < B; t++) {
         float mabs = max_abs[t];
         float* dst = output + t * rows;
@@ -6113,7 +6126,7 @@ static void atlas_moe_forward(
             const float* xb = x_safe + b * H;
             float* gb = m->buf_gate;   // [inter] — reused per (b,k)
             float* ub = m->buf_up;     // [inter]
-            float* ab = m->buf_act;    // [inter] — SiLU(gate)*up result
+            float* ab = m->buf_ffn_f32;    // [inter] — SiLU(gate)*up result (FP32 safety buffer)
 
             // ── gate projection: xb[H] → gb[inter] ──
             if (t_g.ttype == 3) {
@@ -6338,7 +6351,7 @@ static void atlas_moe_forward(
             for (int ur = 0; ur < rows_packed; ur++) {
                 const uint8_t* gw4 = gw + ur * 4 * pw;
                 for (int b = 0; b < B; b++) {
-                    const float* a = m->buf_act + b * dim_w;
+                    const float* a = m->buf_ffn_f32 + b * dim_w;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* wg = gw4 + sub * pw;
                         float s = 0.0f;
@@ -6439,10 +6452,10 @@ static void atlas_moe_forward(
             }
         }
 
-        // SiLU(gate) * up → tmp in buf_act
+        // SiLU(gate) * up → tmp in buf_ffn_f32
         int inter_sd = t3_dim(t_sd);
         for (int b = 0; b < B; b++) {
-            float* tmp = m->buf_act + b * inter_sd;
+            float* tmp = m->buf_ffn_f32 + b * inter_sd;
             for (int i = 0; i < inter; i++)
                 tmp[i] = gate_activation(m->buf_gate[b * inter + i], false) * m->buf_up[b * inter + i];
             for (int i = inter; i < inter_sd; i++) tmp[i] = 0.0f;
@@ -6454,11 +6467,11 @@ static void atlas_moe_forward(
             const uint16_t* rs_fp16 = (const uint16_t*)(t_sd.data);
             const int8_t* w = (int8_t*)(t_sd.data + t_sd.row_dim * 2);
             int dim11 = t3_dim(t_sd);
-            matmul_f32_row_major_per_row_batched(t_sd.row_dim, dim11, w, m->buf_act, inter_sd, rs_fp16, tmp_shared, B);
+            matmul_f32_row_major_per_row_batched(t_sd.row_dim, dim11, w, m->buf_ffn_f32, inter_sd, rs_fp16, tmp_shared, B);
             for (int i = 0; i < B * H; i++) m->buf_hidden[i] += tmp_shared[i];
         } else if (t_sd.ttype == 3) {
             get_i8(t_sd, sd_w, sd_rs, sd_rows, sd_dim, sd_scale);
-            matmul_f32_row_major_batched(sd_rows, sd_dim, sd_w, m->buf_act, inter_sd, sd_scale, tmp_shared, B);
+            matmul_f32_row_major_batched(sd_rows, sd_dim, sd_w, m->buf_ffn_f32, inter_sd, sd_scale, tmp_shared, B);
             for (int i = 0; i < B * H; i++) m->buf_hidden[i] += tmp_shared[i];
         } else if (t_sd.ttype == 8) {
             uint16_t s16; memcpy(&s16, t_sd.data, 2); float sc = fp16_to_fp32(s16);
@@ -6469,7 +6482,7 @@ static void atlas_moe_forward(
             for (int ur = 0; ur < rows_packed; ur++) {
                 const uint8_t* dw4 = dw + ur * 4 * pw;
                 for (int b = 0; b < B; b++) {
-                    const float* a = m->buf_act + b * dim_w;
+                    const float* a = m->buf_ffn_f32 + b * dim_w;
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* w = dw4 + sub * pw;
                         float s = 0.0f;
@@ -6938,7 +6951,7 @@ static void forward_layer_internal_mla(
         auto& t_down = m->tensors[idx[8]];
         int d_dim = t3_dim(t_down);
         for (int b = 0; b < B; b++) {
-            float* tmp = m->buf_act + b * d_dim;
+            float* tmp = m->buf_ffn_f32 + b * d_dim;
             for (int i = 0; i < inter; i++)
                 tmp[i] = gate_activation(m->buf_gate[b * inter + i], m->model_arch == ARCH_BITNET || m->use_relu2)
                          * m->buf_up[b * inter + i];
@@ -6951,14 +6964,14 @@ static void forward_layer_internal_mla(
             const uint16_t* d_rs = (const uint16_t*)(t_down.data);
             const int8_t* dw = (int8_t*)(t_down.data + t_down.row_dim * 2);
             int dim11 = t3_dim(t_down);
-            matmul_f32_per_row(t_down.row_dim, dim11, dw, m->buf_act, d_dim, d_rs, m->buf_gate, B);
+            matmul_f32_per_row(t_down.row_dim, dim11, dw, m->buf_ffn_f32, d_dim, d_rs, m->buf_gate, B);
         } else {
             int8_t* dw; int32_t* drs; int d_rows, d_dim_v; float d_scale;
             get_i8(t_down, dw, drs, d_rows, d_dim_v, d_scale);
             #ifdef ATLAS_DEBUG_MODE
             fprintf(stderr, "[MLA_STEP] L=%d step9d_down d_rows=%d d_dim=%d\n", layer, d_rows, d_dim_v);
             #endif
-            matmul_f32_reorder(d_rows, d_dim_v, dw, m->buf_act, d_scale, m->buf_gate, B);
+            matmul_f32_reorder(d_rows, d_dim_v, dw, m->buf_ffn_f32, d_scale, m->buf_gate, B);
         }
         #ifdef ATLAS_DEBUG_MODE
         fprintf(stderr, "[MLA_STEP] L=%d step9e_down_post\n", layer);
@@ -7090,24 +7103,21 @@ static void forward_layer_internal(
 
     auto& tv = m->tensors[idx_v];
     if (tq.ttype == 10) {
-        auto tq2_fn = m->use_f32_matmul ? matmul_tq2_f32 : matmul_tq2;
-        {
-            auto& t = m->tensors[idx_q];
-            tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols,
-                t.data, t.block_size, t.n_blocks,
-                m->buf_act, m->buf_gate, B);
-        }
-        {
-            auto& t = m->tensors[idx_k];
-            tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols,
-                t.data, t.block_size, t.n_blocks,
-                m->buf_act, m->buf_hidden, B);
-        }
-        {
-            auto& t = m->tensors[idx_v];
-            tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols,
-                t.data, t.block_size, t.n_blocks,
-                m->buf_act, m->buf_up, B);
+        if (m->use_f32_matmul) {
+            auto tq2_fn = matmul_tq2_f32;
+            { auto& t = m->tensors[idx_q]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_k]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_hidden, B); }
+            { auto& t = m->tensors[idx_v]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
+        } else if (B >= LUT_THRESHOLD) {
+            // TQ2 LUT prefill: x86 delegates to TQ1 kernel, skip 1-byte flags
+            { auto& t = m->tensors[idx_q]; tq1_lut_prefill_kernel(t.row_dim, max_qkv_dim, t.packed_cols, t.data + 1, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_k]; tq1_lut_prefill_kernel(t.row_dim, max_qkv_dim, t.packed_cols, t.data + 1, t.block_size, t.n_blocks, m->buf_act, m->buf_hidden, B); }
+            { auto& t = m->tensors[idx_v]; tq1_lut_prefill_kernel(t.row_dim, max_qkv_dim, t.packed_cols, t.data + 1, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
+        } else {
+            auto tq2_fn = matmul_tq2;
+            { auto& t = m->tensors[idx_q]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_k]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_hidden, B); }
+            { auto& t = m->tensors[idx_v]; tq2_fn(t.row_dim, max_qkv_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
         }
     } else if (tq.ttype == 5) {
         if (m->use_f32_matmul) {
@@ -7383,10 +7393,13 @@ static void forward_layer_internal(
     {
         auto& to = m->tensors[idx_o];
         if (to.ttype == 10) {
-        auto& t = m->tensors[idx_o];
-        (m->use_f32_matmul ? matmul_tq2_f32 : matmul_tq2)(t.row_dim, qd, t.packed_cols,
-            t.data, t.block_size, t.n_blocks,
-            attn_out, m->buf_gate, B);
+            if (m->use_f32_matmul) {
+                matmul_tq2_f32(to.row_dim, qd, to.packed_cols, to.data, to.block_size, to.n_blocks, attn_out, m->buf_gate, B);
+            } else if (B >= LUT_THRESHOLD) {
+                tq1_lut_prefill_kernel(to.row_dim, qd, to.packed_cols, to.data + 1, to.block_size, to.n_blocks, attn_out, m->buf_gate, B);
+            } else {
+                matmul_tq2(to.row_dim, qd, to.packed_cols, to.data, to.block_size, to.n_blocks, attn_out, m->buf_gate, B);
+            }
     } else if (to.ttype == 5) {
             int o_dim = to.packed_cols * 5;
             for (int b = 0; b < B; b++) {
@@ -7530,18 +7543,15 @@ static void forward_layer_internal(
     }
 
     if (tg.ttype == 10) {
-        auto tq2_fn = m->use_f32_matmul ? matmul_tq2_f32 : matmul_tq2;
-        {
-            auto& t = m->tensors[idx_gate];
-            tq2_fn(t.row_dim, ffn_dim, t.packed_cols,
-                t.data, t.block_size, t.n_blocks,
-                m->buf_act, m->buf_gate, B);
-        }
-        {
-            auto& t = m->tensors[idx_up];
-            tq2_fn(t.row_dim, ffn_dim, t.packed_cols,
-                t.data, t.block_size, t.n_blocks,
-                m->buf_act, m->buf_up, B);
+        if (m->use_f32_matmul) {
+            { auto& t = m->tensors[idx_gate]; matmul_tq2_f32(t.row_dim, ffn_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_up];   matmul_tq2_f32(t.row_dim, ffn_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
+        } else if (B >= LUT_THRESHOLD) {
+            { auto& t = m->tensors[idx_gate]; tq1_lut_prefill_kernel(t.row_dim, ffn_dim, t.packed_cols, t.data + 1, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_up];   tq1_lut_prefill_kernel(t.row_dim, ffn_dim, t.packed_cols, t.data + 1, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
+        } else {
+            { auto& t = m->tensors[idx_gate]; matmul_tq2(t.row_dim, ffn_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_gate, B); }
+            { auto& t = m->tensors[idx_up];   matmul_tq2(t.row_dim, ffn_dim, t.packed_cols, t.data, t.block_size, t.n_blocks, m->buf_act, m->buf_up, B); }
         }
     } else if (tg.ttype == 5) {
         if (m->use_f32_matmul) {
@@ -7984,7 +7994,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * down_dim;
+                float* tmp = m->buf_ffn_f32 + b * down_dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -7994,7 +8004,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * down_dim;
+                    float* ob = m->buf_ffn_f32 + b * down_dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8004,15 +8014,19 @@ static void forward_layer_internal(
                     }
                 }
             }
-            (m->use_f32_matmul ? matmul_tq2_f32 : matmul_tq2)(td.row_dim, down_dim, td.packed_cols,
-                td.data, td.block_size, td.n_blocks,
-                m->buf_act, m->buf_gate, B);
+            if (m->use_f32_matmul) {
+                matmul_tq2_f32(td.row_dim, down_dim, td.packed_cols, td.data, td.block_size, td.n_blocks, m->buf_ffn_f32, m->buf_gate, B);
+            } else if (B >= LUT_THRESHOLD) {
+                tq1_lut_prefill_kernel(td.row_dim, down_dim, td.packed_cols, td.data + 1, td.block_size, td.n_blocks, m->buf_ffn_f32, m->buf_gate, B);
+            } else {
+                matmul_tq2(td.row_dim, down_dim, td.packed_cols, td.data, td.block_size, td.n_blocks, m->buf_ffn_f32, m->buf_gate, B);
+            }
         } else if (td.ttype == 5) {
             int down_dim = td.packed_cols * 5;
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * down_dim;
+                float* tmp = m->buf_ffn_f32 + b * down_dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8023,7 +8037,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * down_dim;
+                    float* ob = m->buf_ffn_f32 + b * down_dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8036,22 +8050,22 @@ static void forward_layer_internal(
             if (m->use_f32_matmul) {
                 matmul_tq1_block_fused_f32(td.row_dim, down_dim, td.packed_cols,
                     td.data, td.block_size, td.n_blocks,
-                    m->buf_act, m->buf_gate, B);
+                    m->buf_ffn_f32, m->buf_gate, B);
             } else if (B >= LUT_THRESHOLD && td.block_size > 0 && td.n_blocks > 0) {
                 tq1_lut_prefill_kernel(td.row_dim, down_dim, td.packed_cols,
                     td.data, td.block_size, td.n_blocks,
-                    m->buf_act, m->buf_gate, B);
+                    m->buf_ffn_f32, m->buf_gate, B);
             } else {
                 matmul_tq1_block_fused_s8(td.row_dim, down_dim, td.packed_cols,
                     td.data, td.block_size, td.n_blocks,
-                    m->buf_act, m->buf_gate, B);
+                    m->buf_ffn_f32, m->buf_gate, B);
             }
         } else if (td.ttype == 7) {
             int down_dim = td.packed_cols * 4;
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * down_dim;
+                float* tmp = m->buf_ffn_f32 + b * down_dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8061,7 +8075,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * down_dim;
+                    float* ob = m->buf_ffn_f32 + b * down_dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8073,14 +8087,14 @@ static void forward_layer_internal(
             }
             matmul_turboquant_fused(td.row_dim, down_dim, td.packed_cols,
                 td.data, td.block_size, td.n_blocks,
-                m->buf_act, m->buf_gate, B);
+                m->buf_ffn_f32, m->buf_gate, B);
         } else if (td.ttype == 0) {
             const uint8_t* wp; int rows, dim, pc; float scale;
             get_tq1_packed(td, wp, rows, dim, pc, scale);
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * dim;
+                float* tmp = m->buf_ffn_f32 + b * dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8091,7 +8105,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * dim;
+                    float* ob = m->buf_ffn_f32 + b * dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8103,7 +8117,7 @@ static void forward_layer_internal(
             }
             float mb = 1e-5f;
             for (int b = 0; b < B; b++) {
-                const float* tmp = m->buf_act + b * dim;
+                const float* tmp = m->buf_ffn_f32 + b * dim;
                 float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
@@ -8127,7 +8141,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * down_dim;
+                float* tmp = m->buf_ffn_f32 + b * down_dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8137,7 +8151,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * down_dim;
+                    float* ob = m->buf_ffn_f32 + b * down_dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8147,7 +8161,7 @@ static void forward_layer_internal(
                     }
                 }
             }
-            quantize_f32_to_u8(m->buf_act, B, down_dim, max_abs, m->buf_i8);
+            quantize_f32_to_u8(m->buf_ffn_f32, B, down_dim, max_abs, m->buf_i8);
             matmul_i4_reorder_deq(td.row_dim, d_cols, d_pw, d_rs, m->buf_i8, max_abs, d_scale, m->buf_act, m->buf_gate, B);
         } else if (td.ttype == 8 && m->use_f32_matmul) {
 #ifndef __aarch64__
@@ -8157,7 +8171,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * d_cols;
+                float* tmp = m->buf_ffn_f32 + b * d_cols;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 for (int i = inter; i < d_cols; i++) tmp[i] = 0.0f;
@@ -8166,7 +8180,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * d_cols;
+                    float* ob = m->buf_ffn_f32 + b * d_cols;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8190,7 +8204,7 @@ static void forward_layer_internal(
             for (int ur = 0; ur < d_rows_packed; ur++) {
                 const uint8_t* dw4 = dw + ur * 4 * d_packed_cols;
                 for (int b = 0; b < B; b++) {
-                    const float* a = m->buf_act + b * d_cols_i;
+                    const float* a = m->buf_ffn_f32 + b * d_cols_i;
                     float out4[4];
                     for (int sub = 0; sub < 4; sub++) {
                         const uint8_t* w = dw4 + sub * d_packed_cols;
@@ -8234,7 +8248,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * d11_dim;
+                float* tmp = m->buf_ffn_f32 + b * d11_dim;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 for (int i = inter; i < d11_dim; i++) tmp[i] = 0.0f;
@@ -8243,7 +8257,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * d11_dim;
+                    float* ob = m->buf_ffn_f32 + b * d11_dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8256,14 +8270,14 @@ static void forward_layer_internal(
             #ifdef ATLAS_DEBUG_MODE
             if (B <= 6 && H == 2048) {
                 fprintf(stderr, "DBG_SILUUP_f32_b0: ");
-                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_act[i]);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_ffn_f32[i]);
                 fprintf(stderr, "\n");
                 snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_SILUUP.bin", dbg_cur_layer);
                 FILE* f = fopen(dbg_path, "wb");
-                if (f) { fwrite(m->buf_act, sizeof(float), B * m->inter_dim, f); fclose(f); }
+                if (f) { fwrite(m->buf_ffn_f32, sizeof(float), B * m->inter_dim, f); fclose(f); }
             }
             #endif
-            matmul_f32_per_row(d11_rows, d11_dim, dw, m->buf_act, d11_dim, d_rs_fp16, m->buf_gate, B);
+            matmul_f32_per_row(d11_rows, d11_dim, dw, m->buf_ffn_f32, d11_dim, d_rs_fp16, m->buf_gate, B);
             #ifdef ATLAS_DEBUG_MODE
             if (B <= 6 && H == 2048) {
                 snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_DOWN.bin", dbg_cur_layer);
@@ -8282,7 +8296,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * dim;
+                float* tmp = m->buf_ffn_f32 + b * dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8292,7 +8306,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * dim;
+                    float* ob = m->buf_ffn_f32 + b * dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8304,7 +8318,7 @@ static void forward_layer_internal(
             }
             float mb = 1e-5f;
             for (int b = 0; b < B; b++) {
-                const float* tmp = m->buf_act + b * dim;
+                const float* tmp = m->buf_ffn_f32 + b * dim;
                 float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
@@ -8324,7 +8338,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * dim;
+                float* tmp = m->buf_ffn_f32 + b * dim;
                 for (int i = 0; i < inter; i++)
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 // removed: dead code (ARCH_BITNET never has idx_k_norm >= 0)
@@ -8333,18 +8347,18 @@ static void forward_layer_internal(
             #ifdef ATLAS_DEBUG_MODE
             if (B <= 6 && H == 2048) {
                 fprintf(stderr, "DBG_SILUUP_f32_b0: ");
-                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_act[i]);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", m->buf_ffn_f32[i]);
                 fprintf(stderr, "\n");
                 snprintf(dbg_path, sizeof(dbg_path), "dbg_L%d_SILUUP.bin", dbg_cur_layer);
                 FILE* f = fopen(dbg_path, "wb");
-                if (f) { fwrite(m->buf_act, sizeof(float), B * m->inter_dim, f); fclose(f); }
+                if (f) { fwrite(m->buf_ffn_f32, sizeof(float), B * m->inter_dim, f); fclose(f); }
             }
             #endif
             if (idx_ffn_sub_norm >= 0) {
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * dim;
+                    float* ob = m->buf_ffn_f32 + b * dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8354,7 +8368,7 @@ static void forward_layer_internal(
                     }
                 }
             }
-            matmul_f32_reorder(rows, dim, w, m->buf_act, scale, m->buf_gate, B);
+            matmul_f32_reorder(rows, dim, w, m->buf_ffn_f32, scale, m->buf_gate, B);
             #ifdef ATLAS_DEBUG_MODE
             if (B <= 6 && H == 2048) {
                 fprintf(stderr, "DBG_DOWN_f32_b0: ");
@@ -8369,7 +8383,7 @@ static void forward_layer_internal(
             for (int b = 0; b < B; b++) {
                 const float* g = m->buf_gate + b * inter;
                 const float* u = m->buf_up + b * inter;
-                float* tmp = m->buf_act + b * dim;
+                float* tmp = m->buf_ffn_f32 + b * dim;
                 for (int i = 0; i < inter; i++) {
                     tmp[i] = gate_activation(g[i], m->model_arch == ARCH_BITNET || m->use_relu2) * u[i];
                 }
@@ -8379,7 +8393,7 @@ static void forward_layer_internal(
                 auto& sn = m->tensors[idx_ffn_sub_norm];
                 const uint8_t* snw = sn.data;
                 for (int b = 0; b < B; b++) {
-                    float* ob = m->buf_act + b * dim;
+                    float* ob = m->buf_ffn_f32 + b * dim;
                     float ss = 0.0f;
                     for (int i = 0; i < inter; i++) ss += ob[i] * ob[i];
                     float rms = 1.0f / sqrtf(ss / inter + 1e-6f);
@@ -8391,7 +8405,7 @@ static void forward_layer_internal(
             }
             float mb = 1e-5f;
             for (int b = 0; b < B; b++) {
-                const float* tmp = m->buf_act + b * dim;
+                const float* tmp = m->buf_ffn_f32 + b * dim;
                 float bmax = 1e-5f;
                 for (int i = 0; i < inter; i++) {
                     float av = fabsf(tmp[i]);
@@ -8873,7 +8887,9 @@ ATLAS_API int atlas_generate(AtlasModel* m,
     float repetition_penalty,
     int min_new_tokens,
     int cache_offset,
-    int* output_ids)
+    int* output_ids,
+    atlas_logit_processor_cb logit_cb, void* logit_cb_data,
+    atlas_token_notify_cb token_notify_cb, void* token_notify_data)
 {
     profile_reset();
     if (!m || !input_ids || !output_ids || n_input < 1 || max_new_tokens < 1)
@@ -8986,8 +9002,10 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
         if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
     }
+    if (logit_cb) logit_cb(logits, V, logit_cb_data);
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
+    if (token_notify_cb) token_notify_cb(next_token, token_notify_data);
     context[n_input] = next_token;
     output_ids[n_gen++] = next_token;
 
@@ -9032,8 +9050,10 @@ ATLAS_API int atlas_generate(AtlasModel* m,
             if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
             if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
         }
+        if (logit_cb) logit_cb(logits, V, logit_cb_data);
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
+        if (token_notify_cb) token_notify_cb(next_token, token_notify_data);
         context[n_input + n_gen] = next_token;
         output_ids[n_gen++] = next_token;
 
@@ -9060,11 +9080,15 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     float repetition_penalty,
     int min_new_tokens,
     int cache_offset,
-    atlas_token_callback callback, void* user_data)
+    atlas_token_callback callback, void* user_data,
+    int prefill_only,
+    atlas_logit_processor_cb logit_cb, void* logit_cb_data,
+    atlas_token_notify_cb token_notify_cb, void* token_notify_data)
 {
     profile_reset();
-    if (!m || !input_ids || !callback || n_input < 1 || max_new_tokens < 1)
+    if (!m || !input_ids || n_input < 1)
         return -1;
+    if (!prefill_only && !callback) return -1;
     if (n_input >= max_seq_len) {
         fprintf(stderr, "[ATLAS] atlas_generate_stream: prompt (%d) >= max_seq_len (%d)\n",
                 n_input, max_seq_len);
@@ -9081,7 +9105,6 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     int H = m->hidden_dim;
     int V = m->vocab_size;
     uint16_t* embed_w = (uint16_t*)m->tensors[idx_embed].data;
-    uint8_t* norm_w = m->tensors[idx_norm].data;
 
     if (!m->lm_head_quantized) return -1;
 
@@ -9092,21 +9115,9 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     if (cache_offset >= n_input) cache_offset = n_input - 1;
     int n_new = n_input - cache_offset;
 
+    // ─── Embed new tokens ───
     float* embed_buf = (float*)atlas_valloc((size_t)n_new * H * sizeof(float));
-    float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
-    float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
-    int* context = (int*)atlas_valloc((size_t)(n_input + max_new_tokens) * sizeof(int));
-    if (!embed_buf || !h_norm || !logits || !context) {
-        if (embed_buf) atlas_vfree((uint8_t*)embed_buf);
-        if (h_norm) atlas_vfree((uint8_t*)h_norm);
-        if (logits) atlas_vfree((uint8_t*)logits);
-        if (context) atlas_vfree((uint8_t*)context);
-        return -1;
-    }
-    memcpy(context, input_ids, (size_t)n_input * sizeof(int));
-
-    // ─── Prefill: NEW tokens only ───
-    int n_gen = 0;
+    if (!embed_buf) return -1;
     for (int i = 0; i < n_new; i++) {
         int idx = cache_offset + i;
         int tid = input_ids[idx];
@@ -9116,20 +9127,41 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
     }
 
     int* positions = (int*)atlas_valloc((size_t)n_new * sizeof(int));
-    if (!positions) {
-        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context); return -1;
-    }
+    if (!positions) { atlas_vfree((uint8_t*)embed_buf); return -1; }
     for (int i = 0; i < n_new; i++) positions[i] = cache_offset + i;
 
+    ATLAS_LOG("prefill%s forward: B=%d cache_offset=%d\n",
+              prefill_only ? "_only" : "", n_new, cache_offset);
     if (atlas_forward(m, embed_buf, n_new, positions,
                       max_seq_len, n_input,
                       layer_idx, m->n_layers) != 0) {
-        atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
-        atlas_vfree((uint8_t*)context);
+        atlas_vfree((uint8_t*)embed_buf);
+        atlas_vfree((uint8_t*)positions);
         return -1;
     }
+    atlas_vfree((uint8_t*)positions);
+
+    // ─── Prefill-only mode: skip sampling, return 0 ───
+    if (prefill_only) {
+        atlas_vfree((uint8_t*)embed_buf);
+        return 0;
+    }
+
+    // ─── Full generation mode: RMSNorm + lm_head + sample ───
+    float* h_norm = (float*)atlas_valloc((size_t)H * sizeof(float));
+    float* logits = (float*)atlas_valloc((size_t)V * sizeof(float));
+    int* context = (int*)atlas_valloc((size_t)(n_input + max_new_tokens) * sizeof(int));
+    if (!h_norm || !logits || !context) {
+        if (h_norm) atlas_vfree((uint8_t*)h_norm);
+        if (logits) atlas_vfree((uint8_t*)logits);
+        if (context) atlas_vfree((uint8_t*)context);
+        atlas_vfree((uint8_t*)embed_buf);
+        return -1;
+    }
+    memcpy(context, input_ids, (size_t)n_input * sizeof(int));
+    uint8_t* norm_w = m->tensors[idx_norm].data;
+
+    int n_gen = 0;
 
     {
         const float* x = embed_buf + (int64_t)(n_new - 1) * H;
@@ -9147,8 +9179,10 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
         if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
         if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
     }
+    if (logit_cb) logit_cb(logits, V, logit_cb_data);
     int next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input, repetition_penalty);
+    if (token_notify_cb) token_notify_cb(next_token, token_notify_data);
     context[n_input] = next_token;
     callback(next_token, user_data);
     n_gen++;
@@ -9191,8 +9225,10 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
             if (eos_id >= 0 && eos_id < V) logits[eos_id] = -1e9f;
             if (eos_id2 >= 0 && eos_id2 < V) logits[eos_id2] = -1e9f;
         }
+        if (logit_cb) logit_cb(logits, V, logit_cb_data);
         next_token = gumbel_sample(logits, V, temperature, top_k, top_p,
                                     context, n_input + n_gen, repetition_penalty);
+        if (token_notify_cb) token_notify_cb(next_token, token_notify_data);
         context[n_input + n_gen] = next_token;
         callback(next_token, user_data);
         n_gen++;

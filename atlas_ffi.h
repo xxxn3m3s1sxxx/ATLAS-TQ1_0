@@ -287,6 +287,25 @@ ATLAS_API void atlas_set_seed(uint64_t seed);
 ATLAS_API void atlas_sample(void* model, float* logits, int* output,
                              float temperature, int top_k, float top_p);
 
+// ─── v2.3.0: Streaming generation ─────────────────────────────────────
+// Callback type for streaming token output. Fired once per generated token.
+// token_id: the sampled token ID
+// user_data: opaque pointer passed to atlas_generate_stream (e.g., Python queue)
+typedef void (*atlas_token_callback)(int token_id, void* user_data);
+
+// ─── v2.18.0: Grammar-constrained sampling callbacks ──────────────────
+// Logit processor callback: called after EOS suppression, before gumbel_sample.
+// logits: raw logit array [vocab_size], mutable. Set -inf to mask illegal tokens.
+// vocab_size: number of entries in logits.
+// user_data: opaque pointer passed to atlas_generate_stream.
+typedef void (*atlas_logit_processor_cb)(float* logits, int vocab_size, void* user_data);
+
+// Token notification callback: called after gumbel_sample, before streaming callback.
+// Fires the sampled token ID so the grammar state machine can advance.
+// token_id: the token selected by gumbel_sample.
+// user_data: opaque pointer passed to atlas_generate_stream.
+typedef void (*atlas_token_notify_cb)(int token_id, void* user_data);
+
 // End-to-end autoregressive generation. Single C call for the entire decode loop.
 // Allocates internal scratch buffers (embedding, norm, logits). KV cache is
 // managed internally (int8 quantized, allocated for max_seq_len).
@@ -296,6 +315,10 @@ ATLAS_API void atlas_sample(void* model, float* logits, int* output,
 //
 // Returns: number of tokens actually generated ( ≤ max_new_tokens ), or -1 on error.
 // Stops when EOS token (id=0) is produced or max_new_tokens is reached.
+// logit_cb: called before sampling to mask logits (grammar constraint). May be NULL.
+// logit_cb_data: opaque pointer forwarded to logit_cb.
+// token_notify_cb: called after sampling to notify grammar state. May be NULL.
+// token_notify_data: opaque pointer forwarded to token_notify_cb.
 ATLAS_API int atlas_generate(void* model,
     const int* input_ids, int n_input,
     int max_seq_len, int max_new_tokens,
@@ -303,16 +326,18 @@ ATLAS_API int atlas_generate(void* model,
     float repetition_penalty,
     int min_new_tokens,
     int cache_offset,
-    int* output_ids);
-
-// ─── v2.3.0: Streaming generation ─────────────────────────────────────
-// Callback type for streaming token output. Fired once per generated token.
-// token_id: the sampled token ID
-// user_data: opaque pointer passed to atlas_generate_stream (e.g., Python queue)
-typedef void (*atlas_token_callback)(int token_id, void* user_data);
+    int* output_ids,
+    atlas_logit_processor_cb logit_cb, void* logit_cb_data,
+    atlas_token_notify_cb token_notify_cb, void* token_notify_data);
 
 // Streaming variant of atlas_generate. Same parameters + callback + user_data.
 // KV cache is managed internally. Fires callback for each token.
+// prefill_only: if 1, runs forward pass without sampling (for chunked prefill).
+//   Returns 0 on success. callback may be NULL when prefill_only=1.
+// logit_cb: called before sampling to mask logits (grammar constraint). May be NULL.
+// logit_cb_data: opaque pointer forwarded to logit_cb.
+// token_notify_cb: called after sampling to notify grammar state. May be NULL.
+// token_notify_data: opaque pointer forwarded to token_notify_cb.
 // Returns number of tokens generated, or -1 on error.
 ATLAS_API int atlas_generate_stream(void* model,
     const int* input_ids, int n_input,
@@ -321,7 +346,10 @@ ATLAS_API int atlas_generate_stream(void* model,
     float repetition_penalty,
     int min_new_tokens,
     int cache_offset,
-    atlas_token_callback callback, void* user_data);
+    atlas_token_callback callback, void* user_data,
+    int prefill_only,
+    atlas_logit_processor_cb logit_cb, void* logit_cb_data,
+    atlas_token_notify_cb token_notify_cb, void* token_notify_data);
 
 // ─── Int8 lm_head ─────────────────────────────────────────────────────
 // Quantize lm_head from fp16 to per-row symmetric int8 (~403 MB vs 1.5 GB fp32).

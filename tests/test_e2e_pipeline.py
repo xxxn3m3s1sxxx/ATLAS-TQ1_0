@@ -110,7 +110,8 @@ def test_e2e_pipeline(corridor):
     cb = TOKEN_CALLBACK(lambda tid, _: collected.append(tid))
     in_ids = (ctypes.c_int * 3)(1, 2, 3)
     n_gen = dll.atlas_generate_stream(
-        m.model_ptr, in_ids, 3, 512, 10, 0.0, 1, 0.0, 1.0, 0, 0, cb, None)
+        m.model_ptr, in_ids, 3, 512, 10, 0.0, 1, 0.0, 1.0, 0, 0, cb, None, 0,
+        None, None, None, None)
     assert n_gen > 0, f"generate_stream returned {n_gen}"
     assert len(collected) == n_gen
     first_batch = list(collected)
@@ -122,7 +123,8 @@ def test_e2e_pipeline(corridor):
     collected2 = []
     cb2 = TOKEN_CALLBACK(lambda tid, _: collected2.append(tid))
     n_gen2 = dll.atlas_generate_stream(
-        m.model_ptr, in_ids, 3, 512, 5, 0.0, 1, 0.0, 1.0, 0, 0, cb2, None)
+        m.model_ptr, in_ids, 3, 512, 5, 0.0, 1, 0.0, 1.0, 0, 0, cb2, None, 0,
+        None, None, None, None)
     assert n_gen2 > 0
     assert len(collected2) == n_gen2
     assert collected2 != first_batch  # reset changes generation

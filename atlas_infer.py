@@ -238,10 +238,14 @@ dll.atlas_generate.argtypes = [ctypes.c_void_p,
     ctypes.c_float,
     ctypes.c_int,
     ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int)]
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_void_p, ctypes.c_void_p,  # logit_cb, logit_cb_data
+    ctypes.c_void_p, ctypes.c_void_p]  # token_notify_cb, token_notify_data
 
 # v2.1.0: Streaming callback type + repetition_penalty + BPE-PQ
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+LOGIT_PROCESSOR_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p)
+TOKEN_NOTIFY_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
 dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.POINTER(ctypes.c_int), ctypes.c_int,
     ctypes.c_int, ctypes.c_int,
@@ -249,7 +253,10 @@ dll.atlas_generate_stream.argtypes = [ctypes.c_void_p,
     ctypes.c_float,
     ctypes.c_int,
     ctypes.c_int,
-    TOKEN_CALLBACK, ctypes.c_void_p]
+    TOKEN_CALLBACK, ctypes.c_void_p,
+    ctypes.c_int,
+    LOGIT_PROCESSOR_CB, ctypes.c_void_p,  # logit_cb, logit_cb_data
+    TOKEN_NOTIFY_CB, ctypes.c_void_p]     # token_notify_cb, token_notify_data
 dll.atlas_generate_stream.restype = ctypes.c_int
 
 # ─── Model class ─────────────────────────────────────────────────────────
@@ -1038,7 +1045,9 @@ class AtlasModel:
             float(repetition_penalty),
             int(min_new_tokens),
             int(cache_offset),
-            out_arr)
+            out_arr,
+            None, None,  # logit_cb, logit_cb_data
+            None, None)  # token_notify_cb, token_notify_data
 
         if n_gen < 0:
             return "[ATLAS: atlas_generate failed]"
@@ -1126,7 +1135,9 @@ class AtlasModel:
                   float(repetition_penalty),
                   int(min_new_tokens),
                   int(cache_offset),
-                  cb, None))
+                  cb, None, 0,
+                  None, None,  # logit_cb, logit_cb_data
+                  None, None))  # token_notify_cb, token_notify_data
         t.start()
 
         n_gen = 0
