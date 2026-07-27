@@ -77,7 +77,9 @@ def load_model(path_str, dll_path=None):
     dll.atlas_generate.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
         ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int,
-        ctypes.c_float, ctypes.c_float, ctypes.POINTER(ctypes.c_int),
+        ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ]
     dll.atlas_free.argtypes = [ctypes.c_void_p]
     dll.atlas_set_seed.argtypes = [ctypes.c_uint64]
@@ -128,7 +130,8 @@ def test_generate(dll, model, prompt, verify_substr, max_new=50):
         max_seq_len,
         max_new,
         0.7, 40, 0.0, 1.0,
-        output
+        0, 0, output,
+        None, None, None, None,
     )
     elapsed = time.time() - t0
     

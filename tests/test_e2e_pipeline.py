@@ -54,6 +54,11 @@ dll.atlas_get_config.restype = AtlasModelConfig
 dll.atlas_get_config.argtypes = [ctypes.c_void_p]
 
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+LOGIT_PROCESSOR_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p)
+TOKEN_NOTIFY_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+
+_NOOP_LOGIT_CB = LOGIT_PROCESSOR_CB(lambda logits, n, data: None)
+_NOOP_TOKEN_NOTIFY_CB = TOKEN_NOTIFY_CB(lambda tid, data: None)
 
 
 def _apply_corridor_post_init(m, core):
@@ -111,7 +116,7 @@ def test_e2e_pipeline(corridor):
     in_ids = (ctypes.c_int * 3)(1, 2, 3)
     n_gen = dll.atlas_generate_stream(
         m.model_ptr, in_ids, 3, 512, 10, 0.0, 1, 0.0, 1.0, 0, 0, cb, None, 0,
-        None, None, None, None)
+        _NOOP_LOGIT_CB, None, _NOOP_TOKEN_NOTIFY_CB, None)
     assert n_gen > 0, f"generate_stream returned {n_gen}"
     assert len(collected) == n_gen
     first_batch = list(collected)
@@ -124,7 +129,7 @@ def test_e2e_pipeline(corridor):
     cb2 = TOKEN_CALLBACK(lambda tid, _: collected2.append(tid))
     n_gen2 = dll.atlas_generate_stream(
         m.model_ptr, in_ids, 3, 512, 5, 0.0, 1, 0.0, 1.0, 0, 0, cb2, None, 0,
-        None, None, None, None)
+        _NOOP_LOGIT_CB, None, _NOOP_TOKEN_NOTIFY_CB, None)
     assert n_gen2 > 0
     assert len(collected2) == n_gen2
     assert collected2 != first_batch  # reset changes generation

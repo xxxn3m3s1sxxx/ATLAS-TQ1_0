@@ -93,6 +93,8 @@ def _bind_api(dll):
         ctypes.c_int,
         ctypes.c_int,
         ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p, ctypes.c_void_p,  # logit_cb, logit_cb_data
+        ctypes.c_void_p, ctypes.c_void_p,  # token_notify_cb, token_notify_data
     ]
     # ABI guard: abort on Python-vs-C signature mismatch
     header_path = os.path.join(ROOT, "atlas_ffi.h")
@@ -123,6 +125,7 @@ def _run_fixture(dll, name, path):
         n_gen = dll.atlas_generate(
             model, input_ids, len(PROMPT), 512, MAX_NEW,
             TEMPERATURE, TOP_K, 1.0, 1.0, 0, 0, output,
+            None, None, None, None,
         )
         assert n_gen > 0, f"{name}: atlas_generate returned {n_gen}"
         return n_gen, [output[i] for i in range(n_gen)]

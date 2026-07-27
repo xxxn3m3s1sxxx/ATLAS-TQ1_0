@@ -14,7 +14,7 @@ d.atlas_prefetch_int8.restype = None; d.atlas_prefetch_int8.argtypes = [ctypes.c
 d.atlas_get_tensor_count.restype = ctypes.c_int; d.atlas_get_tensor_count.argtypes = [ctypes.c_void_p]
 d.atlas_set_base_seq_len.restype = None; d.atlas_set_base_seq_len.argtypes = [ctypes.c_void_p, ctypes.c_int]
 d.atlas_generate.restype = ctypes.c_int
-d.atlas_generate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+d.atlas_generate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 
 for name in ["falcon3_v6", "falcon3_v8", "qwen3_v6", "qwen3_v8", "bitnet_v6", "bitnet_v8"]:
     path = os.path.join("tests", f"{name}.atlas")
@@ -29,7 +29,7 @@ for name in ["falcon3_v6", "falcon3_v8", "qwen3_v6", "qwen3_v8", "bitnet_v6", "b
     d.atlas_set_base_seq_len(m, 512)
     inp = (ctypes.c_int * 1)(1)
     out = (ctypes.c_int * 10)()
-    n = d.atlas_generate(m, inp, 1, 512, 10, 0.0, 1, 1.0, 1.0, 0, 0, out)
+    n = d.atlas_generate(m, inp, 1, 512, 10, 0.0, 1, 1.0, 1.0, 0, 0, out, None, None, None, None)
     assert n > 0, f"{name}: gen={n}"
     d.atlas_free(m)
     print(f"{name}: {n} tokens OK")
