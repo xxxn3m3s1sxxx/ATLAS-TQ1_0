@@ -35,6 +35,10 @@ C_TO_CTYPES = {
     'float*': ctypes.POINTER(ctypes.c_float),
     'uint8_t*': ctypes.POINTER(ctypes.c_uint8),
     'const uint16_t*': ctypes.POINTER(ctypes.c_uint16),
+    # Callback function pointers — treated as opaque void* for argtypes
+    'atlas_token_callback': ctypes.c_void_p,
+    'atlas_logit_processor_cb': ctypes.c_void_p,
+    'atlas_token_notify_cb': ctypes.c_void_p,
 }
 
 # Function pointer callbacks — skip typedef, but track expected params
