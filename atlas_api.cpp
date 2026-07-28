@@ -9,6 +9,22 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <cstring>
+#include <cmath>
+#include <cstdint>
+
+static inline int align_up4(int n) { return (n + 3) & ~3; }
+// After a 2-byte header, ensure 4-byte alignment of int32_t array
+static inline int align_after_u16(int n) { return n + ((6 - n % 4) % 4); }
+static inline float safe_int_from_float(float x) {
+    return (std::isnan(x) || std::isinf(x)) ? 0.0f : x;
+}
+static inline int32_t read_i32_unaligned(const void* p) {
+    int32_t v; std::memcpy(&v, p, 4); return v;
+}
+static inline uint16_t read_u16_unaligned(const void* p) {
+    uint16_t v; std::memcpy(&v, p, 2); return v;
+}
 
 // Normalize ARM64 detection across compilers. GCC defines __aarch64__,
 // Apple Clang defines __arm64__, MSVC defines _M_ARM64. Unify to __aarch64__
@@ -1253,7 +1269,7 @@ ATLAS_API AtlasModel* atlas_load(const char* path) {
             int actual_bytes = (i + 1 < n_tensors)
                 ? (int)(file_offsets[i + 1] - file_offsets[i]) - ((int)(file_offsets[i + 1] - file_offsets[i]) % 32)
                 : (int)(file_size - (int64_t)file_offsets[i]);
-            int expected = t.row_dim * m->hidden_dim * 2;
+            int64_t expected = (int64_t)t.row_dim * m->hidden_dim * 2;
             if (actual_bytes < expected && actual_bytes > 0) {
                 t.data_size = actual_bytes;
             } else {
@@ -2398,9 +2414,10 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
 
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
+        int n_vals_padded = align_after_u16(n_vals);
 
         // ─── ttype=0: raw ternary {-1,0,1} decompression ───
-        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        uint8_t* new_data = atlas_valloc(2 + n_vals_padded + t.row_dim * 4);
         if (!new_data) {
             fprintf(stderr, "[ATLAS] OOM decompressing tensor (row_dim=%d)\n", t.row_dim);
             total--;
@@ -2410,7 +2427,7 @@ ATLAS_API void atlas_decompress_all(AtlasModel* m) {
         new_data[1] = t.data[1];
 
         int8_t* i8 = (int8_t*)(new_data + 2);
-        int32_t* rs = (int32_t*)(i8 + n_vals);
+        int32_t* rs = (int32_t*)(i8 + n_vals_padded);
         const uint8_t* packed = t.data + 2;
 
         for (int r = 0; r < t.row_dim; r++) {
@@ -2447,6 +2464,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         total++;
         int input_dim = t.packed_cols * 5;
         int n_vals = t.row_dim * input_dim;
+        int n_vals_padded = align_after_u16(n_vals);
         int bs = t.block_size;
         int nbk = t.n_blocks;
 
@@ -2486,7 +2504,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         float quant_scale = global_max / 127.0f;
         float stored_scale = 127.0f / global_max;
 
-        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        uint8_t* new_data = atlas_valloc(2 + n_vals_padded + t.row_dim * 4);
         if (!new_data) {
             free(decoded_scales);
             free(f32_row);
@@ -2497,7 +2515,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
         uint16_t scale_u16 = fp32_to_fp16(stored_scale);
         memcpy(new_data, &scale_u16, 2);
         int8_t* i8 = (int8_t*)(new_data + 2);
-        int32_t* rs = (int32_t*)(i8 + n_vals);
+        int32_t* rs = (int32_t*)(i8 + n_vals_padded);
 
         for (int r = 0; r < t.row_dim; r++) {
             int pos = 0;
@@ -2517,7 +2535,7 @@ ATLAS_API void atlas_decompress_ttype5(AtlasModel* m) {
                     int blk = col / bs;
                     float scale2 = (blk < nbk) ? decoded_scales[r * nbk + blk] : 0.0f;
                     float val = (float)l[t2] * scale2;
-                    int q = (int)(val / quant_scale + 0.5f);
+                    int q = (int)safe_int_from_float(val / quant_scale + 0.5f);
                     if (q < -127) q = -127;
                     if (q > 127) q = 127;
                     i8[r * input_dim + pos] = (int8_t)q;
@@ -2555,6 +2573,7 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
         int packed_cols = t.packed_cols;
         int input_dim = packed_cols * 4;
         int n_vals = t.row_dim * input_dim;
+        int n_vals_padded = align_after_u16(n_vals);
         int block_size = t.block_size;
         int n_blocks = t.n_blocks;
 
@@ -2594,7 +2613,7 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
         float quant_scale = global_max / 127.0f;
         float stored_scale = 127.0f / global_max;
 
-        uint8_t* new_data = atlas_valloc(2 + n_vals + t.row_dim * 4);
+        uint8_t* new_data = atlas_valloc(2 + n_vals_padded + t.row_dim * 4);
         if (!new_data) {
             atlas_vfree((uint8_t*)f32_all);
             fprintf(stderr, "[ATLAS] OOM decompressing ttype=7 (new_data)\n");
@@ -2604,11 +2623,11 @@ ATLAS_API void atlas_decompress_ttype7(AtlasModel* m) {
         uint16_t scale_u16 = fp32_to_fp16(stored_scale);
         memcpy(new_data, &scale_u16, 2);
         int8_t* i8 = (int8_t*)(new_data + 2);
-        int32_t* rs = (int32_t*)(i8 + n_vals);
+        int32_t* rs = (int32_t*)(i8 + n_vals_padded);
 
         for (int64_t i = 0; i < n_vals; i++) {
             float vq = f32_all[i] / quant_scale;
-            int q = (vq >= 0) ? (int)(vq + 0.5f) : (int)(vq - 0.5f);
+            int q = (vq >= 0) ? (int)safe_int_from_float(vq + 0.5f) : (int)safe_int_from_float(vq - 0.5f);
             if (q < -127) q = -127;
             if (q > 127) q = 127;
             i8[i] = (int8_t)q;
@@ -2705,7 +2724,8 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
             : s16;
         
         int packed_cols = (cols + 1) / 2;
-        int new_size = 2 + rows * packed_cols + rows * 4;
+        int packed_bytes = align_up4(rows * packed_cols);
+        int new_size = 2 + packed_bytes + rows * 4;
         
         uint8_t* new_data = atlas_valloc(new_size);
         if (!new_data) {
@@ -2715,7 +2735,7 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         memcpy(new_data, &new_s16, 2);
         
         uint8_t* packed = new_data + 2;
-        int32_t* new_rs = (int32_t*)(packed + rows * packed_cols);
+        int32_t* new_rs = (int32_t*)(packed + packed_bytes);
         
     #ifdef _OPENMP
     #pragma omp parallel for
@@ -3295,11 +3315,11 @@ ATLAS_API void atlas_attention_f32(
                 int ne = blk_end - blk_start;
                 for (int i = 0; i < ne; i += 2) {
                     int d = blk_start + i;
-                    int vk0 = (int)(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
-                    int vk1 = (int)(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
+                    int vk0 = (int)safe_int_from_float(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
+                    int vk1 = (int)safe_int_from_float(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
                     kc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vk0 & 0x0F) | ((vk1 & 0x0F) << 4);
-                    int vv0 = (int)(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
-                    int vv1 = (int)(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
+                    int vv0 = (int)safe_int_from_float(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
+                    int vv1 = (int)safe_int_from_float(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
                     vc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vv0 & 0x0F) | ((vv1 & 0x0F) << 4);
                 }
             }
@@ -3973,7 +3993,7 @@ static void quantize_f32_to_u8(const float* act, int B, int D,
         max_abs_out[t] = max_val;
         float inv = 127.0f / max_val;
         for (int i = 0; i < D; i++) {
-            int q = (int)(act[t * D + i] * inv + 128.5f);
+            int q = (int)safe_int_from_float(act[t * D + i] * inv + 128.5f);
             if (q < 0) q = 0;
             if (q > 255) q = 255;
             act_u8_out[t * D + i] = (uint8_t)q;
@@ -4488,11 +4508,11 @@ static void tq1_lut_prefill_kernel(int rows, int input_dim, int packed_cols,
             if (av > max_val) max_val = av;
         }
         float scale_x = max_val / 127.0f;
-        float inv = 127.0f / max_val;
+        float inv = (max_val > 1e-10f) ? 127.0f / max_val : 0.0f;
 
         int8_t* aq = (int8_t*)alloca(input_dim * sizeof(int8_t));
         for (int i = 0; i < input_dim; i++) {
-            int q = (int)(act[i] * inv + 0.5f);
+            int q = (int)safe_int_from_float(act[i] * inv + 0.5f);
             if (q < -127) q = -127;
             if (q > 127) q = 127;
             aq[i] = (int8_t)q;
@@ -4936,10 +4956,10 @@ static void matmul_tq1_block_fused_s8(int rows, int input_dim, int packed_cols,
                 if (av > max_val) max_val = av;
             }
             scale_x[b] = max_val / 127.0f;
-            float inv = 127.0f / max_val;
+            float inv = (max_val > 1e-10f) ? 127.0f / max_val : 0.0f;
             int8_t* aq = act_s8 + b * input_dim;
             for (int i = 0; i < input_dim; i++) {
-                int q = (int)(act[i] * inv + 0.5f);
+                int q = (int)safe_int_from_float(act[i] * inv + 0.5f);
                 if (q < -127) q = -127;
                 if (q > 127) q = 127;
                 aq[i] = (int8_t)q;
@@ -5156,7 +5176,7 @@ static int quantize_weights_to_tq2(
             int8_t blk_tern[128];
             for (int c = blk_start; c < blk_end; c++) {
                 float v = (float)row[c] / weight_scale;
-                int t = (v >= 0) ? (int)(v + 0.5f) : (int)(v - 0.5f);
+                int t = (v >= 0) ? (int)safe_int_from_float(v + 0.5f) : (int)safe_int_from_float(v - 0.5f);
                 if (t < -1) t = -1;
                 if (t > 1) t = 1;
                 blk_tern[c - blk_start] = (int8_t)t;
@@ -5749,7 +5769,15 @@ static void get_i8(const TensorInfo& t, int8_t*& w, int32_t*& rs,
     dim = t3_dim(t);
     int nv = rows * dim;
     w = (int8_t*)(t.data + 2);
-    rs = (int32_t*)(w + nv);
+    const uint8_t* raw_rs = (const uint8_t*)(w + nv);
+    thread_local int32_t aligned_rs_buf[8192];
+    if (rows <= 8192) {
+        for (int r = 0; r < rows; r++)
+            aligned_rs_buf[r] = read_i32_unaligned(raw_rs + r * 4);
+        rs = aligned_rs_buf;
+    } else {
+        rs = (int32_t*)(w + nv);
+    }
 }
 
 // ─── MLA Attention: On-the-fly KV decompression + standard dot-product attention ───
@@ -8555,7 +8583,7 @@ ATLAS_API void atlas_quantize_lmhead(AtlasModel* m, int idx, int keep_data) {
         int32_t row_sum = 0;
         for (int c = 0; c < H; c++) {
             float v = fp16_to_fp32(fp16[r * H + c]);
-            int q = (int)(v / inv + 0.5f);
+            int q = (int)safe_int_from_float(v / inv + 0.5f);
             if (q < -127) q = -127;
             if (q > 127) q = 127;
             i8[r * H + c] = (int8_t)q;
@@ -8610,9 +8638,9 @@ ATLAS_API void atlas_lmhead_gemv(AtlasModel* m, const float* act,
             if (v > ma) ma = v;
         }
         max_abs[b] = ma;
-        float inv = 127.0f / ma;
+        float inv = (ma > 1e-10f) ? 127.0f / ma : 0.0f;
         for (int i = 0; i < H; i++) {
-            int q = (int)(act[b * H + i] * inv + 128.5f);
+            int q = (int)safe_int_from_float(act[b * H + i] * inv + 128.5f);
             if (q < 0) q = 0;
             if (q > 255) q = 255;
             act_u8[b * H + i] = (uint8_t)q;
@@ -8982,6 +9010,7 @@ ATLAS_API int atlas_generate(AtlasModel* m,
         atlas_vfree((uint8_t*)context);
         return -1;
     }
+    atlas_vfree((uint8_t*)positions);
     ATLAS_LOG("prefill forward done\n");
 
     // Final RMSNorm + LM head — only the last new token's logits are needed
@@ -9011,13 +9040,12 @@ ATLAS_API int atlas_generate(AtlasModel* m,
 
     if (next_token == eos_id || next_token == eos_id2) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
-        atlas_vfree((uint8_t*)context);
+        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)context);
+        atlas_vfree((uint8_t*)positions);
         return n_gen;
     }
 
     // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
-    atlas_vfree((uint8_t*)positions);
     for (int step = 1; step < max_new_tokens; step++) {
         // Embed last generated token
         int tid = next_token;
@@ -9189,13 +9217,12 @@ ATLAS_API int atlas_generate_stream(AtlasModel* m,
 
     if (next_token == eos_id || next_token == eos_id2) {
         atlas_vfree((uint8_t*)embed_buf); atlas_vfree((uint8_t*)h_norm);
-        atlas_vfree((uint8_t*)logits); atlas_vfree((uint8_t*)positions);
+        atlas_vfree((uint8_t*)logits);
         atlas_vfree((uint8_t*)context);
         return n_gen;
     }
 
     // ─── Decode loop (v2.5.0: ring buffer — no veto, wraps at max_seq_len) ───
-    atlas_vfree((uint8_t*)positions);
     for (int step = 1; step < max_new_tokens; step++) {
         int tid = next_token;
         if (tid < 0 || tid >= V) tid = 0;
