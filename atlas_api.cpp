@@ -2724,8 +2724,8 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
             : s16;
         
         int packed_cols = (cols + 1) / 2;
-        int packed_bytes = align_up4(rows * packed_cols);
-        int new_size = 2 + packed_bytes + rows * 4;
+        int rowsum_off = rows * packed_cols;
+        int new_size = 2 + align_up4(rowsum_off) + rows * 4;
         
         uint8_t* new_data = atlas_valloc(new_size);
         if (!new_data) {
@@ -2735,7 +2735,7 @@ ATLAS_API void atlas_quantize_ffn_to_i4(AtlasModel* m) {
         memcpy(new_data, &new_s16, 2);
         
         uint8_t* packed = new_data + 2;
-        int32_t* new_rs = (int32_t*)(packed + packed_bytes);
+        int32_t* new_rs = (int32_t*)(packed + rowsum_off);
         
     #ifdef _OPENMP
     #pragma omp parallel for
@@ -3704,11 +3704,11 @@ ATLAS_API void atlas_attention_f32(
                 int ne = blk_end - blk_start;
                 for (int i = 0; i < ne; i += 2) {
                     int d = blk_start + i;
-                    int vk0 = (int)(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
-                    int vk1 = (int)(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
+                    int vk0 = (int)safe_int_from_float(k_row[d] * inv_sk); if (vk0 < -8) vk0 = -8; if (vk0 > 7) vk0 = 7;
+                    int vk1 = (int)safe_int_from_float(k_row[d+1] * inv_sk); if (vk1 < -8) vk1 = -8; if (vk1 > 7) vk1 = 7;
                     kc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vk0 & 0x0F) | ((vk1 & 0x0F) << 4);
-                    int vv0 = (int)(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
-                    int vv1 = (int)(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
+                    int vv0 = (int)safe_int_from_float(v_row[d] * inv_sv); if (vv0 < -8) vv0 = -8; if (vv0 > 7) vv0 = 7;
+                    int vv1 = (int)safe_int_from_float(v_row[d+1] * inv_sv); if (vv1 < -8) vv1 = -8; if (vv1 > 7) vv1 = 7;
                     vc[blk * KV_BYTES_PER_BLOCK + 2 + i/2] = (vv0 & 0x0F) | ((vv1 & 0x0F) << 4);
                 }
             }
@@ -5767,17 +5767,14 @@ static void get_i8(const TensorInfo& t, int8_t*& w, int32_t*& rs,
     scale = fp16_to_fp32(sr);
     rows = t.row_dim;
     dim = t3_dim(t);
-    int nv = rows * dim;
+    int64_t nv = (int64_t)rows * dim;
     w = (int8_t*)(t.data + 2);
     const uint8_t* raw_rs = (const uint8_t*)(w + nv);
-    thread_local int32_t aligned_rs_buf[8192];
-    if (rows <= 8192) {
-        for (int r = 0; r < rows; r++)
-            aligned_rs_buf[r] = read_i32_unaligned(raw_rs + r * 4);
-        rs = aligned_rs_buf;
-    } else {
-        rs = (int32_t*)(w + nv);
-    }
+    thread_local std::vector<int32_t> aligned_rs_vec;
+    aligned_rs_vec.resize(rows);
+    for (int r = 0; r < rows; r++)
+        aligned_rs_vec[r] = read_i32_unaligned(raw_rs + r * 4);
+    rs = aligned_rs_vec.data();
 }
 
 // ─── MLA Attention: On-the-fly KV decompression + standard dot-product attention ───
@@ -8151,10 +8148,10 @@ static void forward_layer_internal(
                     float av = fabsf(tmp[i]);
                     if (av > bmax) bmax = av;
                 }
-                float inv = 127.0f / bmax;
+                float inv = (bmax > 1e-10f) ? 127.0f / bmax : 0.0f;
                 max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
-                    int q = (int)(tmp[i] * inv + 128.5f);
+                    int q = (int)safe_int_from_float(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
                     m->buf_i8[b * dim + i] = (uint8_t)q;
                 }
@@ -8352,10 +8349,10 @@ static void forward_layer_internal(
                     float av = fabsf(tmp[i]);
                     if (av > bmax) bmax = av;
                 }
-                float inv = 127.0f / bmax;
+                float inv = (bmax > 1e-10f) ? 127.0f / bmax : 0.0f;
                 max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
-                    int q = (int)(tmp[i] * inv + 128.5f);
+                    int q = (int)safe_int_from_float(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
                     m->buf_i8[b * dim + i] = (uint8_t)q;
                 }
@@ -8439,10 +8436,10 @@ static void forward_layer_internal(
                     float av = fabsf(tmp[i]);
                     if (av > bmax) bmax = av;
                 }
-                float inv = 127.0f / bmax;
+                float inv = (bmax > 1e-10f) ? 127.0f / bmax : 0.0f;
                 max_abs[b] = bmax;
                 for (int i = 0; i < dim; i++) {
-                    int q = (int)(tmp[i] * inv + 128.5f);
+                    int q = (int)safe_int_from_float(tmp[i] * inv + 128.5f);
                     if (q < 0) q = 0; if (q > 255) q = 255;
                     m->buf_i8[b * dim + i] = (uint8_t)q;
                 }
