@@ -381,11 +381,6 @@ class AtlasModel:
                         if _HAS_TTYPE7_DECOMPRESS:
                             dll.atlas_decompress_ttype7(self.model_ptr)
                         dll.atlas_save_cache(self.model_ptr, self._atlas_path.encode())
-                    dll.atlas_decompress_all(self.model_ptr)
-                    if _HAS_TTYPE5_DECOMPRESS:
-                        dll.atlas_decompress_ttype5(self.model_ptr)
-                    if _HAS_TTYPE7_DECOMPRESS:
-                        dll.atlas_decompress_ttype7(self.model_ptr)
                     dll.atlas_set_use_f32_matmul(self.model_ptr, 1)
                     # v2.11.3: Skip int4 FFN for CANN-8B (hidden=4096) — int4 matmul kernel
                     # produces wrong results with large row dimensions (16384+ rows in down_proj).
